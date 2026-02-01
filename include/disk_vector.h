@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <deque>
 #include <fstream>
+#include <istream>
+#include <ostream>
 #include <stdexcept>
 #include <cstring>
 #include <algorithm>
@@ -20,6 +22,11 @@ static constexpr node_id_t k_invalid_node_id =
 
 class IVectorStorage {
 public:
+    struct PageCacheStats {
+        std::size_t hits = 0;
+        std::size_t misses = 0;
+    };
+
     virtual ~IVectorStorage() = default;
 
     // Dimension of each vector (number of floats)
@@ -54,6 +61,9 @@ public:
 
     // Optional prefetch API. Default is no-op.
     virtual void prefetchByIds(const std::vector<node_id_t>& /*ids*/) {}
+
+    // Optional page cache stats. Default returns zeros.
+    virtual PageCacheStats getPageCacheStats() const { return {}; }
 };
 
 class BasicVectorStorage : public IVectorStorage {
@@ -69,6 +79,28 @@ private:
     std::vector<uint8_t> deletedFlags_;
 
 private:
+    void ensureDeleteFileSize(size_t targetSize) {
+        deleteStream_.clear();
+        deleteStream_.seekp(0, std::ios::end);
+        size_t currentSize = static_cast<size_t>(deleteStream_.tellp());
+        if (currentSize < targetSize) {
+            deleteStream_.seekp(static_cast<std::streamoff>(targetSize - 1),
+                                std::ios::beg);
+            char zero = 0;
+            deleteStream_.write(&zero, 1);
+            deleteStream_.flush();
+        }
+    }
+
+    void reloadDeleteFlags(size_t targetSize) {
+        ensureDeleteFileSize(targetSize);
+        deletedFlags_.assign(targetSize, 0);
+        deleteStream_.clear();
+        deleteStream_.seekg(0, std::ios::beg);
+        deleteStream_.read(reinterpret_cast<char*>(deletedFlags_.data()),
+                           static_cast<std::streamsize>(deletedFlags_.size()));
+    }
+
     void openDeleteFile() {
         deleteStream_.open(deleteFilePath_,
                            std::ios::in | std::ios::out | std::ios::binary);
@@ -86,21 +118,7 @@ private:
             }
         }
 
-        deleteStream_.seekp(0, std::ios::end);
-        size_t currentSize = static_cast<size_t>(deleteStream_.tellp());
-        if (currentSize < totalVectors_) {
-            deleteStream_.seekp(static_cast<std::streamoff>(totalVectors_ - 1),
-                                std::ios::beg);
-            char zero = 0;
-            deleteStream_.write(&zero, 1);
-            deleteStream_.flush();
-        }
-
-        deletedFlags_.assign(totalVectors_, 0);
-        deleteStream_.clear();
-        deleteStream_.seekg(0, std::ios::beg);
-        deleteStream_.read(reinterpret_cast<char*>(deletedFlags_.data()),
-                           static_cast<std::streamsize>(deletedFlags_.size()));
+        reloadDeleteFlags(totalVectors_);
     }
 
     void writeDeleteFlag(node_id_t id, bool deleted) {
@@ -298,6 +316,8 @@ private:
 
     // Page cache (FIFO) in units of full pages (4KB each)
     size_t maxCachedPages_;
+    size_t pageCacheHits_ = 0;
+    size_t pageCacheMisses_ = 0;
 
     struct PageBuf {
         std::vector<char> data; // always kPageSize bytes
@@ -324,6 +344,28 @@ private:
         }
     }
 
+    void ensureDeleteFileSize(size_t targetSize) {
+        deleteStream_.clear();
+        deleteStream_.seekp(0, std::ios::end);
+        size_t currentSize = static_cast<size_t>(deleteStream_.tellp());
+        if (currentSize < targetSize) {
+            deleteStream_.seekp(static_cast<std::streamoff>(targetSize - 1),
+                                std::ios::beg);
+            char zero = 0;
+            deleteStream_.write(&zero, 1);
+            deleteStream_.flush();
+        }
+    }
+
+    void reloadDeleteFlags(size_t targetSize) {
+        ensureDeleteFileSize(targetSize);
+        deletedFlags_.assign(targetSize, 0);
+        deleteStream_.clear();
+        deleteStream_.seekg(0, std::ios::beg);
+        deleteStream_.read(reinterpret_cast<char*>(deletedFlags_.data()),
+                           static_cast<std::streamsize>(deletedFlags_.size()));
+    }
+
     void openDeleteFile() {
         deleteStream_.open(deleteFilePath_,
                            std::ios::in | std::ios::out | std::ios::binary);
@@ -341,21 +383,7 @@ private:
             }
         }
 
-        deleteStream_.seekp(0, std::ios::end);
-        size_t currentSize = static_cast<size_t>(deleteStream_.tellp());
-        if (currentSize < totalVectors_) {
-            deleteStream_.seekp(static_cast<std::streamoff>(totalVectors_ - 1),
-                                std::ios::beg);
-            char zero = 0;
-            deleteStream_.write(&zero, 1);
-            deleteStream_.flush();
-        }
-
-        deletedFlags_.assign(totalVectors_, 0);
-        deleteStream_.clear();
-        deleteStream_.seekg(0, std::ios::beg);
-        deleteStream_.read(reinterpret_cast<char*>(deletedFlags_.data()),
-                           static_cast<std::streamsize>(deletedFlags_.size()));
+        reloadDeleteFlags(totalVectors_);
     }
 
     void writeDeleteFlag(node_id_t id, bool deleted) {
@@ -368,6 +396,35 @@ private:
         if (!deleteStream_.good()) {
             throw std::runtime_error("Failed to update delete marker file.");
         }
+    }
+
+    void expandCapacity(size_t minCapacity) {
+        if (minCapacity <= totalVectors_) {
+            return;
+        }
+
+        size_t target = totalVectors_ == 0 ? minCapacity : totalVectors_;
+        while (target < minCapacity) {
+            target *= 2;
+        }
+
+        deleteStream_.clear();
+        deleteStream_.seekp(0, std::ios::end);
+        size_t currentSize = static_cast<size_t>(deleteStream_.tellp());
+        if (currentSize < target) {
+            deleteStream_.seekp(static_cast<std::streamoff>(target - 1), std::ios::beg);
+            char zero = 0;
+            deleteStream_.write(&zero, 1);
+            deleteStream_.flush();
+            if (!deleteStream_.good()) {
+                throw std::runtime_error("Failed to expand delete marker file.");
+            }
+        }
+
+        idToPage_.resize(target, -1);
+        idToSlotInPage_.resize(target, 0);
+        deletedFlags_.resize(target, 0);
+        totalVectors_ = target;
     }
 
     // Ensure that the file is large enough to contain pageId (0-based)
@@ -579,7 +636,7 @@ public:
                            node_id_t sectionKey) override
     {
         if (static_cast<size_t>(id) >= totalVectors_) {
-            throw std::out_of_range("Vector ID out of range.");
+            expandCapacity(static_cast<size_t>(id) + 1);
         }
         if (vec.size() != dim_) {
             throw std::runtime_error("Vector size mismatch.");
@@ -633,8 +690,12 @@ public:
         size_t pageId = static_cast<size_t>(page);
 
         // 1) Try page cache
-        if (tryReadFromCache(pageId, slot, vec)) {
-            return;
+        if (maxCachedPages_ > 0) {
+            if (tryReadFromCache(pageId, slot, vec)) {
+                ++pageCacheHits_;
+                return;
+            }
+            ++pageCacheMisses_;
         }
 
         // 2) If not cached, optionally cache the page then try again
@@ -707,6 +768,205 @@ public:
                 loadPageToCache(pageId);
             }
         }
+    }
+
+    PageCacheStats getPageCacheStats() const override {
+        return PageCacheStats{pageCacheHits_, pageCacheMisses_};
+    }
+
+    bool serializeMetadata(std::ostream& out) const {
+        constexpr uint32_t kMetaVersion = 1;
+        auto write = [&](const auto& value) -> bool {
+            out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+            return static_cast<bool>(out);
+        };
+
+        uint64_t totalVectors = static_cast<uint64_t>(totalVectors_);
+        uint64_t dim = static_cast<uint64_t>(dim_);
+        uint64_t vectorsPerPage = static_cast<uint64_t>(vectorsPerPage_);
+        uint64_t pagesSize = static_cast<uint64_t>(pages_.size());
+        uint64_t sectionKeysSize = static_cast<uint64_t>(sectionIdxToKey_.size());
+
+        if (!write(kMetaVersion) ||
+            !write(totalVectors) ||
+            !write(dim) ||
+            !write(vectorsPerPage) ||
+            !write(pagesSize) ||
+            !write(sectionKeysSize)) {
+            return false;
+        }
+
+        for (const auto& page : pages_) {
+            int32_t sectionIdx = static_cast<int32_t>(page.sectionIdx);
+            uint16_t usedSlots = page.usedSlots;
+            if (!write(sectionIdx) || !write(usedSlots)) {
+                return false;
+            }
+        }
+
+        for (node_id_t key : sectionIdxToKey_) {
+            if (!write(key)) {
+                return false;
+            }
+        }
+
+        uint64_t idToPageSize = static_cast<uint64_t>(idToPage_.size());
+        uint64_t idToSlotSize = static_cast<uint64_t>(idToSlotInPage_.size());
+        if (!write(idToPageSize) || !write(idToSlotSize)) {
+            return false;
+        }
+        for (int64_t page : idToPage_) {
+            if (!write(page)) {
+                return false;
+            }
+        }
+        for (uint16_t slot : idToSlotInPage_) {
+            if (!write(slot)) {
+                return false;
+            }
+        }
+
+        return static_cast<bool>(out);
+    }
+
+    bool deserializeMetadata(std::istream& in) {
+        constexpr uint32_t kMetaVersion = 1;
+        auto read = [&](auto* value) -> bool {
+            in.read(reinterpret_cast<char*>(value), sizeof(*value));
+            return static_cast<bool>(in);
+        };
+
+        uint32_t version = 0;
+        uint64_t totalVectors = 0;
+        uint64_t dim = 0;
+        uint64_t vectorsPerPage = 0;
+        uint64_t pagesSize = 0;
+        uint64_t sectionKeysSize = 0;
+        if (!read(&version) ||
+            !read(&totalVectors) ||
+            !read(&dim) ||
+            !read(&vectorsPerPage) ||
+            !read(&pagesSize) ||
+            !read(&sectionKeysSize)) {
+            return false;
+        }
+
+        if (version != kMetaVersion) {
+            return false;
+        }
+        if (dim != dim_ || vectorsPerPage != vectorsPerPage_) {
+            return false;
+        }
+
+        if (totalVectors > totalVectors_) {
+            expandCapacity(static_cast<size_t>(totalVectors));
+        }
+
+        pages_.clear();
+        pages_.reserve(static_cast<size_t>(pagesSize));
+        for (uint64_t i = 0; i < pagesSize; ++i) {
+            int32_t sectionIdx = 0;
+            uint16_t usedSlots = 0;
+            if (!read(&sectionIdx) || !read(&usedSlots)) {
+                return false;
+            }
+            if (usedSlots > vectorsPerPage_) {
+                return false;
+            }
+            pages_.push_back(PageMeta{sectionIdx, usedSlots});
+        }
+
+        sectionIdxToKey_.clear();
+        sectionIdxToKey_.reserve(static_cast<size_t>(sectionKeysSize));
+        for (uint64_t i = 0; i < sectionKeysSize; ++i) {
+            node_id_t key = 0;
+            if (!read(&key)) {
+                return false;
+            }
+            sectionIdxToKey_.push_back(key);
+        }
+
+        uint64_t idToPageSize = 0;
+        uint64_t idToSlotSize = 0;
+        if (!read(&idToPageSize) || !read(&idToSlotSize)) {
+            return false;
+        }
+        if (idToPageSize != totalVectors || idToSlotSize != totalVectors) {
+            return false;
+        }
+
+        idToPage_.assign(static_cast<size_t>(idToPageSize), -1);
+        idToSlotInPage_.assign(static_cast<size_t>(idToSlotSize), 0);
+        for (uint64_t i = 0; i < idToPageSize; ++i) {
+            int64_t page = 0;
+            if (!read(&page)) {
+                return false;
+            }
+            idToPage_[static_cast<size_t>(i)] = page;
+        }
+        for (uint64_t i = 0; i < idToSlotSize; ++i) {
+            uint16_t slot = 0;
+            if (!read(&slot)) {
+                return false;
+            }
+            idToSlotInPage_[static_cast<size_t>(i)] = slot;
+        }
+
+        sectionKeyToIdx_.clear();
+        for (size_t idx = 0; idx < sectionIdxToKey_.size(); ++idx) {
+            sectionKeyToIdx_[sectionIdxToKey_[idx]] = static_cast<int>(idx);
+        }
+
+        sectionOpenPages_.clear();
+        sectionFreeSlots_.clear();
+
+        std::vector<std::vector<uint8_t>> usedSlots;
+        usedSlots.resize(pages_.size());
+        for (size_t pageId = 0; pageId < pages_.size(); ++pageId) {
+            usedSlots[pageId].assign(pages_[pageId].usedSlots, 0);
+        }
+
+        for (size_t id = 0; id < idToPage_.size(); ++id) {
+            int64_t page = idToPage_[id];
+            if (page < 0) {
+                continue;
+            }
+            size_t pageId = static_cast<size_t>(page);
+            if (pageId >= pages_.size()) {
+                return false;
+            }
+            uint16_t slot = idToSlotInPage_[id];
+            if (slot >= pages_[pageId].usedSlots) {
+                return false;
+            }
+            if (slot < usedSlots[pageId].size()) {
+                usedSlots[pageId][slot] = 1;
+            }
+        }
+
+        for (size_t pageId = 0; pageId < pages_.size(); ++pageId) {
+            const PageMeta& meta = pages_[pageId];
+            if (meta.sectionIdx < 0) {
+                continue;
+            }
+            if (static_cast<size_t>(meta.usedSlots) < vectorsPerPage_) {
+                sectionOpenPages_[meta.sectionIdx].push_back(pageId);
+            }
+            auto& freeList = sectionFreeSlots_[meta.sectionIdx];
+            for (size_t slot = 0; slot < meta.usedSlots; ++slot) {
+                if (slot < usedSlots[pageId].size() && usedSlots[pageId][slot] == 0) {
+                    freeList.emplace_back(pageId, static_cast<uint16_t>(slot));
+                }
+            }
+        }
+
+        reloadDeleteFlags(totalVectors_);
+        pageCache_.clear();
+        pageOrder_.clear();
+        pageCacheHits_ = 0;
+        pageCacheMisses_ = 0;
+
+        return static_cast<bool>(in);
     }
 };
 }

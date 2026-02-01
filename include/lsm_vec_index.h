@@ -29,7 +29,7 @@ using namespace ROCKSDB_NAMESPACE;
             std::unordered_map<int, std::vector<node_id_t>> neighbors; // Layer -> neighbors
         };
 
-        HNSWStats stats;
+        mutable HNSWStats stats;
 
         bool use_heuristic_neighbor_selection_ = true;
 
@@ -41,18 +41,23 @@ using namespace ROCKSDB_NAMESPACE;
                const LSMVecDBOptions& options,
                std::ostream &outFile);
 
+        Status SerializeMetadata(std::ostream& out) const;
+        Status DeserializeMetadata(std::istream& in);
+        const std::unordered_set<node_id_t>& deletedIds() const { return deleted_ids_; }
+        void setDeletedIds(const std::unordered_set<node_id_t>& ids) { deleted_ids_ = ids; }
 
         void insertNode(node_id_t nodeId, const std::vector<float> &vector);
         node_id_t knnSearch(const std::vector<float> &queryVector);
         Status deleteNode(node_id_t id);
         Status updateNode(node_id_t id, const std::vector<float>& vec);
         Status getNodeVector(node_id_t id, std::vector<float>* out);
-        std::vector<node_id_t> knnSearchK(const std::vector<float>& query, int k, int ef_search);
+        std::vector<SearchResult> knnSearchK(const std::vector<float>& query, int k, int ef_search);
         std::unordered_set<int> highest_layer_nodes_;
 
         void printIndexStatus() const;
         void printStatistics() const;
         void printState() const;
+        void close();
 
         std::string vector_file_path_;
         int vector_dim_ = 0;
@@ -61,13 +66,17 @@ using namespace ROCKSDB_NAMESPACE;
 
     private:
         int randomLevel();
-        float computeDistance(const std::vector<float> &vectorA, const std::vector<float> &vectorB) const;
+        float computeDistance(Span<const float> vectorA,
+                              Span<const float> vectorB) const;
         void storeVectorWithStats(node_id_t id,
                                   const std::vector<float>& vec,
                                   node_id_t sectionKey);
         void readVectorWithStats(node_id_t id,
                                  std::vector<float>& vec);
-        std::vector<node_id_t> searchLayer(const std::vector<float> &queryVector, node_id_t entryPointId, int efSearch, int layer);
+        std::vector<SearchResult> searchLayer(const std::vector<float> &queryVector,
+                                              node_id_t entryPointId,
+                                              int efSearch,
+                                              int layer);
         void linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer);
         void linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds);
 
@@ -116,9 +125,6 @@ using namespace ROCKSDB_NAMESPACE;
         std::uniform_real_distribution<> uniform_distribution_;
         int max_layer_;
         node_id_t entry_point_ = k_invalid_node_id; // Entry point for HNSW graph
-
-        // Store length for node
-        std::vector<float> node_lengths_;
 
         std::unordered_set<node_id_t> deleted_ids_;
 

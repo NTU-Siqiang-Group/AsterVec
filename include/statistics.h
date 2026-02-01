@@ -49,6 +49,9 @@ public:
         vec_read_time = 0.0;
         vec_write_count = 0;
         vec_write_time = 0.0;
+
+        page_cache_hits = 0;
+        page_cache_misses = 0;
     }
 
     // ------------------------------------------------------------
@@ -132,6 +135,10 @@ public:
     std::size_t vec_write_count = 0;
     double      vec_write_time  = 0.0;
 
+    // Page-based vector storage cache stats
+    std::size_t page_cache_hits = 0;
+    std::size_t page_cache_misses = 0;
+
     // ------------------------------------------------------------
     // Print helper
     // ------------------------------------------------------------
@@ -170,6 +177,13 @@ public:
            << ", Time: " << vec_read_time << " seconds\n";
         os << "Vector Write Operations: " << vec_write_count
            << ", Time: " << vec_write_time << " seconds\n";
+        if (page_cache_hits + page_cache_misses > 0) {
+            std::size_t total = page_cache_hits + page_cache_misses;
+            double hit_rate = 100.0 * static_cast<double>(page_cache_hits) /
+                              static_cast<double>(total);
+            os << "Page Cache Avoided I/O: " << page_cache_hits << "\n";
+            os << "Page Cache Hit Rate: " << hit_rate << "%\n";
+        }
         os << std::endl;
     }
 

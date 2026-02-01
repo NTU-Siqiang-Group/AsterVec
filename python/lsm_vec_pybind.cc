@@ -85,6 +85,7 @@ PYBIND11_MODULE(lsm_vec, m)
         .def_readwrite("db_target_size", &lsm_vec::LSMVecDBOptions::db_target_size)
         .def_readwrite("random_seed", &lsm_vec::LSMVecDBOptions::random_seed)
         .def_readwrite("enable_stats", &lsm_vec::LSMVecDBOptions::enable_stats)
+        .def_readwrite("reinit", &lsm_vec::LSMVecDBOptions::reinit)
         .def_readwrite("vector_file_path", &lsm_vec::LSMVecDBOptions::vector_file_path)
         .def_readwrite("log_file_path", &lsm_vec::LSMVecDBOptions::log_file_path);
 
@@ -176,5 +177,8 @@ PYBIND11_MODULE(lsm_vec, m)
             std::vector<lsm_vec::SearchResult> out;
             RaiseStatus(db.SearchKnn(MakeSpan(data), options, &out));
             return out;
+        })
+        .def("close", [](lsm_vec::LSMVecDB& db) {
+            RaiseStatus(db.Close());
         });
 }

@@ -56,6 +56,7 @@ struct LSMVecDBOptions {
     uint64_t db_target_size = 107374182400ULL;
     int random_seed = 12345;
     bool enable_stats = false;
+    bool reinit = false;
     std::string vector_file_path;
     std::string log_file_path;
 };
@@ -75,6 +76,7 @@ public:
     static Status Open(const std::string& path,
                        const LSMVecDBOptions& opts,
                        std::unique_ptr<LSMVecDB>* db);
+    Status Close();
 
     Status Insert(node_id_t id, Span<float> vec);
     Status Update(node_id_t id, Span<float> vec);
@@ -84,8 +86,11 @@ public:
                      const SearchOptions& options,
                      std::vector<SearchResult>* out);
 
+    void printStatistics() const;
+
 private:
-    LSMVecDB(const LSMVecDBOptions& options,
+    LSMVecDB(const std::string& db_path,
+             const LSMVecDBOptions& options,
              std::unique_ptr<class LSMVec> index,
              std::unique_ptr<std::ostream> log_stream);
 
@@ -93,6 +98,7 @@ private:
     Status EnsureMetricSupported() const;
     float ComputeDistance(Span<float> a, Span<float> b) const;
 
+    std::string db_path_;
     LSMVecDBOptions options_;
     std::unique_ptr<std::ostream> log_stream_;
     std::unique_ptr<class LSMVec> index_;
