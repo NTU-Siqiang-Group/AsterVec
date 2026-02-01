@@ -505,12 +505,19 @@ using namespace ROCKSDB_NAMESPACE;
             {
                 for (int neighbor : selectedNeighbors)
                 {
-                    std::vector<node_id_t> eConn = nodes_[neighbor].neighbors[l];
+                    auto neighborIt = nodes_.find(neighbor);
+                    if (neighborIt == nodes_.end()) {
+                        LOG(WARN) << "Skipping shrink connections for missing node " << neighbor
+                                  << " at layer " << l;
+                        continue;
+                    }
+
+                    std::vector<node_id_t> eConn = neighborIt->second.neighbors[l];
                     if (eConn.size() > static_cast<size_t>(m_max_))
                     {
                         std::vector<node_id_t> eNewConn =
-                            selectNeighbors(nodes_[neighbor].point, eConn, m_max_, l);
-                        nodes_[neighbor].neighbors[l] = std::move(eNewConn);
+                            selectNeighbors(neighborIt->second.point, eConn, m_max_, l);
+                        neighborIt->second.neighbors[l] = std::move(eNewConn);
                     }
                 }
             }
@@ -688,10 +695,23 @@ using namespace ROCKSDB_NAMESPACE;
     // Links neighbors for upper layers stored in memory
     void LSMVec::linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer)
     {
+        auto nodeIt = nodes_.find(nodeId);
+        if (nodeIt == nodes_.end()) {
+            LOG(WARN) << "Skipping upper-layer link for missing node " << nodeId
+                      << " at layer " << layer;
+            return;
+        }
+
         for (node_id_t neighborId : neighborIds)
         {
-            nodes_[neighborId].neighbors[layer].push_back(nodeId);
-            nodes_[nodeId].neighbors[layer].push_back(neighborId);
+            auto neighborIt = nodes_.find(neighborId);
+            if (neighborIt == nodes_.end()) {
+                LOG(WARN) << "Skipping upper-layer link to missing neighbor " << neighborId
+                          << " at layer " << layer;
+                continue;
+            }
+            neighborIt->second.neighbors[layer].push_back(nodeId);
+            nodeIt->second.neighbors[layer].push_back(neighborId);
         }
     }
 
@@ -734,9 +754,17 @@ using namespace ROCKSDB_NAMESPACE;
                 float dist = 0.0;
                 if (layer > 0)
                 {
-                    const auto& candidateVec = nodes_[candidateId].point;
-                    dist = computeDistance(Span<const float>(vector),
-                                           Span<const float>(candidateVec));
+                    const auto nodeIt = nodes_.find(candidateId);
+                    if (nodeIt != nodes_.end() && !nodeIt->second.point.empty()) {
+                        const auto& candidateVec = nodeIt->second.point;
+                        dist = computeDistance(Span<const float>(vector),
+                                               Span<const float>(candidateVec));
+                    } else {
+                        std::vector<float> candidateVector;
+                        readVectorWithStats(candidateId, candidateVector);
+                        dist = computeDistance(Span<const float>(vector),
+                                               Span<const float>(candidateVector));
+                    }
                 }
                 else if (layer == 0)
                 {
@@ -788,17 +816,20 @@ using namespace ROCKSDB_NAMESPACE;
 
         auto getVector = [&](node_id_t nodeId) -> const std::vector<float>& {
             if (layer > 0) {
-                return nodes_[nodeId].point;
-            } else {
-                auto it = vecCache.find(nodeId);
-                if (it != vecCache.end()) return it->second;
-
-                std::vector<float> v;
-                readVectorWithStats(nodeId, v);
-
-                auto res = vecCache.emplace(nodeId, std::move(v));
-                return res.first->second;
+                auto nodeIt = nodes_.find(nodeId);
+                if (nodeIt != nodes_.end() && !nodeIt->second.point.empty()) {
+                    return nodeIt->second.point;
+                }
             }
+
+            auto it = vecCache.find(nodeId);
+            if (it != vecCache.end()) return it->second;
+
+            std::vector<float> v;
+            readVectorWithStats(nodeId, v);
+
+            auto res = vecCache.emplace(nodeId, std::move(v));
+            return res.first->second;
         };
 
         // 1) Precompute distances query -> candidate
@@ -891,17 +922,20 @@ using namespace ROCKSDB_NAMESPACE;
 
         auto getVector = [&](node_id_t nodeId) -> const std::vector<float>& {
             if (layer > 0) {
-                return nodes_[nodeId].point;
-            } else {
-                auto it = vecCache.find(nodeId);
-                if (it != vecCache.end()) return it->second;
-
-                std::vector<float> v;
-                readVectorWithStats(nodeId, v);
-
-                auto res = vecCache.emplace(nodeId, std::move(v));
-                return res.first->second;
+                auto nodeIt = nodes_.find(nodeId);
+                if (nodeIt != nodes_.end() && !nodeIt->second.point.empty()) {
+                    return nodeIt->second.point;
+                }
             }
+
+            auto it = vecCache.find(nodeId);
+            if (it != vecCache.end()) return it->second;
+
+            std::vector<float> v;
+            readVectorWithStats(nodeId, v);
+
+            auto res = vecCache.emplace(nodeId, std::move(v));
+            return res.first->second;
         };
 
         // 1) Precompute distances query -> candidate
@@ -987,7 +1021,8 @@ using namespace ROCKSDB_NAMESPACE;
             if (layer > 0) {
                 // Upper layers: vectors are in-memory when available.
                 const auto nodeIt = nodes_.find(nodeId);
-                if (nodeIt != nodes_.end()) {
+                if (nodeIt != nodes_.end() &&
+                    nodeIt->second.point.size() == static_cast<size_t>(vector_dim_)) {
                     const auto& point = nodeIt->second.point;
                     return computeDistance(Span<const float>(queryVector),
                                            Span<const float>(point));
@@ -1040,7 +1075,8 @@ using namespace ROCKSDB_NAMESPACE;
                     if (visited.insert(neighborId).second) {
                         const auto neighborIt = nodes_.find(neighborId);
                         float d = 0.0f;
-                        if (neighborIt != nodes_.end()) {
+                        if (neighborIt != nodes_.end() &&
+                            neighborIt->second.point.size() == static_cast<size_t>(vector_dim_)) {
                             const auto& point = neighborIt->second.point;
                             d = computeDistance(Span<const float>(queryVector),
                                                 Span<const float>(point));
