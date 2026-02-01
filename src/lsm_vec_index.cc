@@ -985,10 +985,18 @@ using namespace ROCKSDB_NAMESPACE;
 
         auto getDistance = [&](node_id_t nodeId) -> float {
             if (layer > 0) {
-                // Upper layers: vectors are in-memory
-                const auto& point = nodes_.at(nodeId).point;
+                // Upper layers: vectors are in-memory when available.
+                const auto nodeIt = nodes_.find(nodeId);
+                if (nodeIt != nodes_.end()) {
+                    const auto& point = nodeIt->second.point;
+                    return computeDistance(Span<const float>(queryVector),
+                                           Span<const float>(point));
+                }
+                // Fallback to disk if the node is not tracked in upper layers.
+                std::vector<float> v;
+                readVectorWithStats(nodeId, v);
                 return computeDistance(Span<const float>(queryVector),
-                                       Span<const float>(point));
+                                       Span<const float>(v));
             } else {
                 // Level 0: vectors are on disk
                 std::vector<float> v;
@@ -1030,9 +1038,18 @@ using namespace ROCKSDB_NAMESPACE;
                 const auto& neighborIds = it->second;
                 for (node_id_t neighborId : neighborIds) {
                     if (visited.insert(neighborId).second) {
-                        const auto& point = nodes_.at(neighborId).point;
-                        float d = computeDistance(Span<const float>(queryVector),
-                                                  Span<const float>(point));
+                        const auto neighborIt = nodes_.find(neighborId);
+                        float d = 0.0f;
+                        if (neighborIt != nodes_.end()) {
+                            const auto& point = neighborIt->second.point;
+                            d = computeDistance(Span<const float>(queryVector),
+                                                Span<const float>(point));
+                        } else {
+                            std::vector<float> neighborVec;
+                            readVectorWithStats(neighborId, neighborVec);
+                            d = computeDistance(Span<const float>(queryVector),
+                                                Span<const float>(neighborVec));
+                        }
                         if (static_cast<int>(nearest.size()) < efSearch || d < nearest.top().first) {
                             candidates.emplace(-d, neighborId);
                             nearest.emplace(d, neighborId);
