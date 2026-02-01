@@ -108,7 +108,8 @@ using namespace ROCKSDB_NAMESPACE;
             options_,
             EDGE_UPDATE_EAGER,
             ENCODING_TYPE_NONE,
-            db_options_.reinit
+            db_options_.reinit,
+            db_path
         );
 
         if (db_options_.vector_storage_type == 1) {
