@@ -200,7 +200,7 @@ void insertFromFile(lsm_vec::LSMVecDB &db, const std::string &filename)
         return;
     }
 
-    while (input.read(reinterpret_cast<char *>(&dim), sizeof(int)) && node_count <= 100000)
+    while (input.read(reinterpret_cast<char *>(&dim), sizeof(int)))
     {
         if (node_count == 0)
         {
