@@ -73,7 +73,7 @@ void insertFromBigANNFile(lsm_vec::LSMVecDB &db, const std::string &filename)
     auto data = readBvecsFile(filename);
     for (size_t i = 0; i < data.size(); ++i)
     {
-        auto status = db.Insert(static_cast<int>(i), lsm_vec::Span<float>(data[i]));
+        auto status = db.Insert(static_cast<lsm_vec::node_id_t>(i), lsm_vec::Span<float>(data[i]));
         if (!status.ok())
         {
             std::cerr << "Insert failed for node " << i << ": " << status.ToString() << std::endl;
@@ -228,7 +228,7 @@ void insertFromFile(lsm_vec::LSMVecDB &db, const std::string &filename)
             }
         }
 
-        auto status = db.Insert(static_cast<int>(node_count), lsm_vec::Span<float>(finalVec));
+        auto status = db.Insert(static_cast<lsm_vec::node_id_t>(node_count), lsm_vec::Span<float>(finalVec));
         if (!status.ok())
         {
             std::cerr << "Insert failed for node " << node_count << ": " << status.ToString() << std::endl;

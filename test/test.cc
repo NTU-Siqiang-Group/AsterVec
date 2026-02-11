@@ -29,7 +29,7 @@ int main(int argc, char* argv[])
     options.ef_construction = config.efConstruction;
     options.vec_file_capacity = config.vec_file_capacity;
     options.paged_max_cached_pages = config.paged_max_cached_pages;
-    options.vector_storage_type = 0;
+    options.vector_storage_type = config.vector_storage_type;
     options.db_target_size = config.db_target_size;
     options.random_seed = config.random_seed;
     options.enable_stats = config.enable_stats;

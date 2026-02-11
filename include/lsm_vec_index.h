@@ -52,7 +52,7 @@ using namespace ROCKSDB_NAMESPACE;
         Status updateNode(node_id_t id, const std::vector<float>& vec);
         Status getNodeVector(node_id_t id, std::vector<float>* out);
         std::vector<SearchResult> knnSearchK(const std::vector<float>& query, int k, int ef_search);
-        std::unordered_set<int> highest_layer_nodes_;
+        std::unordered_set<node_id_t> highest_layer_nodes_;
 
         void printIndexStatus() const;
         void printStatistics() const;
@@ -118,7 +118,7 @@ using namespace ROCKSDB_NAMESPACE;
         
         std::ostream &out_file_;     // Output stream for logging
 
-        std::unordered_map<int, Node> nodes_; // In-memory nodes for layers > 0
+        std::unordered_map<node_id_t, Node> nodes_; // In-memory nodes for layers > 0
 
         std::random_device random_device_;
         std::mt19937 random_generator_;

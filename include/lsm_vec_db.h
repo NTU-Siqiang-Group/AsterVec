@@ -52,7 +52,11 @@ struct LSMVecDBOptions {
     float ef_construction = 64.0f;
     size_t vec_file_capacity = 100000;
     size_t paged_max_cached_pages = 256;
-    int vector_storage_type = 1;
+#ifdef __APPLE__
+    int vector_storage_type = 0; 
+#else
+    int vector_storage_type = 1; 
+#endif
     uint64_t db_target_size = 107374182400ULL;
     int random_seed = 12345;
     bool enable_stats = false;

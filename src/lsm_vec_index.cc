@@ -503,7 +503,7 @@ using namespace ROCKSDB_NAMESPACE;
             // ---- Shrink connections ----
             if (l > 0)
             {
-                for (int neighbor : selectedNeighbors)
+                for (node_id_t neighbor : selectedNeighbors)
                 {
                     auto neighborIt = nodes_.find(neighbor);
                     if (neighborIt == nodes_.end()) {
