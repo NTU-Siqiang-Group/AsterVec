@@ -11,6 +11,10 @@ set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wall -Wextra -O2")
+find_package(Boost REQUIRED)
+if(Boost_FOUND)
+    include_directories(${Boost_INCLUDE_DIRS})
+endif()
 add_compile_definitions(BOOST_RANDOM_USE_STD_RANDOM ROCKSDB_USE_STD_RANDOM)
 
 set(ASTER_ROCKSDB_ROOT ${CMAKE_SOURCE_DIR}/lib/aster)
@@ -90,6 +94,17 @@ target_include_directories(lsmvec_shared PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
 target_link_libraries(lsmvec_static PUBLIC ${LSMVEC_LINK_LIBS})
 target_link_libraries(lsmvec_shared PUBLIC ${LSMVEC_LINK_LIBS})
+if(APPLE)
+    find_library(JEMALLOC_LIB NAMES jemalloc)
+    
+    if(JEMALLOC_LIB)
+        message(STATUS "Found jemalloc at: ${JEMALLOC_LIB}")
+        target_link_libraries(lsmvec_shared PRIVATE ${JEMALLOC_LIB})
+    else()
+        message(WARNING "jemalloc not found, trying manual link...")
+        target_link_libraries(lsmvec_shared PRIVATE jemalloc)
+    endif()
+endif()
 
 set_target_properties(lsmvec_static PROPERTIES
     OUTPUT_NAME lsmvec
