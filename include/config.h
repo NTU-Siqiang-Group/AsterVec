@@ -21,7 +21,7 @@ struct Config {
     int k = 1;
     bool reinit = true;
 
-    int vector_storage_type = 0; // 0 for basic, 1 for paged
+    int vector_storage_type = 1; // 0 for basic, 1 for paged
 
     // --- Paths / I/O ---
     std::string db_path;                // required: RocksDB path (directory)
