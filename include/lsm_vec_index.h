@@ -127,6 +127,5 @@ using namespace ROCKSDB_NAMESPACE;
         node_id_t entry_point_ = k_invalid_node_id; // Entry point for HNSW graph
 
         std::unordered_set<node_id_t> deleted_ids_;
-
     };
 } // namespace ROCKSDB_NAMESPACE

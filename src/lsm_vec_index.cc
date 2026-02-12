@@ -112,6 +112,8 @@ using namespace ROCKSDB_NAMESPACE;
             db_path
         );
 
+        nodes_.reserve(10000);
+
         if (db_options_.vector_storage_type == 1) {
             LOG(INFO) << "Using page-based vector storage layout";
             vector_storage_ = std::make_unique<PagedVectorStorage>(
@@ -490,7 +492,7 @@ using namespace ROCKSDB_NAMESPACE;
                 vectorStored = true;
             }
 
-            // Link neighbors as before
+            // Link neighbors
             if (l > 0)
             {
                 linkNeighbors(nodeId, selectedNeighbors, l);

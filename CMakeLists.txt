@@ -96,7 +96,7 @@ target_link_libraries(lsmvec_static PUBLIC ${LSMVEC_LINK_LIBS})
 target_link_libraries(lsmvec_shared PUBLIC ${LSMVEC_LINK_LIBS})
 if(APPLE)
     find_library(JEMALLOC_LIB NAMES jemalloc)
-    
+
     if(JEMALLOC_LIB)
         message(STATUS "Found jemalloc at: ${JEMALLOC_LIB}")
         target_link_libraries(lsmvec_shared PRIVATE ${JEMALLOC_LIB})
