@@ -56,6 +56,7 @@ struct LSMVecDBOptions {
     uint64_t db_target_size = 107374182400ULL;
     int random_seed = 12345;
     bool enable_stats = false;
+    bool enable_batch_read = false;
     bool reinit = false;
     std::string vector_file_path;
     std::string log_file_path;

@@ -18,6 +18,7 @@ struct Config {
     size_t input_size;
     int random_seed = 12345;
     bool enable_stats = false;
+    bool enable_batch_read = false;
     int k = 1;
     bool reinit = true;
 
@@ -87,6 +88,7 @@ R"(Usage:
        [--reinit <0|1>] \
        [--k <int>] \
        [--stats <0|1>] \
+       [--batch-read <0|1>] \
        [--edge-policy <eager|lazy|none>] \
        [-h|--help]
 
@@ -121,6 +123,9 @@ Short aliases:
                 kv[k] = "1";
             }
             if (k == "reinit") {
+                kv[k] = "1";
+            }
+            if (k == "batch-read") {
                 kv[k] = "1";
             }
         };
@@ -176,6 +181,7 @@ Short aliases:
         if (kv.count("edge-policy"))        cfg_.edge_update_policy = kv["edge-policy"];
         if (kv.count("stats"))              cfg_.enable_stats = (kv["stats"] != "0");
         if (kv.count("reinit"))             cfg_.reinit = (kv["reinit"] != "0");
+        if (kv.count("batch-read"))         cfg_.enable_batch_read = (kv["batch-read"] != "0");
 
         if (kv.count("M"))                  cfg_.M = parseI(kv["M"]);
         if (kv.count("Mmax"))               cfg_.Mmax = parseI(kv["Mmax"]);

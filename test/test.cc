@@ -33,6 +33,7 @@ int main(int argc, char* argv[])
     options.db_target_size = config.db_target_size;
     options.random_seed = config.random_seed;
     options.enable_stats = config.enable_stats;
+    options.enable_batch_read = config.enable_batch_read;
     options.reinit = config.reinit;
     options.vector_file_path = config.vector_file_path;
 

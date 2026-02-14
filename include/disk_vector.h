@@ -62,6 +62,17 @@ public:
     // Optional prefetch API. Default is no-op.
     virtual void prefetchByIds(const std::vector<node_id_t>& /*ids*/) {}
 
+    // Batch read API: read multiple vectors at once.
+    // Default implementation reads one-by-one; PagedVectorStorage overrides
+    // to group reads by page for fewer page lookups.
+    virtual void readVectorsBatch(const std::vector<node_id_t>& ids,
+                                  std::vector<std::vector<float>>& out) {
+        out.resize(ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) {
+            readVectorFromDisk(ids[i], out[i]);
+        }
+    }
+
     // Optional page cache stats. Default returns zeros.
     virtual PageCacheStats getPageCacheStats() const { return {}; }
 };
@@ -766,6 +777,50 @@ public:
             size_t pageId = static_cast<size_t>(page);
             if (seenPage.emplace(pageId, true).second) {
                 loadPageToCache(pageId);
+            }
+        }
+    }
+
+    // Batch read: groups IDs by page, loads each page once, then reads all
+    // vectors from that page.  Eliminates redundant page lookups for vectors
+    // sharing the same page (128-dim = 8 vectors/page).
+    void readVectorsBatch(const std::vector<node_id_t>& ids,
+                          std::vector<std::vector<float>>& out) override {
+        out.resize(ids.size());
+
+        // Group indices by pageId
+        std::unordered_map<size_t, std::vector<size_t>> pageToIndices;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            node_id_t id = ids[i];
+            if (static_cast<size_t>(id) >= totalVectors_) {
+                throw std::out_of_range("Vector ID out of range in batch read.");
+            }
+            int64_t page = idToPage_[static_cast<size_t>(id)];
+            if (page < 0) {
+                throw std::runtime_error("Vector slot not assigned in batch read.");
+            }
+            pageToIndices[static_cast<size_t>(page)].push_back(i);
+        }
+
+        // For each page, load it once and read all vectors from it
+        for (auto& [pageId, indices] : pageToIndices) {
+            loadPageToCache(pageId);
+
+            for (size_t idx : indices) {
+                node_id_t id = ids[idx];
+                uint16_t slot = idToSlotInPage_[static_cast<size_t>(id)];
+                if (!tryReadFromCache(pageId, slot, out[idx])) {
+                    // Fallback: direct read
+                    if (out[idx].size() != dim_) out[idx].resize(dim_);
+                    size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
+                    fileStream_.clear();
+                    fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+                    fileStream_.read(reinterpret_cast<char*>(out[idx].data()),
+                                     static_cast<std::streamsize>(recordSize_));
+                    if (!fileStream_.good()) {
+                        throw std::runtime_error("Failed to read vector in batch.");
+                    }
+                }
             }
         }
     }

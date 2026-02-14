@@ -91,6 +91,7 @@ using namespace ROCKSDB_NAMESPACE;
           entry_point_(-1)
     {
         stats.setEnabled(db_options_.enable_stats);
+        enable_batch_read_ = db_options_.enable_batch_read;
 
         if (db_options_.random_seed > 0) {
             random_generator_.seed(db_options_.random_seed);
@@ -1102,19 +1103,50 @@ using namespace ROCKSDB_NAMESPACE;
                 rocksdb::Edges edges;
                 db_->GetAllEdges(currentId, &edges);
 
-                for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
-                    node_id_t neighborId = static_cast<node_id_t>(edges.nxts_out[i].nxt);
+                if (enable_batch_read_) {
+                    // --- Batch read path: collect unvisited, read all at once ---
+                    std::vector<node_id_t> unvisitedIds;
+                    unvisitedIds.reserve(edges.num_edges_out);
+                    for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
+                        node_id_t neighborId = static_cast<node_id_t>(edges.nxts_out[i].nxt);
+                        if (visited.insert(neighborId).second) {
+                            unvisitedIds.push_back(neighborId);
+                        }
+                    }
 
-                    if (visited.insert(neighborId).second) {
-                        std::vector<float> neighborVec;
-                        readVectorWithStats(neighborId, neighborVec);
-                        float d = computeDistance(Span<const float>(queryVector),
-                                                  Span<const float>(neighborVec));
-                        if (static_cast<int>(nearest.size()) < efSearch || d < nearest.top().first) {
-                            candidates.emplace(-d, neighborId);
-                            nearest.emplace(d, neighborId);
-                            if (static_cast<int>(nearest.size()) > efSearch) {
-                                nearest.pop();
+                    if (!unvisitedIds.empty()) {
+                        std::vector<std::vector<float>> neighborVecs;
+                        vector_storage_->readVectorsBatch(unvisitedIds, neighborVecs);
+
+                        for (size_t i = 0; i < unvisitedIds.size(); ++i) {
+                            float d = computeDistance(
+                                Span<const float>(queryVector),
+                                Span<const float>(neighborVecs[i]));
+                            if (static_cast<int>(nearest.size()) < efSearch || d < nearest.top().first) {
+                                candidates.emplace(-d, unvisitedIds[i]);
+                                nearest.emplace(d, unvisitedIds[i]);
+                                if (static_cast<int>(nearest.size()) > efSearch) {
+                                    nearest.pop();
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // --- Original path: read one-by-one ---
+                    for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
+                        node_id_t neighborId = static_cast<node_id_t>(edges.nxts_out[i].nxt);
+
+                        if (visited.insert(neighborId).second) {
+                            std::vector<float> neighborVec;
+                            readVectorWithStats(neighborId, neighborVec);
+                            float d = computeDistance(Span<const float>(queryVector),
+                                                      Span<const float>(neighborVec));
+                            if (static_cast<int>(nearest.size()) < efSearch || d < nearest.top().first) {
+                                candidates.emplace(-d, neighborId);
+                                nearest.emplace(d, neighborId);
+                                if (static_cast<int>(nearest.size()) > efSearch) {
+                                    nearest.pop();
+                                }
                             }
                         }
                     }
