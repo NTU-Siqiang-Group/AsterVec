@@ -71,12 +71,36 @@ endif()
 
 message(STATUS "Using ZSTD library at ${ZSTD_LIB}")
 
+find_library(SNAPPY_LIB snappy
+    HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/opt/snappy/lib
+)
+find_library(LZ4_LIB lz4
+    HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/opt/lz4/lib
+)
+find_library(BZ2_LIB bz2
+    HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/opt/bzip2/lib
+)
+
+if(NOT SNAPPY_LIB)
+    message(FATAL_ERROR "libsnappy not found; please install snappy or provide its path")
+endif()
+if(NOT LZ4_LIB)
+    message(FATAL_ERROR "liblz4 not found; please install lz4 or provide its path")
+endif()
+if(NOT BZ2_LIB)
+    message(FATAL_ERROR "libbz2 not found; please install bzip2 or provide its path")
+endif()
+
+message(STATUS "Using Snappy library at ${SNAPPY_LIB}")
+message(STATUS "Using LZ4 library at ${LZ4_LIB}")
+message(STATUS "Using BZ2 library at ${BZ2_LIB}")
+
 set(LSMVEC_LINK_LIBS
     ${ROCKSDB_LIB}
-    ${ZSTD_LIB}  
-    snappy
-    lz4
-    bz2
+    ${ZSTD_LIB}
+    ${SNAPPY_LIB}
+    ${LZ4_LIB}
+    ${BZ2_LIB}
     z
     pthread
     dl
