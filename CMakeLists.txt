@@ -112,7 +112,7 @@ if(JEMALLOC_LIB)
     message(STATUS "Found jemalloc at: ${JEMALLOC_LIB}")
     list(APPEND LSMVEC_LINK_LIBS ${JEMALLOC_LIB})
 else()
-    message(STATUS "jemalloc not found, skipping (OK if Aster was built without it)")
+    message(STATUS "jemalloc not found, skipping")
 endif()
 
 target_link_libraries(lsmvec_static PUBLIC ${LSMVEC_LINK_LIBS})
