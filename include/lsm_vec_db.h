@@ -49,14 +49,14 @@ struct LSMVecDBOptions {
     int m = 8;
     int m_max = 16;
     int m_level = 1;
-    float ef_construction = 64.0f;
+    float ef_construction = 32.0f;
     size_t vec_file_capacity = 100000;
-    size_t paged_max_cached_pages = 256;
+    size_t paged_max_cached_pages = 4096;
     int vector_storage_type = 1; 
     uint64_t db_target_size = 107374182400ULL;
     int random_seed = 12345;
     bool enable_stats = false;
-    bool enable_batch_read = false;
+    bool enable_batch_read = true;
     bool reinit = false;
     std::string vector_file_path;
     std::string log_file_path;

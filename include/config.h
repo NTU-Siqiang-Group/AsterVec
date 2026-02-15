@@ -14,11 +14,11 @@ struct Config {
     int   M = 8;
     int   Mmax = 16;
     int   Ml = 1;
-    float efConstruction = 64.0f;
+    float efConstruction = 32.0f;
     size_t input_size;
     int random_seed = 12345;
     bool enable_stats = false;
-    bool enable_batch_read = false;
+    bool enable_batch_read = true;
     int k = 1;
     bool reinit = true;
 
@@ -31,7 +31,7 @@ struct Config {
     // If --vec is omitted, this defaults to db_path
     std::string vector_file_path;
     size_t vec_file_capacity = 100000;
-    size_t paged_max_cached_pages = 512;
+    size_t paged_max_cached_pages = 4096;
 
     // New: single data directory and optional shared name/prefix
     // If only --data-dir is provided (no --name), filenames become:
