@@ -130,7 +130,7 @@ Example:
 * `--M <int>` (default: 8)
 * `--Mmax <int>` (default: 16)
 * `--Ml <int>` (default: 1)
-* `--efc <float>` (default: 64)
+* `--efc <float>` (default: 32)
 
 Example:
 
@@ -149,7 +149,7 @@ Example:
 * `--vec-storage <int>`:
   * `0` = BasicVectorStorage (default)
   * `1` = PagedVectorStorage (4KB pages + FIFO cache)
-* `--paged-cache-pages <count>`: page cache capacity in pages (default: 256)
+* `--paged-cache-pages <count>`: page cache capacity in pages (default: 4096)
 * `--out <path>`: output file (default: `output.txt`)
 
 ## Notes on vector storage
