@@ -42,18 +42,6 @@ message(STATUS "Using RocksDB headers at ${ROCKSDB_INCLUDE_DIR}")
 
 include_directories(${ROCKSDB_INCLUDE_DIR})
 
-# find_library(ROCKSDB_LIB rocksdb HINTS /usr/lib/x86_64-linux-gnu /usr/local/lib)
-# set(ROCKSDB_INCLUDE_DIR /usr/include/rocksdb)
-
-if(NOT ROCKSDB_LIB OR NOT ROCKSDB_INCLUDE_DIR)
-    message(FATAL_ERROR "RocksDB library or headers not found")
-endif()
-
-message(STATUS "Found RocksDB library at ${ROCKSDB_LIB}")
-message(STATUS "Found RocksDB headers at ${ROCKSDB_INCLUDE_DIR}")
-
-include_directories(${ROCKSDB_INCLUDE_DIR})
-
 # Specify the source files
 set(LIB_SOURCES
     src/lsm_vec_index.cc
@@ -116,19 +104,19 @@ add_library(lsmvec_shared SHARED $<TARGET_OBJECTS:lsmvec_obj>)
 target_include_directories(lsmvec_static PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(lsmvec_shared PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
+find_library(JEMALLOC_LIB NAMES jemalloc
+    HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/opt/jemalloc/lib
+)
+
+if(JEMALLOC_LIB)
+    message(STATUS "Found jemalloc at: ${JEMALLOC_LIB}")
+    list(APPEND LSMVEC_LINK_LIBS ${JEMALLOC_LIB})
+else()
+    message(STATUS "jemalloc not found, skipping (OK if Aster was built without it)")
+endif()
+
 target_link_libraries(lsmvec_static PUBLIC ${LSMVEC_LINK_LIBS})
 target_link_libraries(lsmvec_shared PUBLIC ${LSMVEC_LINK_LIBS})
-if(APPLE)
-    find_library(JEMALLOC_LIB NAMES jemalloc)
-
-    if(JEMALLOC_LIB)
-        message(STATUS "Found jemalloc at: ${JEMALLOC_LIB}")
-        target_link_libraries(lsmvec_shared PRIVATE ${JEMALLOC_LIB})
-    else()
-        message(WARNING "jemalloc not found, trying manual link...")
-        target_link_libraries(lsmvec_shared PRIVATE jemalloc)
-    endif()
-endif()
 
 set_target_properties(lsmvec_static PROPERTIES
     OUTPUT_NAME lsmvec
@@ -163,7 +151,7 @@ if(LSMVEC_BUILD_PYTHON)
 
     pybind11_add_module(lsm_vec_python MODULE python/lsm_vec_pybind.cc)
     target_include_directories(lsm_vec_python PRIVATE ${CMAKE_SOURCE_DIR}/include)
-    target_link_libraries(lsm_vec_python PRIVATE lsmvec_shared)
+    target_link_libraries(lsm_vec_python PRIVATE lsmvec_static)
     set_target_properties(lsm_vec_python PROPERTIES
         OUTPUT_NAME lsm_vec
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python

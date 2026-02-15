@@ -86,6 +86,7 @@ PYBIND11_MODULE(lsm_vec, m)
         .def_readwrite("random_seed", &lsm_vec::LSMVecDBOptions::random_seed)
         .def_readwrite("enable_stats", &lsm_vec::LSMVecDBOptions::enable_stats)
         .def_readwrite("reinit", &lsm_vec::LSMVecDBOptions::reinit)
+        .def_readwrite("enable_batch_read", &lsm_vec::LSMVecDBOptions::enable_batch_read)
         .def_readwrite("vector_file_path", &lsm_vec::LSMVecDBOptions::vector_file_path)
         .def_readwrite("log_file_path", &lsm_vec::LSMVecDBOptions::log_file_path);
 
