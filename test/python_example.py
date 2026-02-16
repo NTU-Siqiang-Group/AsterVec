@@ -14,6 +14,10 @@ db = lsm_vec.LSMVecDB.open(db_dir, opts)
 
 db.insert(1, [0.1] * 128)
 
+db.close()
+opts.reinit = False
+db = lsm_vec.LSMVecDB.open(db_dir, opts)
+
 searchOpts = lsm_vec.SearchOptions()
 searchOpts.k = 10
 results = db.search_knn([0.1] * 128, searchOpts)

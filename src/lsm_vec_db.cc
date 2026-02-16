@@ -256,6 +256,8 @@ Status LSMVecDB::Close()
         log_stream_->flush();
     }
 
+    index_->close();
+
     return Status::OK();
 }
 } // namespace lsm_vec
