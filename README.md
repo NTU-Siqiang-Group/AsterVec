@@ -1,52 +1,87 @@
 # LSM-Vec
 
-LSM-Vec is a research prototype that builds an HNSW-style index on top of **Aster**
-(a RocksDB fork providing a graph API). Vectors are stored on disk via a
-pluggable vector storage layer.
+LSM-Vec is a disk-based approximate nearest-neighbor search engine built on
+[HNSW](https://arxiv.org/abs/1603.09320). It stores the Layer-0 graph edges in
+**Aster** (a [RocksDB](https://rocksdb.org/) fork with a native graph API) and
+keeps vectors on disk through a pluggable storage layer. Upper HNSW layers are
+held in memory for fast traversal.
 
 ## Features
 
-* HNSW graph construction with configurable hyperparameters (`M`, `Mmax`, `Ml`, `efConstruction`)
-* Layer-0 edges stored in **Aster RocksGraph**
-* Upper layers stored in memory
-* Two vector storage backends:
-  * **BasicVectorStorage**: contiguous by logical ID
-  * **PagedVectorStorage**: 4KB-page managed layout + FIFO page cache (user-space)
+- HNSW graph index with fully configurable hyperparameters (`M`, `Mmax`, `Ml`, `efConstruction`)
+- Layer-0 edges persisted in Aster RocksGraph (LSM-tree backed)
+- Upper-layer edges kept in-memory for fast navigation
+- Two vector storage backends:
+  - **BasicVectorStorage** -- contiguous flat file, offset by logical ID
+  - **PagedVectorStorage** -- 4 KB page-managed layout with a user-space page cache (FIFO eviction)
+- Batch vector read -- groups neighbor reads by page to reduce I/O during search
+- Persistent metadata -- database can be closed and reopened without re-indexing
+- Python SDK via pybind11 (`pip install .`)
 
 ## Repository layout
 
 ```
-LSM-Vec/
-  include/
-  src/
-  test/
+LAINN/
+  include/           # C++ headers (public API + internals)
+  src/               # C++ source files + Python example
+  python/            # pybind11 binding source
+  test/              # C++ test binary entry point + Python quick-start
+  data/              # dataset preparation scripts
   lib/
-    aster/        # Aster submodule
+    aster/           # Aster submodule (RocksDB fork)
   CMakeLists.txt
   Makefile
+  pyproject.toml     # Python packaging (scikit-build-core)
 ```
 
-## Dependencies
 
-### System packages (Ubuntu/Debian)
+---
+
+## Prerequisites
+
+### Compiler & tools
+
+- C++17 compiler (GCC 8+ or Clang 10+)
+- CMake >= 3.10
+- GNU Make
+- Boost (headers only)
+
+### System libraries
+
+**Ubuntu / Debian**
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  build-essential cmake \
+  build-essential cmake libboost-dev \
   libzstd-dev libsnappy-dev liblz4-dev libbz2-dev zlib1g-dev
 ```
 
-## Build
+**macOS (Homebrew)**
 
-### 1) Build Aster
+```bash
+brew install cmake boost zstd snappy lz4 bzip2
+```
+
+---
+
+
+## Building (C++)
+
+### Step 1 -- Build Aster
+
+Aster is included as a Git submodule. Initialize it and build the static
+library:
 
 ```bash
 git submodule update --init --recursive
 make aster
 ```
 
-### 2) Build embeddable libraries
+This produces `lib/aster/librocksdb.a`. The build typically takes a few minutes
+and uses all available cores automatically.
+
+### Step 2 -- Build the LSM-Vec libraries
 
 ```bash
 make lib
@@ -54,56 +89,61 @@ make lib
 
 Outputs:
 
-```
-build/lib/liblsmvec.a
-build/lib/liblsmvec.so
-```
+| File | Description |
+|------|-------------|
+| `build/lib/liblsmvec.a` | Static library |
+| `build/lib/liblsmvec.so` (Linux) / `liblsmvec.dylib` (macOS) | Shared library |
 
-### 3) Build the example/test binary
+### Step 3 -- Build the test binary
 
 ```bash
 make bin
 ```
 
-The target `lsm_vec` is built from `test/test.cc` and is placed in `build/bin/`
-by default. If your generator overrides output paths, check the CMake build logs
-for the exact location.
+The executable `lsm_vec` is placed in `build/bin/`. It reads a vector dataset,
+builds the HNSW index, runs k-NN queries, and compares results against a ground
+truth file.
 
-## Embedding
-
-Include headers from `include/` and link against `liblsmvec.a` or
-`liblsmvec.so`, plus the transitive dependencies:
-`rocksdb`, `zstd`, `snappy`, `lz4`, `bz2`, `z`, `jemalloc`, `pthread`, `dl`.
-When using the shared library, make sure the runtime can locate `liblsmvec.so`.
-
-## Testing
-
-The example/test entry point is the binary built from `test/test.cc`. It accepts
-CLI flags defined in `include/config.h` and expects a dataset on disk.
-
-### Example: prepare a mini dataset
-
-You can generate a small SIFT dataset under `data/` and then run the examples
-below.
+### One-shot build
 
 ```bash
-python data/prepare_sift_100k.py
+make          # equivalent to: make lib bin
 ```
 
-### Required flags
+### Cleaning
 
-* `--db <path>`: DB directory (required)
-* dataset files: either via `--data-dir` (recommended) or explicit `--base/--query/--truth`
+```bash
+make clean    # removes the build/ directory
+```
 
-### Option A: use `--data-dir` (recommended)
+---
 
-If you pass only `--data-dir`, the tool expects:
+## Running the Test Binary
 
-* `<data-dir>/input.fvecs`
-* `<data-dir>/query.fvecs`
-* `<data-dir>/groundtruth.ivecs`
+### Prepare a dataset
 
-Example:
+A helper script downloads the SIFT1M corpus and creates a 100 k-vector subset
+with pre-computed ground truth:
+
+```bash
+cd data
+python prepare_sift_100k.py
+cd ..
+```
+
+This produces three files under `data/`:
+
+| File | Format | Contents |
+|------|--------|----------|
+| `sift_100k_input.fvecs` | fvecs | 100 000 base vectors (128-d) |
+| `sift_100k_query.fvecs` | fvecs | 10 000 query vectors (128-d) |
+| `sift_100k_groundtruth.ivecs` | ivecs | Exact top-100 neighbors per query |
+
+### Run with `--data-dir` (recommended)
+
+If all three files share a common directory and follow the naming convention
+`input.fvecs` / `query.fvecs` / `groundtruth.ivecs`, point `--data-dir` at that
+directory:
 
 ```bash
 ./build/bin/lsm_vec \
@@ -112,118 +152,333 @@ Example:
   --out ./run/output.txt
 ```
 
-### Option B: explicit file paths
+If the files carry a shared prefix, pass `--name`:
+
+```bash
+# expects: data/sift_100k_input.fvecs, data/sift_100k_query.fvecs, ...
+./build/bin/lsm_vec \
+  --db ./run/db \
+  --data-dir ./data \
+  --name sift_100k \
+  --out ./run/output.txt
+```
+
+### Run with explicit file paths
 
 ```bash
 ./build/bin/lsm_vec \
   --db ./run/db \
-  --base ./data/sift_100k_input.fvecs \
+  --base  ./data/sift_100k_input.fvecs \
   --query ./data/sift_100k_query.fvecs \
   --truth ./data/sift_100k_groundtruth.ivecs \
-  --out ./run/output.txt
+  --out   ./run/output.txt
 ```
 
-## CLI options
+---
 
-### Graph / index parameters
+## CLI Reference
 
-* `--M <int>` (default: 8)
-* `--Mmax <int>` (default: 16)
-* `--Ml <int>` (default: 1)
-* `--efc <float>` (default: 32)
+Run `./build/bin/lsm_vec --help` for the full list.
 
-Example:
+### Required
+
+| Flag | Description |
+|------|-------------|
+| `--db <path>` | Database directory (created automatically if absent) |
+| Dataset | Either `--data-dir` (+ optional `--name`) **or** all three of `--base`, `--query`, `--truth` |
+
+### HNSW Parameters
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--M <int>` | `-m` | 8 | Number of bi-directional links per node |
+| `--Mmax <int>` | `-x` | 16 | Max neighbors per node per layer |
+| `--Ml <int>` | `-l` | 1 | Level multiplier for random level generation |
+| `--efc <float>` | `-e` | 32 | Candidate pool size during construction (ef_construction) |
+| `--k <int>` | `-k` | 1 | Number of nearest neighbors to retrieve |
+
+### Storage
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--vec <path>` | `-v` | `<db>/vector.log` | Path to the vector data file |
+| `--vec-storage <int>` | `-V` | 1 | `0` = BasicVectorStorage, `1` = PagedVectorStorage |
+| `--paged-cache-pages <int>` | | 4096 | Number of 4 KB pages kept in the user-space page cache |
+| `--db-target-size <bytes>` | `-s` | 107374182400 | RocksDB target file size (100 GiB) |
+
+### Runtime / Feature Switches
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--batch-read <0\|1>` | 1 | Batch vector reads during search (groups by page for fewer I/O ops) |
+| `--stats <0\|1>` | 0 | Print performance statistics after the run |
+| `--reinit <0\|1>` | 1 | Wipe and reinitialize the database on open (set to 0 to reopen an existing DB) |
+| `--edge-policy <eager\|lazy\|none>` | eager | Edge update strategy |
+
+### Output
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--out <path>` | `-o` | `output.txt` | File to write query results |
+
+### Example with tuned parameters
 
 ```bash
 ./build/bin/lsm_vec \
   --db ./run/db \
-  --data-dir ./data/sift_100k \
-  --M 16 --Mmax 32 --Ml 1 --efc 200 \
+  --data-dir ./data \
+  --name sift_100k \
+  --M 16 --Mmax 32 --efc 200 --k 10 \
+  --vec-storage 1 --paged-cache-pages 1024 \
+  --batch-read \
+  --stats \
   --out ./run/output.txt
 ```
 
-### Storage / paths
+---
 
-* `--db <path>`: DB directory (required)
-* `--vec <path>`: vector file path (default: `<db>/vector.log`)
-* `--vec-storage <int>`:
-  * `0` = BasicVectorStorage (default)
-  * `1` = PagedVectorStorage (4KB pages + FIFO cache)
-* `--paged-cache-pages <count>`: page cache capacity in pages (default: 4096)
-* `--out <path>`: output file (default: `output.txt`)
+## Vector Storage Backends
 
-## Notes on vector storage
+### BasicVectorStorage (`--vec-storage 0`)
 
-### BasicVectorStorage
+- Vectors stored contiguously: `offset = id * dim * sizeof(float)`
+- No user-space caching; relies entirely on the OS page cache
+- Simple and fast for sequential ID access patterns
 
-* Writes/reads by offset = `id * dim * sizeof(float)`
-* Performance depends heavily on OS page cache and access pattern
+### PagedVectorStorage (`--vec-storage 1`, default)
 
-### PagedVectorStorage
+- Vectors organized into 4 KB pages; no vector crosses a page boundary
+- Vectors sharing the same HNSW Level-1 entry point are co-located on the same page,
+  improving spatial locality during graph traversal
+- User-space FIFO page cache (`--paged-cache-pages` controls the capacity)
+- **Batch read** (`--batch-read`): during k-NN search, all unvisited neighbor
+  vectors in a layer-0 search step are grouped by page and read together,
+  reducing redundant page loads
 
-* Manages vectors by 4KB pages
-* Vectors never cross page boundaries
-* Page-level caching with FIFO eviction (`paged_max_cached_pages` inside `Config.h`)
-* Supports optional page prefetch by IDs
+---
 
-## Python plugin (SDK/API)
+## Embedding LSM-Vec in Your Application
 
-LSM-Vec includes an optional pybind11-based Python module. Enable it by passing
-`-DLSMVEC_BUILD_PYTHON=ON` when configuring CMake. The resulting extension is
-named `lsm_vec` and is written to `build/python/`.
+Include headers from `include/` and link against `liblsmvec.a` (static) or
+`liblsmvec.so` / `liblsmvec.dylib` (shared).
 
-```bash
-cmake -S . -B build -DLSMVEC_BUILD_PYTHON=ON
-cmake --build build
+Transitive link dependencies: `rocksdb` (Aster), `zstd`, `snappy`, `lz4`,
+`bz2`, `z`, `pthread`, `dl`. On macOS, `jemalloc` is also required.
+
+```cpp
+#include "lsm_vec_db.h"
+
+lsm_vec::LSMVecDBOptions opts;
+opts.dim = 128;
+opts.vector_file_path = "./db/vectors.bin";
+
+std::unique_ptr<lsm_vec::LSMVecDB> db;
+auto s = lsm_vec::LSMVecDB::Open("./db", opts, &db);
+
+// Insert
+std::vector<float> vec(128, 0.1f);
+db->Insert(0, vec);
+
+// Search
+lsm_vec::SearchOptions search_opts;
+search_opts.k = 10;
+search_opts.ef_search = 64;
+std::vector<lsm_vec::SearchResult> results;
+db->SearchKnn(vec, search_opts, &results);
+
+// Close
+db->Close();
 ```
 
-Example usage:
+---
+
+## Python SDK
+
+LSM-Vec provides a Python module (`lsm_vec`) via pybind11. It supports Python
+lists and NumPy arrays as vector inputs.
+
+### Installation
+
+**Prerequisite:** Aster must be built first (see [Step 1](#step-1----build-aster)).
+
+```bash
+git submodule update --init --recursive   # if not done already
+make aster                                 # builds lib/aster/librocksdb.a
+python -m pip install .                    # builds and installs the lsm_vec module
+```
+
+`python -m pip install .` handles the entire C++ compilation internally via
+scikit-build-core. You do **not** need to run `make lib` beforehand.
+
+To verify:
+
+```bash
+python -c "import lsm_vec; print('OK')"
+```
+
+### Quick Start
+
+A ready-to-run example is provided at **`test/python_example.py`**:
+
+```bash
+python test/python_example.py
+```
 
 ```python
+import lsm_vec
+import os
+
+opts = lsm_vec.LSMVecDBOptions()
+opts.dim = 128
+db_dir = "./run/db/"
+opts.vector_file_path = os.path.join(db_dir, "vectors.bin")
+opts.reinit = True
+
+db = lsm_vec.LSMVecDB.open(db_dir, opts)
+
+db.insert(1, [0.1] * 128)
+
+search_opts = lsm_vec.SearchOptions()
+search_opts.k = 10
+results = db.search_knn([0.1] * 128, search_opts)
+print(results[0].id, results[0].distance)
+```
+
+### Python API Reference
+
+#### `lsm_vec.LSMVecDBOptions`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `dim` | int | 0 | Vector dimensionality (required) |
+| `metric` | DistanceMetric | `L2` | `lsm_vec.L2` or `lsm_vec.Cosine` |
+| `m` | int | 8 | HNSW M parameter |
+| `m_max` | int | 16 | Max neighbors per layer |
+| `m_level` | int | 1 | Level multiplier |
+| `ef_construction` | float | 32.0 | Construction-time candidate pool size |
+| `vec_file_capacity` | int | 100000 | Initial vector file capacity |
+| `paged_max_cached_pages` | int | 4096 | Page cache capacity (number of pages) |
+| `vector_storage_type` | int | 1 | 0 = Basic, 1 = Paged |
+| `db_target_size` | int | 107374182400 | RocksDB target file size (bytes) |
+| `random_seed` | int | 12345 | Seed for HNSW level generation |
+| `enable_stats` | bool | False | Print statistics |
+| `enable_batch_read` | bool | True | Batch vector reads during search |
+| `reinit` | bool | False | Wipe DB on open |
+| `vector_file_path` | str | "" | Path to the vector data file |
+| `log_file_path` | str | "" | Path to the log file |
+
+#### `lsm_vec.SearchOptions`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `k` | int | 1 | Number of nearest neighbors |
+| `ef_search` | int | 64 | Search-time candidate pool size |
+
+#### `lsm_vec.SearchResult`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | int | Vector ID |
+| `distance` | float | Distance from query |
+
+#### `lsm_vec.LSMVecDB`
+
+| Method | Description |
+|--------|-------------|
+| `LSMVecDB.open(path, opts)` | Open or create a database |
+| `db.insert(id, vector)` | Insert a vector (list or numpy array) |
+| `db.update(id, vector)` | Update an existing vector |
+| `db.delete(id)` | Delete a vector by ID |
+| `db.get(id) -> np.ndarray` | Retrieve a vector by ID |
+| `db.search_knn(query, opts)` | Search with a `SearchOptions` object |
+| `db.search_knn(query, k, ef_search)` | Search with explicit k and ef_search |
+| `db.close()` | Flush and close the database |
+
+### NumPy Example
+
+```python
+import numpy as np
 import lsm_vec
 
 opts = lsm_vec.LSMVecDBOptions()
 opts.dim = 128
-opts.vector_file_path = "./run/db/vector.log"
+opts.vector_file_path = "./run/db/vectors.bin"
+opts.reinit = True
 
-db = lsm_vec.LSMVecDB.open("./run/db", opts)
-db.insert(0, [0.1] * 128)
+db = lsm_vec.LSMVecDB.open("./run/db/", opts)
 
-search_opts = lsm_vec.SearchOptions()
-search_opts.k = 5
-results = db.search_knn([0.1] * 128, search_opts)
-print([(r.id, r.distance) for r in results])
+vec = np.random.rand(128).astype(np.float32)
+db.insert(42, vec)
+
+query = np.random.rand(128).astype(np.float32)
+results = db.search_knn(query, k=5, ef_search=100)
+for r in results:
+    print(f"id={r.id}  distance={r.distance:.4f}")
+
+db.close()
 ```
 
-### pip install .
-
-You can also build and install the module via `pip` (uses `pyproject.toml` and
-scikit-build-core under the hood):
-
-```bash
-pip install .
-```
-
-If you want an editable install while iterating locally:
-
-```bash
-pip install -e .
-```
+---
 
 ## Troubleshooting
 
-#### 1) Link errors about RocksGraph methods (e.g. `undefined reference to rocksdb::RocksGraph::AddEdge`)
+### `Aster RocksDB library or headers not found`
 
-This usually means you linked against **system RocksDB** instead of Aster’s build.
+Aster hasn't been built yet:
 
-Make sure:
+```bash
+git submodule update --init --recursive
+make aster
+```
 
-* Aster is built under `lib/aster`
-* CMake resolves the RocksDB library from `lib/aster` (not `/usr/lib/...`)
+### `undefined reference to rocksdb::RocksGraph::AddEdge` (or similar)
 
-#### 2) ZSTD undefined references (e.g. `ZSTD_versionNumber`)
+You are linking against system RocksDB instead of Aster. Make sure CMake
+resolves the library from `lib/aster/`, not `/usr/lib/`. Check the CMake output
+for the line `Using RocksDB library at ...`.
 
-You are missing `-lzstd` at link time, or `libzstd-dev` is not installed.
+### `libzstd not found` / `libsnappy not found` / `liblz4 not found` / `libbz2 not found`
 
-* Install `libzstd-dev`
-* Ensure `target_link_libraries(... zstd ...)` is present (your current CMake does this)
+Install the missing library:
+
+- **Ubuntu:** `sudo apt-get install libzstd-dev libsnappy-dev liblz4-dev libbz2-dev`
+- **macOS:** `brew install zstd snappy lz4 bzip2`
+
+### `externally-managed-environment` when running `pip install .`
+
+Your system Python is managed by the OS package manager. Use a virtual
+environment or conda:
+
+```bash
+conda create -n lainn python=3.12 -y
+conda activate lainn
+python -m pip install .
+```
+
+### `cannot allocate memory in static TLS block` (Linux, jemalloc)
+
+This occurs when the Python module is loaded via `dlopen` and jemalloc's
+thread-local storage cannot be allocated. Preload jemalloc at process startup:
+
+```bash
+LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2 python test/python_example.py
+```
+
+To make this automatic in a conda environment:
+
+```bash
+conda activate lainn
+mkdir -p $CONDA_PREFIX/etc/conda/activate.d $CONDA_PREFIX/etc/conda/deactivate.d
+echo 'export LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2' \
+  > $CONDA_PREFIX/etc/conda/activate.d/jemalloc.sh
+echo 'unset LD_PRELOAD' \
+  > $CONDA_PREFIX/etc/conda/deactivate.d/jemalloc.sh
+```
+
+### `GLIBCXX_3.4.30 not found` (Linux, conda)
+
+Conda ships an older `libstdc++`. Update it:
+
+```bash
+conda install -c conda-forge libstdcxx-ng>=12
+```
