@@ -4,6 +4,7 @@ import os
 opts = lsm_vec.LSMVecDBOptions()
 opts.dim = 128
 db_dir = "./run/db/"
+os.makedirs(db_dir, exist_ok=True)
 if hasattr(opts, "vector_file_path"):
     opts.vector_file_path = os.path.join(db_dir, "vectors.bin")
 if hasattr(opts, "log_file_path"):

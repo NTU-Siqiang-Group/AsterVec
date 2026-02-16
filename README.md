@@ -405,6 +405,7 @@ opts.dim = 128
 opts.vector_file_path = "./run/db/vectors.bin"
 opts.reinit = True
 
+os.makedirs(db_dir, exist_ok=True)
 db = lsm_vec.LSMVecDB.open("./run/db/", opts)
 
 vec = np.random.rand(128).astype(np.float32)
