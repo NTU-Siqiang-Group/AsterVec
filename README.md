@@ -148,7 +148,7 @@ directory:
 ```bash
 ./build/bin/lsm_vec \
   --db ./run/db \
-  --data-dir ./data/sift_100k \
+  --data-dir ./data/sift_100k_ \
   --out ./run/output.txt
 ```
 
@@ -158,7 +158,7 @@ If the files carry a shared prefix, pass `--name`:
 # expects: data/sift_100k_input.fvecs, data/sift_100k_query.fvecs, ...
 ./build/bin/lsm_vec \
   --db ./run/db \
-  --data-dir ./data \
+  --data-dir ./data/ \
   --name sift_100k \
   --out ./run/output.txt
 ```
@@ -221,15 +221,14 @@ Run `./build/bin/lsm_vec --help` for the full list.
 |------|-------|---------|-------------|
 | `--out <path>` | `-o` | `output.txt` | File to write query results |
 
-### Example with tuned parameters
+### Example with parameters
 
 ```bash
 ./build/bin/lsm_vec \
   --db ./run/db \
-  --data-dir ./data \
-  --name sift_100k \
-  --M 16 --Mmax 32 --efc 200 --k 10 \
-  --vec-storage 1 --paged-cache-pages 1024 \
+  --data-dir ./data/sift_100k_ \
+  --M 8 --Mmax 16 --efc 64 --k 10 \
+  --vec-storage 1 --paged-cache-pages 4096 \
   --batch-read \
   --stats \
   --out ./run/output.txt
@@ -297,9 +296,11 @@ db->Close();
 LSM-Vec provides a Python module (`lsm_vec`) via pybind11. It supports Python
 lists and NumPy arrays as vector inputs.
 
+
 ### Installation
 
-**Prerequisite:** Aster must be built first (see [Step 1](#step-1----build-aster)).
+**Prerequisite:** Aster must be built first (see [Step 1](#step-1----build-aster)). And please install `ninja-build` at first.
+
 
 ```bash
 git submodule update --init --recursive   # if not done already
@@ -482,4 +483,13 @@ Conda ships an older `libstdc++`. Update it:
 
 ```bash
 conda install -c conda-forge libstdcxx-ng>=12
+```
+
+
+### ImportError: liblsmvec.so: cannot open shared object file: No such file or directory
+
+Update library paths:
+
+```bash
+export LD_LIBRARY_PATH=/path/to/LSM_Vec/build/lib:$LD_LIBRARY_PATH
 ```
