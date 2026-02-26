@@ -17,6 +17,8 @@ constexpr char kDefaultLogFileName[] = "lsm_vec_db.log";
 constexpr char kMetadataFileName[] = "lsm_vec_db.meta";
 } // namespace
 
+LSMVecDB::~LSMVecDB() = default;
+
 LSMVecDB::LSMVecDB(const std::string& db_path,
                    const LSMVecDBOptions& options,
                    std::unique_ptr<LSMVec> index,
@@ -224,6 +226,15 @@ Status LSMVecDB::SearchKnn(Span<float> query,
     }
 
     return Status::OK();
+}
+
+Status LSMVecDB::SearchKnn(Span<float> query,
+                           std::vector<SearchResult>* out)
+{
+    SearchOptions opts;
+    opts.k = options_.k;
+    opts.ef_search = options_.ef_search;
+    return SearchKnn(query, opts, out);
 }
 
 void LSMVecDB::printStatistics() const

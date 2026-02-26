@@ -216,6 +216,7 @@ Run `./build/bin/lsm_vec --help` for the full list.
 | `--Ml <int>` | `-l` | 1 | Level multiplier for random level generation |
 | `--efc <float>` | `-e` | 32 | Candidate pool size during construction (ef_construction) |
 | `--k <int>` | `-k` | 1 | Number of nearest neighbors to retrieve |
+| `--efs <int>` | `-f` | 64 | Candidate pool size during search (ef_search) |
 
 ### Storage
 
@@ -247,7 +248,7 @@ Run `./build/bin/lsm_vec --help` for the full list.
 ./build/bin/lsm_vec \
   --db ./run/db \
   --data-dir ./data/sift_100k_ \
-  --M 8 --Mmax 16 --efc 64 --k 10 \
+  --M 8 --Mmax 16 --efc 32 --k 10 --efs 64 \
   --vec-storage 1 --paged-cache-pages 4096 \
   --batch-read \
   --stats \
@@ -298,12 +299,9 @@ auto s = lsm_vec::LSMVecDB::Open("./db", opts, &db);
 std::vector<float> vec(128, 0.1f);
 db->Insert(0, vec);
 
-// Search
-lsm_vec::SearchOptions search_opts;
-search_opts.k = 10;
-search_opts.ef_search = 64;
+// Search (uses k and ef_search from opts)
 std::vector<lsm_vec::SearchResult> results;
-db->SearchKnn(vec, search_opts, &results);
+db->SearchKnn(vec, &results);
 
 // Close
 db->Close();
@@ -359,9 +357,8 @@ db = lsm_vec.LSMVecDB.open(db_dir, opts)
 
 db.insert(1, [0.1] * 128)
 
-search_opts = lsm_vec.SearchOptions()
-search_opts.k = 10
-results = db.search_knn([0.1] * 128, search_opts)
+# Search (uses k and ef_search from opts)
+results = db.search_knn([0.1] * 128)
 print(results[0].id, results[0].distance)
 ```
 
@@ -385,6 +382,8 @@ print(results[0].id, results[0].distance)
 | `enable_stats` | bool | False | Print statistics |
 | `enable_batch_read` | bool | True | Batch vector reads during search |
 | `reinit` | bool | False | Wipe DB on open |
+| `k` | int | 1 | Default number of nearest neighbors for search |
+| `ef_search` | int | 64 | Default search-time candidate pool size |
 | `vector_file_path` | str | "" | Path to the vector data file |
 | `log_file_path` | str | "" | Path to the log file |
 
@@ -411,8 +410,9 @@ print(results[0].id, results[0].distance)
 | `db.update(id, vector)` | Update an existing vector |
 | `db.delete(id)` | Delete a vector by ID |
 | `db.get(id) -> np.ndarray` | Retrieve a vector by ID |
-| `db.search_knn(query, opts)` | Search with a `SearchOptions` object |
+| `db.search_knn(query)` | Search using `k` and `ef_search` from `LSMVecDBOptions` |
 | `db.search_knn(query, k, ef_search)` | Search with explicit k and ef_search |
+| `db.search_knn(query, opts)` | Search with a `SearchOptions` object |
 | `db.close()` | Flush and close the database |
 
 ### NumPy Example
@@ -423,17 +423,19 @@ import lsm_vec
 
 opts = lsm_vec.LSMVecDBOptions()
 opts.dim = 128
+opts.k = 5
+opts.ef_search = 100
 opts.vector_file_path = "./run/db/vectors.bin"
 opts.reinit = True
 
-os.makedirs(db_dir, exist_ok=True)
+os.makedirs("./run/db/", exist_ok=True)
 db = lsm_vec.LSMVecDB.open("./run/db/", opts)
 
 vec = np.random.rand(128).astype(np.float32)
 db.insert(42, vec)
 
 query = np.random.rand(128).astype(np.float32)
-results = db.search_knn(query, k=5, ef_search=100)
+results = db.search_knn(query)
 for r in results:
     print(f"id={r.id}  distance={r.distance:.4f}")
 

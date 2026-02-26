@@ -87,6 +87,8 @@ PYBIND11_MODULE(lsm_vec, m)
         .def_readwrite("enable_stats", &lsm_vec::LSMVecDBOptions::enable_stats)
         .def_readwrite("reinit", &lsm_vec::LSMVecDBOptions::reinit)
         .def_readwrite("enable_batch_read", &lsm_vec::LSMVecDBOptions::enable_batch_read)
+        .def_readwrite("k", &lsm_vec::LSMVecDBOptions::k)
+        .def_readwrite("ef_search", &lsm_vec::LSMVecDBOptions::ef_search)
         .def_readwrite("vector_file_path", &lsm_vec::LSMVecDBOptions::vector_file_path)
         .def_readwrite("log_file_path", &lsm_vec::LSMVecDBOptions::log_file_path);
 
@@ -177,6 +179,20 @@ PYBIND11_MODULE(lsm_vec, m)
             options.ef_search = ef_search;
             std::vector<lsm_vec::SearchResult> out;
             RaiseStatus(db.SearchKnn(MakeSpan(data), options, &out));
+            return out;
+        })
+        .def("search_knn", [](lsm_vec::LSMVecDB& db,
+                              const py::sequence& seq) {
+            auto data = ToVector(seq);
+            std::vector<lsm_vec::SearchResult> out;
+            RaiseStatus(db.SearchKnn(MakeSpan(data), &out));
+            return out;
+        })
+        .def("search_knn", [](lsm_vec::LSMVecDB& db,
+                              const py::array_t<float, py::array::c_style | py::array::forcecast>& array) {
+            auto data = ToVector(array);
+            std::vector<lsm_vec::SearchResult> out;
+            RaiseStatus(db.SearchKnn(MakeSpan(data), &out));
             return out;
         })
         .def("close", [](lsm_vec::LSMVecDB& db) {

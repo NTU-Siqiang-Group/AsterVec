@@ -254,7 +254,8 @@ void insertFromFile(lsm_vec::LSMVecDB &db, const std::string &filename)
 void queryAndCompareWithGroundTruth(lsm_vec::LSMVecDB &db,
                                     const std::string &queryFile,
                                     const std::string &groundTruthFile,
-                                    int k)
+                                    int k,
+                                    int ef_search)
 {
     auto queries = readFvecsFile(queryFile);
     auto groundTruth = readIvecsFile(groundTruthFile);
@@ -270,6 +271,7 @@ void queryAndCompareWithGroundTruth(lsm_vec::LSMVecDB &db,
     double totalQueryTime = 0.0;
     lsm_vec::SearchOptions search_options;
     search_options.k = k;
+    search_options.ef_search = ef_search;
 
     for (size_t i = 0; i < queries.size(); ++i)
     {

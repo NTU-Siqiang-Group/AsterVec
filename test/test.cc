@@ -54,7 +54,7 @@ int main(int argc, char* argv[])
     // }
 
     std::cout << "Querying and comparing with ground truth " << config.query_file_path << std::endl;
-    queryAndCompareWithGroundTruth(*db, config.query_file_path, config.groundtruth_file_path, config.k);
+    queryAndCompareWithGroundTruth(*db, config.query_file_path, config.groundtruth_file_path, config.k, config.ef_search);
     if(options.enable_stats){
         std::cout << "---------------------------------" << std::endl;
         db->printStatistics();
@@ -73,6 +73,6 @@ int main(int argc, char* argv[])
         return 1;
     }
     std::cout << "Querying and comparing with ground truth after reopen " << config.query_file_path << std::endl;
-    queryAndCompareWithGroundTruth(*db, config.query_file_path, config.groundtruth_file_path, config.k);
+    queryAndCompareWithGroundTruth(*db, config.query_file_path, config.groundtruth_file_path, config.k, config.ef_search);
     return 0;
 }

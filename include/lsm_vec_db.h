@@ -58,6 +58,8 @@ struct LSMVecDBOptions {
     bool enable_stats = false;
     bool enable_batch_read = true;
     bool reinit = false;
+    int k = 1;
+    int ef_search = 64;
     std::string vector_file_path;
     std::string log_file_path;
 };
@@ -74,6 +76,8 @@ struct SearchResult {
 
 class LSMVecDB {
 public:
+    ~LSMVecDB();
+
     static Status Open(const std::string& path,
                        const LSMVecDBOptions& opts,
                        std::unique_ptr<LSMVecDB>* db);
@@ -85,6 +89,9 @@ public:
     Status Get(node_id_t id, std::vector<float>* vec);
     Status SearchKnn(Span<float> query,
                      const SearchOptions& options,
+                     std::vector<SearchResult>* out);
+
+    Status SearchKnn(Span<float> query,
                      std::vector<SearchResult>* out);
 
     void printStatistics() const;
