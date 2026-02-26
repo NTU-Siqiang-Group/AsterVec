@@ -1,10 +1,29 @@
 # LSM-Vec
 
-LSM-Vec is a disk-based approximate nearest-neighbor search engine built on
-[HNSW](https://arxiv.org/abs/1603.09320). It stores the Layer-0 graph edges in
-**Aster** (a [RocksDB](https://rocksdb.org/) fork with a native graph API) and
-keeps vectors on disk through a pluggable storage layer. Upper HNSW layers are
-held in memory for fast traversal.
+LSM-Vec is a persistent vector database for approximate nearest-neighbor (ANN)
+search. It combines an [HNSW](https://arxiv.org/abs/1603.09320) graph index
+with **Aster**, a [RocksDB](https://rocksdb.org/) fork that provides a native
+graph-oriented LSM-tree storage engine.
+
+## Why LSM-Vec?
+
+### Minimal Memory Overhead
+Unlike many vector databases that keep large index state in memory, LSM-Vec is fully disk-oriented.
+Its memory footprint remains small and predictable even at large data scale. 
+
+
+### Graph-Oriented LSM-Tree Storage
+
+LSM-Vec stores the majority of the HNSW index within **Aster**, which extends
+RocksDB with a graph data model (`RocksGraph`). This graph-oriented LSM-tree structure enables LSM-Vec to achieve search and update performance comparable to in-memory vector databases.
+
+### Embeddable and Easy to Use
+
+LSM-Vec is offered as a lightweight C++ library with Python bindings. 
+LSM-Vec can be built with just a few lines of commands.
+Then users can simply link the library or import the module to get started.
+
+
 
 ## Features
 
@@ -16,6 +35,7 @@ held in memory for fast traversal.
   - **PagedVectorStorage** -- 4 KB page-managed layout with a user-space page cache (FIFO eviction)
 - Batch vector read -- groups neighbor reads by page to reduce I/O during search
 - Persistent metadata -- database can be closed and reopened without re-indexing
+- L2 (Euclidean) and Cosine distance metrics with SIMD acceleration (AVX2/SSE2)
 - Python SDK via pybind11 (`pip install .`)
 
 ## Repository layout
@@ -308,7 +328,7 @@ make aster                                 # builds lib/aster/librocksdb.a
 python -m pip install .                    # builds and installs the lsm_vec module
 ```
 
-`python -m pip install .` handles the entire C++ compilation internally via
+`python -m pip install .` handles the entire compilation internally via
 scikit-build-core. You do **not** need to run `make lib` beforehand.
 
 To verify:
@@ -445,6 +465,34 @@ Install the missing library:
 
 - **Ubuntu:** `sudo apt-get install libzstd-dev libsnappy-dev liblz4-dev libbz2-dev`
 - **macOS:** `brew install zstd snappy lz4 bzip2`
+
+### `FetchContent` fails to download pybind11 during `pip install .`
+
+In regions with restricted access to GitHub, CMake's `FetchContent` may fail to
+clone the pybind11 repository. As a workaround, install pybind11 locally first
+and switch `CMakeLists.txt` to use `find_package` instead:
+
+1. Install pybind11 via conda or pip:
+
+```bash
+conda install -c conda-forge pybind11   # or: pip install pybind11
+```
+
+2. In `CMakeLists.txt`, replace the `FetchContent` block (inside the
+   `if(LSMVEC_BUILD_PYTHON)` section) with `find_package`:
+
+```cmake
+    # include(FetchContent)
+    # FetchContent_Declare(
+    #     pybind11
+    #     GIT_REPOSITORY https://github.com/pybind/pybind11.git
+    #     GIT_TAG v2.13.6
+    # )
+    # FetchContent_MakeAvailable(pybind11)
+    find_package(pybind11 REQUIRED)
+```
+
+Then re-run `python -m pip install .`.
 
 ### `externally-managed-environment` when running `pip install .`
 

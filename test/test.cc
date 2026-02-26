@@ -3,7 +3,6 @@
 #include <string>
 #include "utils.h"
 #include "lsm_vec_db.h"
-#include "lsm_vec_index.h"
 #include "config.h"
 
 

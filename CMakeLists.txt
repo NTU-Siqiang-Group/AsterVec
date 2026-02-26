@@ -11,6 +11,15 @@ set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wall -Wextra -O2")
+
+# On Apple Silicon, Homebrew installs to /opt/homebrew instead of /usr/local.
+# Add it to the search paths so find_package/find_library can locate dependencies.
+if(APPLE AND EXISTS /opt/homebrew)
+    list(APPEND CMAKE_PREFIX_PATH /opt/homebrew)
+    include_directories(/opt/homebrew/include)
+    link_directories(/opt/homebrew/lib)
+endif()
+
 find_package(Boost REQUIRED)
 if(Boost_FOUND)
     include_directories(${Boost_INCLUDE_DIRS})
@@ -63,6 +72,7 @@ set(LIB_SOURCES
 
 find_library(ZSTD_LIB zstd
     HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib
+          /opt/homebrew/lib
 )
 
 if(NOT ZSTD_LIB)
@@ -73,12 +83,15 @@ message(STATUS "Using ZSTD library at ${ZSTD_LIB}")
 
 find_library(SNAPPY_LIB snappy
     HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/opt/snappy/lib
+          /opt/homebrew/lib /opt/homebrew/opt/snappy/lib
 )
 find_library(LZ4_LIB lz4
     HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/opt/lz4/lib
+          /opt/homebrew/lib /opt/homebrew/opt/lz4/lib
 )
 find_library(BZ2_LIB bz2
     HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/opt/bzip2/lib
+          /opt/homebrew/lib /opt/homebrew/opt/bzip2/lib
 )
 
 if(NOT SNAPPY_LIB)
@@ -119,7 +132,9 @@ target_include_directories(lsmvec_shared PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(lsmvec_static PUBLIC ${LSMVEC_LINK_LIBS})
 target_link_libraries(lsmvec_shared PUBLIC ${LSMVEC_LINK_LIBS})
 if(APPLE)
-    find_library(JEMALLOC_LIB NAMES jemalloc)
+    find_library(JEMALLOC_LIB NAMES jemalloc
+        HINTS /usr/local/lib /opt/homebrew/lib /opt/homebrew/opt/jemalloc/lib
+    )
 
     if(JEMALLOC_LIB)
         message(STATUS "Found jemalloc at: ${JEMALLOC_LIB}")
