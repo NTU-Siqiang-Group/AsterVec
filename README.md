@@ -1,9 +1,18 @@
-# LSM-Vec
+# LSM-Vec -- Memory Friendly, High Performance VDB
+<p align="center">
+  <img src="docs/assets/lsm-vec-poster.jpg" alt="LSM-Vec" width="350">
+</p>
+
+<p align="center">
+  <a href="https://volatill.github.io/lsm-vec-site">Website</a> ·
+  <a href="https://volatill.github.io/lsm-vec-site/docs.html">Quick Start</a> ·
+  <a href="https://volatill.github.io/lsm-vec-site/docs.html">Docs</a> ·
+  <a href="https://volatill.github.io/lsm-vec-site/benchmark.html">Benchmark</a>
+</p>
 
 LSM-Vec is a persistent vector database for approximate nearest-neighbor (ANN)
 search. It combines an [HNSW](https://arxiv.org/abs/1603.09320) graph index
-with **Aster**, a [RocksDB](https://rocksdb.org/) fork that provides a native
-graph-oriented LSM-tree storage engine.
+with **[Aster](https://github.com/NTU-Siqiang-Group/Aster)**, a native graph-oriented LSM-tree storage engine.
 
 ## Why LSM-Vec?
 
