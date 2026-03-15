@@ -1,6 +1,7 @@
 #include "utils.h"
 #include <algorithm>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 // Function to read vectors from a bvecs file
 std::vector<std::vector<float>> readBvecsFile(const std::string &filename)
@@ -200,6 +201,18 @@ void insertFromFile(lsm_vec::LSMVecDB &db, const std::string &filename)
         return;
     }
 
+    // Get file size to compute total vector count
+    input.seekg(0, std::ios::end);
+    size_t file_size = input.tellg();
+    input.seekg(0, std::ios::beg);
+
+    // Read dim from first record to compute record size
+    input.read(reinterpret_cast<char *>(&dim), sizeof(int));
+    input.seekg(0, std::ios::beg);
+
+    size_t record_size = sizeof(int) + dim * (isFvecs ? sizeof(float) : sizeof(uint8_t));
+    size_t total_vectors = file_size / record_size;
+
     while (input.read(reinterpret_cast<char *>(&dim), sizeof(int)))
     {
         if (node_count == 0)
@@ -237,11 +250,24 @@ void insertFromFile(lsm_vec::LSMVecDB &db, const std::string &filename)
 
         if (node_count % 1000 == 0)
         {
-            std::cout << "Inserting node " << node_count << std::endl;
+            auto now = std::chrono::high_resolution_clock::now();
+            double elapsed = std::chrono::duration<double>(now - start).count();
+            int pct = static_cast<int>(100.0 * node_count / total_vectors);
+            int bar_width = 30;
+            int filled = bar_width * pct / 100;
+            std::cout << "\rInserting: [";
+            for (int b = 0; b < bar_width; ++b)
+                std::cout << (b < filled ? '#' : '.');
+            std::cout << "] " << pct << "% (" << node_count << "/" << total_vectors
+                      << ") " << std::fixed << std::setprecision(1) << elapsed << "s" << std::flush;
         }
 
         ++node_count;
     }
+
+    std::cout << "\rInserting: [";
+    for (int b = 0; b < 30; ++b) std::cout << '#';
+    std::cout << "] 100% (" << node_count << "/" << total_vectors << ")          " << std::endl;
 
     auto end = std::chrono::high_resolution_clock::now();
     double duration = std::chrono::duration<double>(end - start).count();

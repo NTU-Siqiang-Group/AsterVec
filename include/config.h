@@ -32,7 +32,7 @@ struct Config {
     // If --vec is omitted, this defaults to db_path
     std::string vector_file_path;
     size_t vec_file_capacity = 100000;
-    size_t paged_max_cached_pages = 4096;
+    size_t paged_max_cached_pages = 8192;
 
     // New: single data directory and optional shared name/prefix
     // If only --data-dir is provided (no --name), filenames become:

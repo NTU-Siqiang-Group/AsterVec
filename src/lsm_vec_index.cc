@@ -720,11 +720,14 @@ using namespace ROCKSDB_NAMESPACE;
 
     void LSMVec::linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds)
     {
-        db_->AddVertex(nodeId);
+        // Create vertex with all forward (out) edges in a single Put.
+        // in_neighbors left empty — reverse edges are added individually below.
+        std::vector<ROCKSDB_NAMESPACE::node_id_t> out_neighbors(neighborIds.begin(), neighborIds.end());
+        std::vector<ROCKSDB_NAMESPACE::node_id_t> in_neighbors;
+        db_->AddVertexWithEdges(nodeId, out_neighbors, in_neighbors);
 
-        for (node_id_t neighborId : neighborIds)
-        {
-            db_->AddEdge(nodeId, neighborId);
+        // Add reverse edges: each neighbor → new node
+        for (node_id_t neighborId : neighborIds) {
             db_->AddEdge(neighborId, nodeId);
         }
     }

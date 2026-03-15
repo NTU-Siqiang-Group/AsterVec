@@ -51,7 +51,7 @@ struct LSMVecDBOptions {
     int m_level = 1;
     float ef_construction = 32.0f;
     size_t vec_file_capacity = 100000;
-    size_t paged_max_cached_pages = 4096;
+    size_t paged_max_cached_pages = 8192;
     int vector_storage_type = 1; 
     uint64_t db_target_size = 107374182400ULL;
     int random_seed = 12345;
