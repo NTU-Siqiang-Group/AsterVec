@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace lsm_vec
 {
@@ -70,6 +72,17 @@ public:
         out.resize(ids.size());
         for (size_t i = 0; i < ids.size(); ++i) {
             readVectorFromDisk(ids[i], out[i]);
+        }
+    }
+
+    // Flat-buffer batch read: writes vectors contiguously into caller-owned buffer.
+    // out must point to at least ids.size() * dim floats.
+    virtual void readVectorsBatchFlat(const std::vector<node_id_t>& ids,
+                                      float* out, size_t dim) {
+        for (size_t i = 0; i < ids.size(); ++i) {
+            std::vector<float> tmp(dim);
+            readVectorFromDisk(ids[i], tmp);
+            std::memcpy(out + i * dim, tmp.data(), dim * sizeof(float));
         }
     }
 
@@ -337,6 +350,13 @@ private:
     std::unordered_map<size_t, PageBuf> pageCache_; // pageId -> data
     std::deque<size_t>                  pageOrder_; // FIFO order of pageIds
 
+    int readFd_ = -1;  // file descriptor for pread-based I/O
+
+    // Scratch buffers for readVectorsBatchFlat (avoid per-call allocations)
+    struct MissEntry { size_t idx; size_t pageId; uint16_t slot; };
+    std::vector<MissEntry> missScratch_;
+    std::vector<size_t> uniquePageScratch_;
+
 private:
     // Open or create the underlying file.
     void openFile() {
@@ -353,6 +373,7 @@ private:
                 throw std::runtime_error("Failed to reopen vector file.");
             }
         }
+        readFd_ = ::open(filePath_.c_str(), O_RDONLY);
     }
 
     void ensureDeleteFileSize(size_t targetSize) {
@@ -477,9 +498,13 @@ private:
         buf.data.resize(kPageSize, 0);
 
         size_t offset = pageId * kPageSize;
-        fileStream_.clear();
-        fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-        fileStream_.read(buf.data.data(), static_cast<std::streamsize>(kPageSize));
+        if (readFd_ >= 0) {
+            ::pread(readFd_, buf.data.data(), kPageSize, static_cast<off_t>(offset));
+        } else {
+            fileStream_.clear();
+            fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+            fileStream_.read(buf.data.data(), static_cast<std::streamsize>(kPageSize));
+        }
         // If the read is short (near EOF), remaining bytes stay zero.
 
         pageCache_.emplace(pageId, std::move(buf));
@@ -500,6 +525,19 @@ private:
         if (vec.size() != dim_) vec.resize(dim_);
         std::memcpy(vec.data(), buf.data.data() + offsetInPage, recordSize_);
         return true;
+    }
+
+    // Direct read of a single record into caller buffer (no cache interaction).
+    void directReadRecord(size_t pageId, uint16_t slot, float* out) {
+        size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
+        if (readFd_ >= 0) {
+            ::pread(readFd_, out, recordSize_, static_cast<off_t>(offset));
+        } else {
+            fileStream_.clear();
+            fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+            fileStream_.read(reinterpret_cast<char*>(out),
+                             static_cast<std::streamsize>(recordSize_));
+        }
     }
 
     // Write a single record (one vector) at (pageId, slot) to disk.
@@ -622,6 +660,7 @@ public:
     }
 
     ~PagedVectorStorage() {
+        if (readFd_ >= 0) { ::close(readFd_); readFd_ = -1; }
         if (fileStream_.is_open()) {
             fileStream_.close();
         }
@@ -821,6 +860,74 @@ public:
                         throw std::runtime_error("Failed to read vector in batch.");
                     }
                 }
+            }
+        }
+    }
+
+    // Flat-buffer two-pass batch read: avoids per-call map construction
+    // and per-vector heap allocations.
+    void readVectorsBatchFlat(const std::vector<node_id_t>& ids,
+                              float* out, size_t dim) override {
+        missScratch_.clear();
+
+        // Pass 1: serve cache hits directly, collect misses
+        for (size_t i = 0; i < ids.size(); ++i) {
+            node_id_t id = ids[i];
+            size_t sid = static_cast<size_t>(id);
+            if (sid >= totalVectors_) {
+                throw std::out_of_range("Vector ID out of range in batch flat read.");
+            }
+            int64_t page = idToPage_[sid];
+            if (page < 0) {
+                throw std::runtime_error("Vector slot not assigned in batch flat read.");
+            }
+            size_t pageId = static_cast<size_t>(page);
+            uint16_t slot = idToSlotInPage_[sid];
+
+            // Try cache hit
+            if (maxCachedPages_ > 0) {
+                auto cit = pageCache_.find(pageId);
+                if (cit != pageCache_.end()) {
+                    size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
+                    std::memcpy(out + i * dim, cit->second.data.data() + offsetInPage, recordSize_);
+                    ++pageCacheHits_;
+                    continue;
+                }
+            }
+            ++pageCacheMisses_;
+            missScratch_.push_back({i, pageId, slot});
+        }
+
+        if (missScratch_.empty()) return; // fast path: all cached
+
+        // Pass 2: sort misses by pageId, load unique pages, then copy
+        std::sort(missScratch_.begin(), missScratch_.end(),
+                  [](const MissEntry& a, const MissEntry& b) {
+                      return a.pageId < b.pageId;
+                  });
+
+        // Deduplicate pages and load them
+        uniquePageScratch_.clear();
+        for (size_t j = 0; j < missScratch_.size(); ++j) {
+            if (j == 0 || missScratch_[j].pageId != missScratch_[j - 1].pageId) {
+                uniquePageScratch_.push_back(missScratch_[j].pageId);
+            }
+        }
+
+        for (size_t pageId : uniquePageScratch_) {
+            loadPageToCache(pageId);
+        }
+
+        // Copy from now-cached pages (or direct read as fallback)
+        for (const auto& miss : missScratch_) {
+            auto cit = pageCache_.find(miss.pageId);
+            if (cit != pageCache_.end()) {
+                size_t offsetInPage = static_cast<size_t>(miss.slot) * recordSize_;
+                std::memcpy(out + miss.idx * dim,
+                            cit->second.data.data() + offsetInPage, recordSize_);
+            } else {
+                // Cache full, page was evicted — direct read
+                directReadRecord(miss.pageId, miss.slot, out + miss.idx * dim);
             }
         }
     }

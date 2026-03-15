@@ -1115,13 +1115,16 @@ using namespace ROCKSDB_NAMESPACE;
                     }
 
                     if (!unvisitedIds.empty()) {
-                        std::vector<std::vector<float>> neighborVecs;
-                        vector_storage_->readVectorsBatch(unvisitedIds, neighborVecs);
+                        batchReadBuf_.resize(unvisitedIds.size() * static_cast<size_t>(vector_dim_));
+                        vector_storage_->readVectorsBatchFlat(
+                            unvisitedIds, batchReadBuf_.data(),
+                            static_cast<size_t>(vector_dim_));
 
                         for (size_t i = 0; i < unvisitedIds.size(); ++i) {
                             float d = computeDistance(
                                 Span<const float>(queryVector),
-                                Span<const float>(neighborVecs[i]));
+                                Span<const float>(batchReadBuf_.data() + i * static_cast<size_t>(vector_dim_),
+                                                  static_cast<size_t>(vector_dim_)));
                             if (static_cast<int>(nearest.size()) < efSearch || d < nearest.top().first) {
                                 candidates.emplace(-d, unvisitedIds[i]);
                                 nearest.emplace(d, unvisitedIds[i]);

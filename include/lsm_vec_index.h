@@ -129,5 +129,6 @@ using namespace ROCKSDB_NAMESPACE;
         std::unordered_set<node_id_t> deleted_ids_;
 
         bool enable_batch_read_ = true;
+        std::vector<float> batchReadBuf_;  // reusable flat buffer for batch reads
     };
 } // namespace ROCKSDB_NAMESPACE
