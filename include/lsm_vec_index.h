@@ -77,6 +77,8 @@ using namespace ROCKSDB_NAMESPACE;
                                               node_id_t entryPointId,
                                               int efSearch,
                                               int layer);
+        node_id_t greedySearchUpperLayer(const std::vector<float>& query,
+                                          node_id_t entryPoint, int layer);
         void linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer);
         void linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds);
 
@@ -130,5 +132,9 @@ using namespace ROCKSDB_NAMESPACE;
 
         bool enable_batch_read_ = true;
         std::vector<float> batchReadBuf_;  // reusable flat buffer for batch reads
+
+        // Versioned visited map (reused across searchLayer calls, zero-alloc after warmup)
+        std::unordered_map<node_id_t, uint16_t> visited_map_;
+        uint16_t visited_version_ = 0;
     };
 } // namespace ROCKSDB_NAMESPACE

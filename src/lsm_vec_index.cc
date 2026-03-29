@@ -447,15 +447,10 @@ using namespace ROCKSDB_NAMESPACE;
             return ids;
         };
 
-        // ----- Search down from top layer to (highestLayer+1) to choose entry -----
+        // ----- Greedy descent from top layer to (highestLayer+1) -----
         for (int l = max_layer_; l > highestLayer; --l)
         {
-            std::vector<SearchResult> closest =
-                searchLayer(vector, currentEntryPoint, 1, l);
-            if (!closest.empty())
-            {
-                currentEntryPoint = closest[0].id;
-            }
+            currentEntryPoint = greedySearchUpperLayer(vector, currentEntryPoint, l);
         }
 
         // Initial guess for sectionKey: if we have upper layers, use currentEntryPoint,
@@ -551,7 +546,6 @@ using namespace ROCKSDB_NAMESPACE;
                             if (std::find(eNewConn.begin(), eNewConn.end(), node) == eNewConn.end())
                             {
                                 db_->DeleteEdge(neighbor, node);
-                                db_->DeleteEdge(node, neighbor);
                             }
                         }
                     }
@@ -660,11 +654,7 @@ using namespace ROCKSDB_NAMESPACE;
         auto search_timer = stats.startTimer();
         node_id_t currentEntryPoint = entry_point_;
         for (int l = max_layer_; l >= 1; --l) {
-            std::vector<SearchResult> nearest =
-                searchLayer(query, currentEntryPoint, ef_search, l);
-            if (!nearest.empty()) {
-                currentEntryPoint = nearest[0].id;
-            }
+            currentEntryPoint = greedySearchUpperLayer(query, currentEntryPoint, l);
         }
 
         int ef = std::max(ef_search, k);
@@ -999,6 +989,37 @@ using namespace ROCKSDB_NAMESPACE;
         return selected;
     }
 
+    node_id_t LSMVec::greedySearchUpperLayer(const std::vector<float>& query,
+                                               node_id_t entryPoint, int layer)
+    {
+        node_id_t current = entryPoint;
+        auto getVec = [&](node_id_t id) -> const std::vector<float>& {
+            return nodes_.at(id).point;
+        };
+        float bestDist = computeDistance(Span<const float>(query),
+                                          Span<const float>(getVec(current)));
+        bool improved = true;
+        while (improved) {
+            improved = false;
+            auto nodeIt = nodes_.find(current);
+            if (nodeIt == nodes_.end()) break;
+            auto layerIt = nodeIt->second.neighbors.find(layer);
+            if (layerIt == nodeIt->second.neighbors.end()) break;
+            for (node_id_t neighborId : layerIt->second) {
+                auto nIt = nodes_.find(neighborId);
+                if (nIt == nodes_.end()) continue;
+                float d = computeDistance(Span<const float>(query),
+                                           Span<const float>(nIt->second.point));
+                if (d < bestDist) {
+                    bestDist = d;
+                    current = neighborId;
+                    improved = true;
+                }
+            }
+        }
+        return current;
+    }
+
     std::vector<SearchResult> LSMVec::searchLayer(const std::vector<float>& queryVector,
                                                   node_id_t entryPointId,
                                                   int efSearch,
@@ -1012,9 +1033,20 @@ using namespace ROCKSDB_NAMESPACE;
             return {};
         }
 
-        // Visited set
-        std::unordered_set<node_id_t> visited;
-        visited.reserve(static_cast<std::size_t>(efSearch) * 4);
+        // Versioned visited map (reused across calls, zero allocation after warmup)
+        ++visited_version_;
+        if (visited_version_ == 0) {
+            visited_map_.clear();
+            visited_version_ = 1;
+        }
+        auto visitedInsert = [&](node_id_t id) -> bool {
+            auto [it, inserted] = visited_map_.emplace(id, visited_version_);
+            if (inserted || it->second != visited_version_) {
+                it->second = visited_version_;
+                return true;  // newly visited
+            }
+            return false;  // already visited
+        };
 
         // Candidates: max-heap by (-distance) => smallest distance comes first
         using Cand = std::pair<float, node_id_t>;
@@ -1049,7 +1081,7 @@ using namespace ROCKSDB_NAMESPACE;
 
         // Initialize with entry point
         float distToEntry = getDistance(entryPointId);
-        visited.insert(entryPointId);
+        visitedInsert(entryPointId);
         candidates.emplace(-distToEntry, entryPointId);
         nearest.emplace(distToEntry, entryPointId);
 
@@ -1078,7 +1110,7 @@ using namespace ROCKSDB_NAMESPACE;
 
                 const auto& neighborIds = it->second;
                 for (node_id_t neighborId : neighborIds) {
-                    if (visited.insert(neighborId).second) {
+                    if (visitedInsert(neighborId)) {
                         const auto neighborIt = nodes_.find(neighborId);
                         float d = 0.0f;
                         if (neighborIt != nodes_.end() &&
@@ -1112,7 +1144,7 @@ using namespace ROCKSDB_NAMESPACE;
                     unvisitedIds.reserve(edges.num_edges_out);
                     for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
                         node_id_t neighborId = static_cast<node_id_t>(edges.nxts_out[i].nxt);
-                        if (visited.insert(neighborId).second) {
+                        if (visitedInsert(neighborId)) {
                             unvisitedIds.push_back(neighborId);
                         }
                     }
@@ -1142,7 +1174,7 @@ using namespace ROCKSDB_NAMESPACE;
                     for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
                         node_id_t neighborId = static_cast<node_id_t>(edges.nxts_out[i].nxt);
 
-                        if (visited.insert(neighborId).second) {
+                        if (visitedInsert(neighborId)) {
                             std::vector<float> neighborVec;
                             readVectorWithStats(neighborId, neighborVec);
                             float d = computeDistance(Span<const float>(queryVector),
