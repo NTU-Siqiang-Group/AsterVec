@@ -521,6 +521,8 @@ using namespace ROCKSDB_NAMESPACE;
             }
             else // l == 0
             {
+                std::vector<std::pair<rocksdb::node_id_t, rocksdb::node_id_t>> edgesToDelete;
+
                 for (node_id_t neighbor : selectedNeighbors)
                 {
                     rocksdb::Edges edges;
@@ -545,11 +547,17 @@ using namespace ROCKSDB_NAMESPACE;
                         {
                             if (std::find(eNewConn.begin(), eNewConn.end(), node) == eNewConn.end())
                             {
-                                db_->DeleteEdge(neighbor, node);
+                                edgesToDelete.emplace_back(
+                                    static_cast<rocksdb::node_id_t>(neighbor),
+                                    static_cast<rocksdb::node_id_t>(node));
                             }
                         }
                     }
                     rocksdb::free_edges(&edges);
+                }
+
+                if (!edgesToDelete.empty()) {
+                    db_->DeleteEdgeBatch(edgesToDelete);
                 }
             }
 
