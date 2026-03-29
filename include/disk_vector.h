@@ -311,7 +311,7 @@ private:
     std::string filePath_;
     std::string deleteFilePath_;
     size_t dim_;            // vector dimension
-    size_t recordSize_;     // dim_ * sizeof(float)
+    size_t recordSize_;     // SQ8: dim_ + 2 * sizeof(float)
     size_t totalVectors_;   // logical ID capacity
     size_t vectorsPerPage_; // how many vectors fit into one page (floor division)
 
@@ -356,6 +356,41 @@ private:
     struct MissEntry { size_t idx; size_t pageId; uint16_t slot; };
     std::vector<MissEntry> missScratch_;
     std::vector<size_t> uniquePageScratch_;
+
+    // Reusable temp buffer for SQ8 record I/O
+    mutable std::vector<char> sq8TempBuf_;
+
+    // SQ8 quantize: float32[dim] → [min(4B), max(4B), uint8[dim]]
+    static void quantize(const float* vec, size_t dim, char* record) {
+        float minVal = vec[0], maxVal = vec[0];
+        for (size_t i = 1; i < dim; ++i) {
+            if (vec[i] < minVal) minVal = vec[i];
+            if (vec[i] > maxVal) maxVal = vec[i];
+        }
+        float range = maxVal - minVal;
+        if (range < 1e-10f) range = 1e-10f;
+        std::memcpy(record, &minVal, sizeof(float));
+        std::memcpy(record + sizeof(float), &maxVal, sizeof(float));
+        float scale = 255.0f / range;
+        uint8_t* qdata = reinterpret_cast<uint8_t*>(record + 2 * sizeof(float));
+        for (size_t i = 0; i < dim; ++i) {
+            float normalized = (vec[i] - minVal) * scale;
+            int q = static_cast<int>(normalized + 0.5f);
+            qdata[i] = static_cast<uint8_t>(std::min(255, std::max(0, q)));
+        }
+    }
+
+    // SQ8 dequantize: [min(4B), max(4B), uint8[dim]] → float32[dim]
+    static void dequantize(const char* record, float* vec, size_t dim) {
+        float minVal, maxVal;
+        std::memcpy(&minVal, record, sizeof(float));
+        std::memcpy(&maxVal, record + sizeof(float), sizeof(float));
+        float invScale = (maxVal - minVal) / 255.0f;
+        const uint8_t* qdata = reinterpret_cast<const uint8_t*>(record + 2 * sizeof(float));
+        for (size_t i = 0; i < dim; ++i) {
+            vec[i] = static_cast<float>(qdata[i]) * invScale + minVal;
+        }
+    }
 
 private:
     // Open or create the underlying file.
@@ -511,7 +546,7 @@ private:
         pageOrder_.push_back(pageId);
     }
 
-    // Try to read a vector from cache by pageId & slot.
+    // Try to read a vector from cache by pageId & slot. Dequantizes SQ8 → float32.
     bool tryReadFromCache(size_t pageId, uint16_t slot, std::vector<float>& vec) {
         if (maxCachedPages_ == 0) return false;
         auto it = pageCache_.find(pageId);
@@ -520,35 +555,39 @@ private:
         const PageBuf& buf = it->second;
         size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
         if (offsetInPage + recordSize_ > buf.data.size()) {
-            return false; // corrupted / inconsistent
+            return false;
         }
         if (vec.size() != dim_) vec.resize(dim_);
-        std::memcpy(vec.data(), buf.data.data() + offsetInPage, recordSize_);
+        dequantize(buf.data.data() + offsetInPage, vec.data(), dim_);
         return true;
     }
 
-    // Direct read of a single record into caller buffer (no cache interaction).
+    // Direct read of a single record into caller buffer (no cache interaction). Dequantizes.
     void directReadRecord(size_t pageId, uint16_t slot, float* out) {
+        sq8TempBuf_.resize(recordSize_);
         size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
         if (readFd_ >= 0) {
-            ::pread(readFd_, out, recordSize_, static_cast<off_t>(offset));
+            ::pread(readFd_, sq8TempBuf_.data(), recordSize_, static_cast<off_t>(offset));
         } else {
             fileStream_.clear();
             fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-            fileStream_.read(reinterpret_cast<char*>(out),
+            fileStream_.read(sq8TempBuf_.data(),
                              static_cast<std::streamsize>(recordSize_));
         }
+        dequantize(sq8TempBuf_.data(), out, dim_);
     }
 
-    // Write a single record (one vector) at (pageId, slot) to disk.
+    // Write a single record (one vector) at (pageId, slot) to disk. Quantizes to SQ8.
     void writeRecord(size_t pageId, uint16_t slot, const std::vector<float>& vec) {
         if (vec.size() != dim_) {
             throw std::runtime_error("Vector size mismatch in writeRecord.");
         }
+        sq8TempBuf_.resize(recordSize_);
+        quantize(vec.data(), dim_, sq8TempBuf_.data());
         size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
         fileStream_.clear();
         fileStream_.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
-        fileStream_.write(reinterpret_cast<const char*>(vec.data()),
+        fileStream_.write(sq8TempBuf_.data(),
                           static_cast<std::streamsize>(recordSize_));
         if (!fileStream_.good()) {
             throw std::runtime_error("Failed to write vector to file.");
@@ -556,7 +595,7 @@ private:
         fileStream_.flush();
     }
 
-    // If the page is cached, update the cached copy after a write.
+    // If the page is cached, update the cached copy after a write (stores quantized SQ8).
     void updateCacheAfterWrite(size_t pageId, uint16_t slot, const std::vector<float>& vec) {
         if (maxCachedPages_ == 0) return;
         auto it = pageCache_.find(pageId);
@@ -567,9 +606,7 @@ private:
         if (offsetInPage + recordSize_ > buf.data.size()) {
             return;
         }
-        std::memcpy(buf.data.data() + offsetInPage,
-                    reinterpret_cast<const char*>(vec.data()),
-                    recordSize_);
+        quantize(vec.data(), dim_, buf.data.data() + offsetInPage);
     }
 
     // Allocate a free slot for a given sectionKey (creates section/pages on demand).
@@ -635,7 +672,7 @@ public:
         : filePath_(path),
           deleteFilePath_(path + ".deleted"),
           dim_(dim),
-          recordSize_(dim * sizeof(float)),
+          recordSize_(dim + 2 * sizeof(float)),  // SQ8: dim bytes quantized + 8 bytes min/max
           totalVectors_(capacity),
           vectorsPerPage_(0),
           maxCachedPages_(maxCachedPages)
@@ -657,6 +694,7 @@ public:
 
         idToPage_.assign(totalVectors_, -1);
         idToSlotInPage_.assign(totalVectors_, 0);
+        sq8TempBuf_.resize(recordSize_);
     }
 
     ~PagedVectorStorage() {
@@ -756,16 +794,18 @@ public:
             }
         }
 
-        // 3) Fallback: direct disk read of this record
+        // 3) Fallback: direct disk read of this record + dequantize
         if (vec.size() != dim_) vec.resize(dim_);
+        sq8TempBuf_.resize(recordSize_);
         size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
         fileStream_.clear();
         fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-        fileStream_.read(reinterpret_cast<char*>(vec.data()),
+        fileStream_.read(sq8TempBuf_.data(),
                          static_cast<std::streamsize>(recordSize_));
         if (!fileStream_.good()) {
             throw std::runtime_error("Failed to read vector from file.");
         }
+        dequantize(sq8TempBuf_.data(), vec.data(), dim_);
     }
 
     void deleteVector(node_id_t id) override
@@ -849,16 +889,9 @@ public:
                 node_id_t id = ids[idx];
                 uint16_t slot = idToSlotInPage_[static_cast<size_t>(id)];
                 if (!tryReadFromCache(pageId, slot, out[idx])) {
-                    // Fallback: direct read
+                    // Fallback: direct read + dequantize
                     if (out[idx].size() != dim_) out[idx].resize(dim_);
-                    size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
-                    fileStream_.clear();
-                    fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-                    fileStream_.read(reinterpret_cast<char*>(out[idx].data()),
-                                     static_cast<std::streamsize>(recordSize_));
-                    if (!fileStream_.good()) {
-                        throw std::runtime_error("Failed to read vector in batch.");
-                    }
+                    directReadRecord(pageId, slot, out[idx].data());
                 }
             }
         }
@@ -884,12 +917,12 @@ public:
             size_t pageId = static_cast<size_t>(page);
             uint16_t slot = idToSlotInPage_[sid];
 
-            // Try cache hit
+            // Try cache hit — dequantize SQ8 → float
             if (maxCachedPages_ > 0) {
                 auto cit = pageCache_.find(pageId);
                 if (cit != pageCache_.end()) {
                     size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
-                    std::memcpy(out + i * dim, cit->second.data.data() + offsetInPage, recordSize_);
+                    dequantize(cit->second.data.data() + offsetInPage, out + i * dim, dim_);
                     ++pageCacheHits_;
                     continue;
                 }
@@ -918,13 +951,13 @@ public:
             loadPageToCache(pageId);
         }
 
-        // Copy from now-cached pages (or direct read as fallback)
+        // Dequantize from now-cached pages (or direct read as fallback)
         for (const auto& miss : missScratch_) {
             auto cit = pageCache_.find(miss.pageId);
             if (cit != pageCache_.end()) {
                 size_t offsetInPage = static_cast<size_t>(miss.slot) * recordSize_;
-                std::memcpy(out + miss.idx * dim,
-                            cit->second.data.data() + offsetInPage, recordSize_);
+                dequantize(cit->second.data.data() + offsetInPage,
+                           out + miss.idx * dim, dim_);
             } else {
                 // Cache full, page was evicted — direct read
                 directReadRecord(miss.pageId, miss.slot, out + miss.idx * dim);
