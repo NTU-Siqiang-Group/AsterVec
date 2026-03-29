@@ -131,6 +131,22 @@ using namespace ROCKSDB_NAMESPACE;
                 db_options_.vec_file_capacity
             );
         }
+
+        // Adaptive section layer: find smallest k such that M^k >= vectorsPerPage
+        {
+            size_t vpp = 1;
+            if (auto* paged = dynamic_cast<PagedVectorStorage*>(vector_storage_.get()))
+                vpp = paged->vectorsPerPage();
+
+            section_layer_ = 1;
+            size_t coverage = static_cast<size_t>(m_);
+            while (coverage < vpp && section_layer_ < 10) {
+                ++section_layer_;
+                coverage *= static_cast<size_t>(m_);
+            }
+            LOG(INFO) << "Adaptive section layer: " << section_layer_
+                      << " (vectorsPerPage=" << vpp << ", M=" << m_ << ")";
+        }
     }
 
     namespace {
@@ -448,14 +464,14 @@ using namespace ROCKSDB_NAMESPACE;
         };
 
         // ----- Greedy descent from top layer to (highestLayer+1) -----
+        node_id_t sectionKey = entry_point_;
         for (int l = max_layer_; l > highestLayer; --l)
         {
             currentEntryPoint = greedySearchUpperLayer(vector, currentEntryPoint, l);
+            if (l == section_layer_) {
+                sectionKey = currentEntryPoint;
+            }
         }
-
-        // Initial guess for sectionKey: if we have upper layers, use currentEntryPoint,
-        // otherwise fall back to global entry_point_.
-        node_id_t sectionKey = (max_layer_ >= 1 ? currentEntryPoint : entry_point_);
 
         // ----- From min(max_layer_, highestLayer) ... down to 0 -----
         for (int l = std::min(max_layer_, highestLayer); l >= 0; --l)
@@ -472,8 +488,8 @@ using namespace ROCKSDB_NAMESPACE;
             // else
             //     selectedNeighbors = selectNeighbors(point, neighbors, Mmax, l);
 
-            // If we are at level 1, refine sectionKey using closest neighbor at l=1.
-            if (l == 1)
+            // Refine sectionKey at the adaptive section layer.
+            if (l == section_layer_)
             {
                 if (!neighbors.empty())
                     sectionKey = neighbors[0].id;

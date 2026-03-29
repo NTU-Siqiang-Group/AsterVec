@@ -130,6 +130,7 @@ using namespace ROCKSDB_NAMESPACE;
 
         std::unordered_set<node_id_t> deleted_ids_;
 
+        int section_layer_ = 1;
         bool enable_batch_read_ = true;
         std::vector<float> batchReadBuf_;  // reusable flat buffer for batch reads
 
