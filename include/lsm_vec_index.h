@@ -110,6 +110,21 @@ using namespace ROCKSDB_NAMESPACE;
             int layer
         );
 
+        // Overloads accepting SearchResult (with precomputed distances)
+        std::vector<node_id_t> selectNeighbors(
+            const std::vector<float>& vector,
+            const std::vector<SearchResult>& candidates,
+            int maxNeighbors,
+            int layer
+        );
+
+        std::vector<node_id_t> selectNeighborsHeuristic2(
+            const std::vector<float>& vector,
+            const std::vector<SearchResult>& candidates,
+            int maxNeighbors,
+            int layer
+        );
+
         int m_;                      // Number of established connections
         int m_max_;                  // Maximum neighbors per layer
         int m_level_;                // Normalization factor for level generation

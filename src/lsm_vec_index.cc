@@ -454,15 +454,6 @@ using namespace ROCKSDB_NAMESPACE;
 
         node_id_t currentEntryPoint = entry_point_;
 
-        auto extractIds = [](const std::vector<SearchResult>& results) {
-            std::vector<node_id_t> ids;
-            ids.reserve(results.size());
-            for (const auto& result : results) {
-                ids.push_back(result.id);
-            }
-            return ids;
-        };
-
         // ----- Greedy descent from top layer to (highestLayer+1) -----
         node_id_t sectionKey = entry_point_;
         for (int l = max_layer_; l > highestLayer; --l)
@@ -478,15 +469,8 @@ using namespace ROCKSDB_NAMESPACE;
         {
             std::vector<SearchResult> neighbors =
                 searchLayer(vector, currentEntryPoint, ef_construction_, l);
-            std::vector<node_id_t> neighborIds = extractIds(neighbors);
-            std::vector<node_id_t> selectedNeighbors = 
-                selectNeighbors(vector, neighborIds, m_, l);
-                
-            // std::vector<node_id_t> selectedNeighbors;
-            // if (l > 0)
-            //     selectedNeighbors = selectNeighbors(point, neighbors, M, l);
-            // else
-            //     selectedNeighbors = selectNeighbors(point, neighbors, Mmax, l);
+            std::vector<node_id_t> selectedNeighbors =
+                selectNeighbors(vector, neighbors, m_, l);
 
             // Refine sectionKey at the adaptive section layer.
             if (l == section_layer_)
@@ -1000,6 +984,111 @@ using namespace ROCKSDB_NAMESPACE;
                 selected.push_back(candidateId);
             else
                 rejected.push_back(candidateId);
+        }
+
+        return selected;
+    }
+
+    // --- SearchResult overloads (fast path: skip redundant distance computation) ---
+
+    std::vector<node_id_t> LSMVec::selectNeighbors(
+        const std::vector<float>& vector,
+        const std::vector<SearchResult>& candidates,
+        int maxNeighbors,
+        int layer)
+    {
+        if (!use_heuristic_neighbor_selection_) {
+            // Simple: just take the closest maxNeighbors by precomputed distance
+            std::vector<SearchResult> sorted(candidates);
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const SearchResult& a, const SearchResult& b) {
+                          return a.distance < b.distance;
+                      });
+            std::vector<node_id_t> result;
+            result.reserve(std::min(static_cast<size_t>(maxNeighbors), sorted.size()));
+            for (size_t i = 0; i < sorted.size() && static_cast<int>(i) < maxNeighbors; ++i)
+                result.push_back(sorted[i].id);
+            return result;
+        }
+        return selectNeighborsHeuristic2(vector, candidates, maxNeighbors, layer);
+    }
+
+    std::vector<node_id_t> LSMVec::selectNeighborsHeuristic2(
+        const std::vector<float>& vector,
+        const std::vector<SearchResult>& candidates,
+        int maxNeighbors,
+        int layer)
+    {
+        if (candidates.size() <= static_cast<size_t>(maxNeighbors)) {
+            std::vector<node_id_t> result;
+            result.reserve(candidates.size());
+            for (const auto& c : candidates) result.push_back(c.id);
+            return result;
+        }
+
+        struct CandidateInfo {
+            node_id_t id;
+            float distToQuery;
+        };
+
+        // 1) Use precomputed distances — no readVector or computeDistance needed
+        std::vector<CandidateInfo> candInfos;
+        candInfos.reserve(candidates.size());
+        for (const auto& sr : candidates) {
+            candInfos.push_back({sr.id, sr.distance});
+        }
+
+        // 2) Sort by distance to query
+        std::sort(candInfos.begin(), candInfos.end(),
+                  [](const CandidateInfo& a, const CandidateInfo& b) {
+                      return a.distToQuery < b.distToQuery;
+                  });
+
+        const size_t N = candInfos.size();
+        const size_t dim = static_cast<size_t>(vector_dim_);
+
+        // 3) Read all candidate vectors into a contiguous buffer
+        std::vector<float> candVecs(N * dim);
+        if (layer > 0) {
+            for (size_t i = 0; i < N; ++i) {
+                auto nodeIt = nodes_.find(candInfos[i].id);
+                if (nodeIt != nodes_.end()) {
+                    std::memcpy(candVecs.data() + i * dim,
+                                nodeIt->second.point.data(), dim * sizeof(float));
+                }
+            }
+        } else {
+            std::vector<node_id_t> ids(N);
+            for (size_t i = 0; i < N; ++i) ids[i] = candInfos[i].id;
+            vector_storage_->readVectorsBatchFlat(ids, candVecs.data(), dim);
+        }
+
+        // 4) Diversity pruning with contiguous buffer (no hash map)
+        std::vector<node_id_t> selected;
+        selected.reserve(maxNeighbors);
+        std::vector<size_t> selectedIndices;
+        selectedIndices.reserve(maxNeighbors);
+
+        for (size_t ci = 0; ci < N; ++ci) {
+            if (static_cast<int>(selected.size()) >= maxNeighbors)
+                break;
+
+            bool good = true;
+            const float* candPtr = candVecs.data() + ci * dim;
+            for (size_t si : selectedIndices) {
+                const float* selPtr = candVecs.data() + si * dim;
+                float d = computeDistance(Span<const float>(candPtr, dim),
+                                          Span<const float>(selPtr, dim));
+                if (d < candInfos[ci].distToQuery) {
+                    good = false;
+                    break;
+                }
+            }
+
+            if (good) {
+                selected.push_back(candInfos[ci].id);
+                selectedIndices.push_back(ci);
+            }
         }
 
         return selected;
