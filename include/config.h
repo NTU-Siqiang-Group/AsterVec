@@ -23,6 +23,7 @@ struct Config {
     int ef_search = 64;
     bool reinit = true;
 
+    size_t edge_cache_size = 100000;
     int vector_storage_type = 1; // 0 for basic, 1 for paged
 
     // --- Paths / I/O ---
@@ -198,6 +199,7 @@ Short aliases:
         if (kv.count("query"))              cfg_.query_file_path = kv["query"];
         if (kv.count("truth"))              cfg_.groundtruth_file_path = kv["truth"];
         if (kv.count("vec-storage"))              cfg_.vector_storage_type = parseI(kv["vec-storage"]);
+        if (kv.count("edge-cache-size"))         cfg_.edge_cache_size = parseU64(kv["edge-cache-size"]);
 
         // Default vector_file_path to db_path if not provided
         if (cfg_.vector_file_path.empty() && !cfg_.db_path.empty()) {

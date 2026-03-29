@@ -93,6 +93,10 @@ using namespace ROCKSDB_NAMESPACE;
     {
         stats.setEnabled(db_options_.enable_stats);
         enable_batch_read_ = db_options_.enable_batch_read;
+        if (db_options_.edge_cache_size > 0) {
+            edge_cache_ = std::make_unique<EdgeLRUCache>(db_options_.edge_cache_size);
+            LOG(INFO) << "Edge LRU cache: " << db_options_.edge_cache_size << " entries";
+        }
 
         if (db_options_.random_seed > 0) {
             random_generator_.seed(db_options_.random_seed);
@@ -545,18 +549,10 @@ using namespace ROCKSDB_NAMESPACE;
 
                 for (node_id_t neighbor : selectedNeighbors)
                 {
-                    rocksdb::Edges edges;
-                    db_->GetAllEdges(neighbor, &edges);
+                    auto eConns = getEdgesCached(neighbor);
 
-                    if (edges.num_edges_out > static_cast<uint32_t>(m_max_))
+                    if (eConns.size() > static_cast<size_t>(m_max_))
                     {
-                        std::vector<node_id_t> eConns;
-                        eConns.reserve(edges.num_edges_out);
-                        for (uint32_t i = 0; i < edges.num_edges_out; ++i)
-                        {
-                            eConns.push_back(edges.nxts_out[i].nxt);
-                        }
-
                         std::vector<float> neighborVector;
                         readVectorWithStats(neighbor, neighborVector);
 
@@ -573,11 +569,17 @@ using namespace ROCKSDB_NAMESPACE;
                             }
                         }
                     }
-                    rocksdb::free_edges(&edges);
                 }
 
                 if (!edgesToDelete.empty()) {
                     db_->DeleteEdgeBatch(edgesToDelete);
+                    // Invalidate cache for affected nodes
+                    if (edge_cache_) {
+                        for (const auto& [from, to] : edgesToDelete) {
+                            edge_cache_->erase(from);
+                            edge_cache_->erase(to);
+                        }
+                    }
                 }
             }
 
@@ -747,7 +749,29 @@ using namespace ROCKSDB_NAMESPACE;
         // Add reverse edges: each neighbor → new node
         for (node_id_t neighborId : neighborIds) {
             db_->AddEdge(neighborId, nodeId);
+            if (edge_cache_) edge_cache_->erase(neighborId);
         }
+    }
+
+    std::vector<node_id_t> LSMVec::getEdgesCached(node_id_t id) {
+        if (edge_cache_) {
+            auto* cached = edge_cache_->get(id);
+            if (cached) return *cached;
+        }
+
+        rocksdb::Edges edges;
+        db_->GetAllEdges(id, &edges);
+        std::vector<node_id_t> result;
+        result.reserve(edges.num_edges_out);
+        for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
+            result.push_back(edges.nxts_out[i].nxt);
+        }
+        rocksdb::free_edges(&edges);
+
+        if (edge_cache_) {
+            edge_cache_->put(id, result);
+        }
+        return result;
     }
 
     std::vector<node_id_t> LSMVec::selectNeighbors(
@@ -1268,15 +1292,13 @@ using namespace ROCKSDB_NAMESPACE;
                 }
             } else {
                 // Level 0: adjacency is stored in RocksGraph.
-                rocksdb::Edges edges;
-                db_->GetAllEdges(currentId, &edges);
+                auto neighborList = getEdgesCached(currentId);
 
                 if (enable_batch_read_) {
                     // --- Batch read path: collect unvisited, read all at once ---
                     std::vector<node_id_t> unvisitedIds;
-                    unvisitedIds.reserve(edges.num_edges_out);
-                    for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
-                        node_id_t neighborId = static_cast<node_id_t>(edges.nxts_out[i].nxt);
+                    unvisitedIds.reserve(neighborList.size());
+                    for (node_id_t neighborId : neighborList) {
                         if (visitedInsert(neighborId)) {
                             unvisitedIds.push_back(neighborId);
                         }
@@ -1304,9 +1326,7 @@ using namespace ROCKSDB_NAMESPACE;
                     }
                 } else {
                     // --- Original path: read one-by-one ---
-                    for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
-                        node_id_t neighborId = static_cast<node_id_t>(edges.nxts_out[i].nxt);
-
+                    for (node_id_t neighborId : neighborList) {
                         if (visitedInsert(neighborId)) {
                             std::vector<float> neighborVec;
                             readVectorWithStats(neighborId, neighborVec);
@@ -1322,7 +1342,6 @@ using namespace ROCKSDB_NAMESPACE;
                         }
                     }
                 }
-                rocksdb::free_edges(&edges);
             }
         }
 

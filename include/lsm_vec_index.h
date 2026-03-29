@@ -2,6 +2,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <list>
 #include <random>
 #include <string>
 #include "rocksdb/graph.h"
@@ -18,6 +19,57 @@
 namespace lsm_vec
 {
 using namespace ROCKSDB_NAMESPACE;
+
+    class EdgeLRUCache {
+    public:
+        explicit EdgeLRUCache(size_t capacity) : capacity_(capacity) {}
+
+        const std::vector<node_id_t>* get(node_id_t id) {
+            auto it = map_.find(id);
+            if (it == map_.end()) { ++misses_; return nullptr; }
+            ++hits_;
+            lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
+            return &it->second->second;
+        }
+
+        void put(node_id_t id, std::vector<node_id_t> neighbors) {
+            auto it = map_.find(id);
+            if (it != map_.end()) {
+                it->second->second = std::move(neighbors);
+                lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
+                return;
+            }
+            if (map_.size() >= capacity_) {
+                auto& back = lru_list_.back();
+                map_.erase(back.first);
+                lru_list_.pop_back();
+                ++evictions_;
+            }
+            lru_list_.emplace_front(id, std::move(neighbors));
+            map_[id] = lru_list_.begin();
+        }
+
+        void erase(node_id_t id) {
+            auto it = map_.find(id);
+            if (it == map_.end()) return;
+            lru_list_.erase(it->second);
+            map_.erase(it);
+            ++invalidations_;
+        }
+
+        size_t hits() const { return hits_; }
+        size_t misses() const { return misses_; }
+        size_t evictions() const { return evictions_; }
+        size_t invalidations() const { return invalidations_; }
+        size_t capacity() const { return capacity_; }
+
+    private:
+        size_t capacity_;
+        using Entry = std::pair<node_id_t, std::vector<node_id_t>>;
+        std::list<Entry> lru_list_;
+        std::unordered_map<node_id_t, std::list<Entry>::iterator> map_;
+        size_t hits_ = 0, misses_ = 0, evictions_ = 0, invalidations_ = 0;
+    };
 
     class LSMVec
     {
@@ -81,6 +133,7 @@ using namespace ROCKSDB_NAMESPACE;
                                           node_id_t entryPoint, int layer);
         void linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer);
         void linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds);
+        std::vector<node_id_t> getEdgesCached(node_id_t id);
 
         std::vector<node_id_t> selectNeighbors(
             const std::vector<float>& vector,
@@ -152,5 +205,8 @@ using namespace ROCKSDB_NAMESPACE;
         // Versioned visited map (reused across searchLayer calls, zero-alloc after warmup)
         std::unordered_map<node_id_t, uint16_t> visited_map_;
         uint16_t visited_version_ = 0;
+
+        // Edge LRU cache for L0 GetAllEdges
+        std::unique_ptr<EdgeLRUCache> edge_cache_;
     };
 } // namespace ROCKSDB_NAMESPACE

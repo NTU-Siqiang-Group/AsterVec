@@ -34,6 +34,7 @@ int main(int argc, char* argv[])
     options.enable_stats = config.enable_stats;
     options.enable_batch_read = config.enable_batch_read;
     options.reinit = config.reinit;
+    options.edge_cache_size = config.edge_cache_size;
     options.vector_file_path = config.vector_file_path;
 
     std::unique_ptr<lsm_vec::LSMVecDB> db;

@@ -60,6 +60,7 @@ struct LSMVecDBOptions {
     bool reinit = false;
     int k = 1;
     int ef_search = 64;
+    size_t edge_cache_size = 100000;
     std::string vector_file_path;
     std::string log_file_path;
 };
