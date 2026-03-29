@@ -106,6 +106,19 @@ using namespace ROCKSDB_NAMESPACE;
         options_.db_paths.emplace_back(rocksdb::DbPath(db_path, db_options_.db_target_size));
         options_.statistics = rocksdb::CreateDBStatistics();
 
+        // RocksDB tuning: block cache, compaction parallelism, no compression
+        {
+            auto table_options =
+                options_.table_factory->GetOptions<rocksdb::BlockBasedTableOptions>();
+            if (table_options) {
+                table_options->block_cache = rocksdb::NewLRUCache(32 * 1024 * 1024);
+            }
+            options_.max_background_jobs = 8;
+            options_.max_background_compactions = 4;
+            options_.max_subcompactions = 4;
+            options_.compression = rocksdb::kNoCompression;
+        }
+
         db_ = std::make_unique<rocksdb::RocksGraph>(
             options_,
             EDGE_UPDATE_EAGER,
