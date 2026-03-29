@@ -242,6 +242,13 @@ void LSMVecDB::printStatistics() const
     index_->printStatistics();
 }
 
+void LSMVecDB::flushVectorWrites()
+{
+    if (index_) {
+        index_->vector_storage_->flushWrites();
+    }
+}
+
 Status LSMVecDB::Close()
 {
     if (!index_) {

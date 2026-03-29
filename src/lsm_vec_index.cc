@@ -9,6 +9,7 @@
 #include <string>
 #include <sstream>
 #include <iostream>
+#include <cstdio>
 
 
 uint8_t encode(int value)
@@ -114,6 +115,12 @@ using namespace ROCKSDB_NAMESPACE;
         );
 
         nodes_.reserve(10000);
+
+        // Reinit: remove stale vector storage files before construction
+        if (db_options_.reinit) {
+            std::remove(db_options_.vector_file_path.c_str());
+            std::remove((db_options_.vector_file_path + ".deleted").c_str());
+        }
 
         if (db_options_.vector_storage_type == 1) {
             LOG(INFO) << "Using page-based vector storage layout";
@@ -1574,6 +1581,7 @@ using namespace ROCKSDB_NAMESPACE;
 
     void LSMVec::close()
     {
+        vector_storage_->flushWrites();
         db_.reset();
     }
 

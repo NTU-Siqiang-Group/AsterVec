@@ -45,6 +45,7 @@ int main(int argc, char* argv[])
 
     std::cout << "Inserting nodes from " << config.input_file_path << std::endl;
     insertFromFile(*db, config.input_file_path);
+    db->flushVectorWrites();
     // std::vector<float> first_vec;
     // auto get_status = db->Get(0, &first_vec);
     // if (get_status.ok()) {

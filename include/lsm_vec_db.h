@@ -95,6 +95,7 @@ public:
                      std::vector<SearchResult>* out);
 
     void printStatistics() const;
+    void flushVectorWrites();
 
 private:
     LSMVecDB(const std::string& db_path,

@@ -15,6 +15,7 @@
 #include <limits>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 namespace lsm_vec
 {
@@ -85,6 +86,9 @@ public:
             std::memcpy(out + i * dim, tmp.data(), dim * sizeof(float));
         }
     }
+
+    // Flush buffered writes to disk. Default is no-op.
+    virtual void flushWrites() {}
 
     // Optional page cache stats. Default returns zeros.
     virtual PageCacheStats getPageCacheStats() const { return {}; }
@@ -360,6 +364,15 @@ private:
     // Reusable temp buffer for SQ8 record I/O
     mutable std::vector<char> sq8TempBuf_;
 
+    // Section write buffer: per-section 4KB buffer for coalesced writes via pwrite
+    struct SectionWriteBuf {
+        std::vector<char> data;  // kPageSize bytes
+        size_t pageId;
+        uint16_t filledSlots;
+    };
+    std::unordered_map<int, SectionWriteBuf> sectionWriteBufs_; // sectionIdx -> buf
+    int writeFd_ = -1;  // file descriptor for pwrite-based writes
+
     // SQ8 quantize: float32[dim] → [min(4B), max(4B), uint8[dim]]
     static void quantize(const float* vec, size_t dim, char* record) {
         float minVal = vec[0], maxVal = vec[0];
@@ -409,6 +422,7 @@ private:
             }
         }
         readFd_ = ::open(filePath_.c_str(), O_RDONLY);
+        writeFd_ = ::open(filePath_.c_str(), O_WRONLY | O_CREAT, 0644);
     }
 
     void ensureDeleteFileSize(size_t targetSize) {
@@ -496,15 +510,98 @@ private:
 
     // Ensure that the file is large enough to contain pageId (0-based)
     void ensurePageAllocated(size_t pageId) {
+        if (writeFd_ < 0) return;
         size_t requiredSize = (pageId + 1) * kPageSize;
-        fileStream_.seekp(0, std::ios::end);
-        size_t currentSize = static_cast<size_t>(fileStream_.tellp());
-        if (currentSize < requiredSize) {
-            fileStream_.seekp(static_cast<std::streamoff>(requiredSize - 1), std::ios::beg);
+        struct stat st;
+        if (::fstat(writeFd_, &st) == 0 &&
+            static_cast<size_t>(st.st_size) < requiredSize) {
             char zero = 0;
-            fileStream_.write(&zero, 1);
-            fileStream_.flush();
+            ::pwrite(writeFd_, &zero, 1,
+                     static_cast<off_t>(requiredSize - 1));
         }
+    }
+
+    // Flush one section write buffer to disk via pwrite (one 4KB aligned write).
+    void flushSectionWriteBuf(SectionWriteBuf& swb) {
+        off_t offset = static_cast<off_t>(swb.pageId * kPageSize);
+        if (writeFd_ >= 0) {
+            ::pwrite(writeFd_, swb.data.data(), kPageSize, offset);
+        }
+        // Update read cache if page is cached
+        auto cit = pageCache_.find(swb.pageId);
+        if (cit != pageCache_.end()) {
+            std::memcpy(cit->second.data.data(), swb.data.data(), kPageSize);
+        }
+    }
+
+    // Write a vector into the section's write buffer.
+    // When the page is full, flush the 4KB buffer to disk in one write.
+    void writeToSectionBuffer(int sectionIdx, size_t pageId, uint16_t slot,
+                              const std::vector<float>& vec) {
+        auto it = sectionWriteBufs_.find(sectionIdx);
+        if (it == sectionWriteBufs_.end()) {
+            SectionWriteBuf swb;
+            swb.pageId = pageId;
+            swb.data.resize(kPageSize, 0);
+            it = sectionWriteBufs_.emplace(sectionIdx, std::move(swb)).first;
+        }
+
+        auto& swb = it->second;
+        // If the section moved to a new page, flush the old page first
+        if (swb.pageId != pageId) {
+            flushSectionWriteBuf(swb);
+            swb.pageId = pageId;
+            std::fill(swb.data.begin(), swb.data.end(), 0);
+        }
+
+        // Quantize vector into the buffer
+        size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
+        quantize(vec.data(), dim_, swb.data.data() + offsetInPage);
+
+        // Also update read cache if the page is cached (read consistency)
+        updateCacheAfterWrite(pageId, slot, vec);
+
+        // If page is full, flush to disk and free the buffer
+        if (slot + 1 >= vectorsPerPage_) {
+            flushSectionWriteBuf(swb);
+            sectionWriteBufs_.erase(it);
+        }
+    }
+
+    // Overlay write buffer content onto a page buffer loaded from disk.
+    // Uses pages_[pageId].sectionIdx for O(1) lookup instead of scanning all buffers.
+    void overlayWriteBuf(size_t pageId, PageBuf& buf) const {
+        if (sectionWriteBufs_.empty() || pageId >= pages_.size()) return;
+        int sectionIdx = pages_[pageId].sectionIdx;
+        auto it = sectionWriteBufs_.find(sectionIdx);
+        if (it != sectionWriteBufs_.end() && it->second.pageId == pageId) {
+            std::memcpy(buf.data.data(), it->second.data.data(), kPageSize);
+        }
+    }
+
+    // Try to read a vector from the section write buffer (for unflushed pages).
+    bool tryReadFromWriteBuf(size_t pageId, uint16_t slot, std::vector<float>& vec) const {
+        if (sectionWriteBufs_.empty()) return false;
+        if (pageId >= pages_.size()) return false;
+        int sectionIdx = pages_[pageId].sectionIdx;
+        auto it = sectionWriteBufs_.find(sectionIdx);
+        if (it == sectionWriteBufs_.end() || it->second.pageId != pageId) return false;
+        size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
+        if (vec.size() != dim_) vec.resize(dim_);
+        dequantize(it->second.data.data() + offsetInPage, vec.data(), dim_);
+        return true;
+    }
+
+    // Flat version for batch reads: dequantize into a float* buffer.
+    bool tryReadFromWriteBufFlat(size_t pageId, uint16_t slot, float* out, size_t dim) const {
+        if (sectionWriteBufs_.empty()) return false;
+        if (pageId >= pages_.size()) return false;
+        int sectionIdx = pages_[pageId].sectionIdx;
+        auto it = sectionWriteBufs_.find(sectionIdx);
+        if (it == sectionWriteBufs_.end() || it->second.pageId != pageId) return false;
+        size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
+        dequantize(it->second.data.data() + offsetInPage, out, dim);
+        return true;
     }
 
     // Evict pages if cache size exceeds the limit (FIFO).
@@ -541,6 +638,7 @@ private:
             fileStream_.read(buf.data.data(), static_cast<std::streamsize>(kPageSize));
         }
         // If the read is short (near EOF), remaining bytes stay zero.
+        overlayWriteBuf(pageId, buf);
 
         pageCache_.emplace(pageId, std::move(buf));
         pageOrder_.push_back(pageId);
@@ -564,6 +662,8 @@ private:
 
     // Direct read of a single record into caller buffer (no cache interaction). Dequantizes.
     void directReadRecord(size_t pageId, uint16_t slot, float* out) {
+        // Check write buffer first
+        if (tryReadFromWriteBufFlat(pageId, slot, out, dim_)) return;
         sq8TempBuf_.resize(recordSize_);
         size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
         if (readFd_ >= 0) {
@@ -698,6 +798,8 @@ public:
     }
 
     ~PagedVectorStorage() {
+        flushWrites();
+        if (writeFd_ >= 0) { ::close(writeFd_); writeFd_ = -1; }
         if (readFd_ >= 0) { ::close(readFd_); readFd_ = -1; }
         if (fileStream_.is_open()) {
             fileStream_.close();
@@ -714,6 +816,14 @@ public:
     void setMaxCachedPages(size_t m) {
         maxCachedPages_ = m;
         evictIfNeeded();
+    }
+
+    // Flush all remaining section write buffers (partially filled pages).
+    void flushWrites() override {
+        for (auto& [sectionIdx, swb] : sectionWriteBufs_) {
+            flushSectionWriteBuf(swb);
+        }
+        sectionWriteBufs_.clear();
     }
 
     // Store vector with a section hint: 'sectionKey' is derived from HNSW Level-1 entry.
@@ -747,8 +857,16 @@ public:
         idToPage_[static_cast<size_t>(id)]       = static_cast<int64_t>(pageId);
         idToSlotInPage_[static_cast<size_t>(id)] = slot;
 
-        writeRecord(pageId, slot, vec);
-        updateCacheAfterWrite(pageId, slot, vec);
+        // Look up the internal sectionIdx for write buffer
+        auto secIt = sectionKeyToIdx_.find(sectionKey);
+        int sectionIdx = (secIt != sectionKeyToIdx_.end()) ? secIt->second : -1;
+
+        if (sectionIdx >= 0 && writeFd_ >= 0) {
+            writeToSectionBuffer(sectionIdx, pageId, slot, vec);
+        } else {
+            writeRecord(pageId, slot, vec);
+            updateCacheAfterWrite(pageId, slot, vec);
+        }
         if (deletedFlags_[static_cast<size_t>(id)] != 0) {
             writeDeleteFlag(id, false);
         }
@@ -776,6 +894,11 @@ public:
         }
 
         size_t pageId = static_cast<size_t>(page);
+
+        // 0) Try unflushed write buffer first
+        if (tryReadFromWriteBuf(pageId, slot, vec)) {
+            return;
+        }
 
         // 1) Try page cache
         if (maxCachedPages_ > 0) {
@@ -917,6 +1040,10 @@ public:
             size_t pageId = static_cast<size_t>(page);
             uint16_t slot = idToSlotInPage_[sid];
 
+            // Try write buffer first (unflushed data)
+            if (tryReadFromWriteBufFlat(pageId, slot, out + i * dim, dim_)) {
+                continue;
+            }
             // Try cache hit — dequantize SQ8 → float
             if (maxCachedPages_ > 0) {
                 auto cit = pageCache_.find(pageId);
