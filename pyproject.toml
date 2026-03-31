@@ -5,9 +5,35 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "lsm-vec"
 version = "0.1.0"
-description = "LSM-Vec Python bindings"
+description = "LSM-Vec: Persistent disk-oriented vector database for approximate nearest-neighbor search"
 readme = "README.md"
-requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "NTU-Siqiang-Group"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: C++",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+keywords = ["vector-database", "ann", "hnsw", "rocksdb", "similarity-search"]
+
+[project.urls]
+Homepage = "https://github.com/NTU-Siqiang-Group/LSM-Vec"
+Repository = "https://github.com/NTU-Siqiang-Group/LSM-Vec"
 
 [tool.scikit-build]
 wheel.packages = []

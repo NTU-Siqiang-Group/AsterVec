@@ -10,7 +10,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wall -Wextra -O2 -mavx2 -mfma")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wall -Wextra -O2")
+
+# SIMD flags: AVX2/FMA on x86_64 only (ARM uses scalar fallback in distance.h)
+include(CheckCXXCompilerFlag)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    check_cxx_compiler_flag("-mavx2" HAS_AVX2)
+    check_cxx_compiler_flag("-mfma" HAS_FMA)
+    if(HAS_AVX2)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
+    endif()
+    if(HAS_FMA)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mfma")
+    endif()
+endif()
 
 # On Apple Silicon, Homebrew installs to /opt/homebrew instead of /usr/local.
 # Add it to the search paths so find_package/find_library can locate dependencies.
@@ -43,23 +56,35 @@ find_path(ROCKSDB_INCLUDE_DIR rocksdb/db.h
 )
 
 if(NOT ROCKSDB_LIB OR NOT ROCKSDB_INCLUDE_DIR)
-    message(FATAL_ERROR "Aster RocksDB library or headers not found")
+    message(STATUS "Pre-built Aster not found, building from source...")
+    include(ProcessorCount)
+    ProcessorCount(NPROC)
+    if(NPROC EQUAL 0)
+        set(NPROC 4)
+    endif()
+    execute_process(
+        COMMAND make static_lib -j${NPROC} DEBUG_LEVEL=0
+                DISABLE_WARNING_AS_ERROR=1 EXTRA_CXXFLAGS=-fPIC
+        WORKING_DIRECTORY "${ASTER_ROCKSDB_ROOT}"
+        RESULT_VARIABLE ASTER_BUILD_RESULT
+    )
+    if(NOT ASTER_BUILD_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to build Aster from source")
+    endif()
+    # Re-find after build
+    find_library(ROCKSDB_LIB rocksdb
+        HINTS "${ASTER_ROCKSDB_ROOT}" "${ASTER_ROCKSDB_ROOT}/lib"
+    )
+    find_path(ROCKSDB_INCLUDE_DIR rocksdb/db.h
+        HINTS "${ASTER_ROCKSDB_ROOT}/include"
+    )
+    if(NOT ROCKSDB_LIB OR NOT ROCKSDB_INCLUDE_DIR)
+        message(FATAL_ERROR "Aster build succeeded but library/headers still not found")
+    endif()
 endif()
 
 message(STATUS "Using RocksDB library at ${ROCKSDB_LIB}")
 message(STATUS "Using RocksDB headers at ${ROCKSDB_INCLUDE_DIR}")
-
-include_directories(${ROCKSDB_INCLUDE_DIR})
-
-# find_library(ROCKSDB_LIB rocksdb HINTS /usr/lib/x86_64-linux-gnu /usr/local/lib)
-# set(ROCKSDB_INCLUDE_DIR /usr/include/rocksdb)
-
-if(NOT ROCKSDB_LIB OR NOT ROCKSDB_INCLUDE_DIR)
-    message(FATAL_ERROR "RocksDB library or headers not found")
-endif()
-
-message(STATUS "Found RocksDB library at ${ROCKSDB_LIB}")
-message(STATUS "Found RocksDB headers at ${ROCKSDB_INCLUDE_DIR}")
 
 include_directories(${ROCKSDB_INCLUDE_DIR})
 
@@ -140,8 +165,7 @@ if(APPLE)
         message(STATUS "Found jemalloc at: ${JEMALLOC_LIB}")
         target_link_libraries(lsmvec_shared PRIVATE ${JEMALLOC_LIB})
     else()
-        message(WARNING "jemalloc not found, trying manual link...")
-        target_link_libraries(lsmvec_shared PRIVATE jemalloc)
+        message(STATUS "jemalloc not found, skipping (optional)")
     endif()
 endif()
 
@@ -166,6 +190,7 @@ set_target_properties(lsm_vec PROPERTIES
 )
 
 option(LSMVEC_BUILD_PYTHON "Build Python bindings" OFF)
+option(LSMVEC_PYTHON_STATIC "Link Python module against static lib (for wheel builds)" OFF)
 
 if(LSMVEC_BUILD_PYTHON)
     include(FetchContent)
@@ -178,7 +203,11 @@ if(LSMVEC_BUILD_PYTHON)
 
     pybind11_add_module(lsm_vec_python MODULE python/lsm_vec_pybind.cc)
     target_include_directories(lsm_vec_python PRIVATE ${CMAKE_SOURCE_DIR}/include)
-    target_link_libraries(lsm_vec_python PRIVATE lsmvec_shared)
+    if(LSMVEC_PYTHON_STATIC)
+        target_link_libraries(lsm_vec_python PRIVATE lsmvec_static)
+    else()
+        target_link_libraries(lsm_vec_python PRIVATE lsmvec_shared)
+    endif()
     set_target_properties(lsm_vec_python PROPERTIES
         OUTPUT_NAME lsm_vec
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python
