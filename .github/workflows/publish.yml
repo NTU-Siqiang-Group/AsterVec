@@ -12,9 +12,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-13, macos-14]
+        os: [ubuntu-22.04, macos-14]
         # ubuntu-22.04: Linux x86_64
-        # macos-13: macOS x86_64 (Intel)
         # macos-14: macOS arm64 (Apple Silicon)
 
     steps:
@@ -44,20 +43,19 @@ jobs:
             cd {project} && make aster
 
           # Install system dependencies and build Aster (macOS)
-          # Set MACOSX_DEPLOYMENT_TARGET to avoid std::optional::value() availability errors
+          # Export MACOSX_DEPLOYMENT_TARGET before building to avoid std::optional::value() availability errors
           CIBW_BEFORE_ALL_MACOS: >
             brew install zstd snappy lz4 boost &&
+            export MACOSX_DEPLOYMENT_TARGET=10.14 &&
             cd {project} &&
-            EXTRA_CXXFLAGS="-fPIC -mmacosx-version-min=10.14 -I$(brew --prefix boost)/include"
-            EXTRA_LDFLAGS="-L$(brew --prefix boost)/lib"
-            MACOSX_DEPLOYMENT_TARGET=10.14
             make -C lib/aster static_lib -j$(sysctl -n hw.ncpu) DEBUG_LEVEL=0
             DISABLE_WARNING_AS_ERROR=1
+            EXTRA_CXXFLAGS="-fPIC -I$(brew --prefix boost)/include"
 
           CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=10.14"
 
-          # Pass static linking flag for self-contained wheels
-          CIBW_CONFIG_SETTINGS: "cmake.args=-DLSMVEC_PYTHON_STATIC=ON"
+          # Pass both Python build and static linking flags
+          CIBW_CONFIG_SETTINGS: "cmake.args=-DLSMVEC_BUILD_PYTHON=ON;-DLSMVEC_PYTHON_STATIC=ON"
 
           # Bundle shared libs into wheels
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
