@@ -322,26 +322,21 @@ void queryAndCompareWithGroundTruth(lsm_vec::LSMVecDB &db,
         }
 
         int max_truth = std::min(static_cast<int>(groundTruth[i].size()), k);
-        bool matched = false;
+        int hits = 0;
         for (const auto& result : results) {
             for (int idx = 0; idx < max_truth; ++idx) {
                 if (result.id == groundTruth[i][idx]) {
-                    matched = true;
+                    ++hits;
                     break;
                 }
             }
-            if (matched) {
-                break;
-            }
         }
-        if (matched) {
-            ++correctMatches;
-        }
+        correctMatches += hits;
     }
 
-    // Calculate and print accuracy
-    float accuracy = static_cast<float>(correctMatches) / totalQueries;
-    std::cout << "Accuracy: " << (accuracy * 100) << "%" << std::endl;
+    // recall@k = |intersect(returned, truth)| / k, averaged over queries
+    float recall = static_cast<float>(correctMatches) / (static_cast<float>(totalQueries) * k);
+    std::cout << "Recall@" << k << ": " << (recall * 100) << "%" << std::endl;
 
     // Print efficiency statistics
     std::cout << "Total Query Time: " << totalQueryTime << " ms" << std::endl;
