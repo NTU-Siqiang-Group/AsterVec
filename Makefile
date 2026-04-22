@@ -1,4 +1,4 @@
-.PHONY: all configure static shared lib bin clean aster
+.PHONY: all configure static shared lib bin clean aster unit_test
 
 BUILD_DIR ?= build
 BUILD_TYPE ?= Release
@@ -27,3 +27,7 @@ aster:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+unit_test: configure
+	$(CMAKE) --build $(BUILD_DIR) --target lsmvec_unit_tests -- -j
+	$(BUILD_DIR)/test/unit/lsmvec_unit_tests
