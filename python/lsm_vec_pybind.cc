@@ -95,7 +95,8 @@ PYBIND11_MODULE(lsm_vec, m)
     py::class_<lsm_vec::SearchOptions>(m, "SearchOptions")
         .def(py::init<>())
         .def_readwrite("k", &lsm_vec::SearchOptions::k)
-        .def_readwrite("ef_search", &lsm_vec::SearchOptions::ef_search);
+        .def_readwrite("ef_search", &lsm_vec::SearchOptions::ef_search)
+        .def_readwrite("max_scan_candidates", &lsm_vec::SearchOptions::max_scan_candidates);
 
     py::class_<lsm_vec::SearchResult>(m, "SearchResult")
         .def_readonly("id", &lsm_vec::SearchResult::id)
@@ -108,16 +109,38 @@ PYBIND11_MODULE(lsm_vec, m)
             RaiseStatus(status);
             return db;
         })
-        .def("insert", [](lsm_vec::LSMVecDB& db, int id, const py::sequence& seq) {
-            auto data = ToVector(seq);
-            RaiseStatus(db.Insert(id, MakeSpan(data)));
-        })
-        .def("insert", [](lsm_vec::LSMVecDB& db,
-                           int id,
-                           const py::array_t<float, py::array::c_style | py::array::forcecast>& array) {
-            auto data = ToVector(array);
-            RaiseStatus(db.Insert(id, MakeSpan(data)));
-        })
+        .def("insert",
+             [](lsm_vec::LSMVecDB& db,
+                lsm_vec::node_id_t id,
+                const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
+                py::object metadata) {
+                 std::vector<float> data = ToVector(array);
+                 if (metadata.is_none()) {
+                     RaiseStatus(db.Insert(id, MakeSpan(data)));
+                     return;
+                 }
+                 py::object json_mod = py::module_::import("json");
+                 std::string md_str = json_mod.attr("dumps")(metadata).cast<std::string>();
+                 RaiseStatus(db.Insert(id, MakeSpan(data), md_str));
+             },
+             py::arg("id"), py::arg("vector"), py::arg("metadata") = py::none(),
+             "Insert a vector with optional metadata (Python dict serialized to JSON).")
+        .def("insert",
+             [](lsm_vec::LSMVecDB& db,
+                lsm_vec::node_id_t id,
+                const py::sequence& seq,
+                py::object metadata) {
+                 std::vector<float> data = ToVector(seq);
+                 if (metadata.is_none()) {
+                     RaiseStatus(db.Insert(id, MakeSpan(data)));
+                     return;
+                 }
+                 py::object json_mod = py::module_::import("json");
+                 std::string md_str = json_mod.attr("dumps")(metadata).cast<std::string>();
+                 RaiseStatus(db.Insert(id, MakeSpan(data), md_str));
+             },
+             py::arg("id"), py::arg("vector"), py::arg("metadata") = py::none(),
+             "Insert a vector with optional metadata (Python dict serialized to JSON).")
         .def("update", [](lsm_vec::LSMVecDB& db, int id, const py::sequence& seq) {
             auto data = ToVector(seq);
             RaiseStatus(db.Update(id, MakeSpan(data)));
@@ -195,6 +218,110 @@ PYBIND11_MODULE(lsm_vec, m)
             RaiseStatus(db.SearchKnn(MakeSpan(data), &out));
             return out;
         })
+        .def("search",
+             [](lsm_vec::LSMVecDB& db,
+                const py::array_t<float, py::array::c_style | py::array::forcecast>& query,
+                int k, int ef_search,
+                py::object filter,
+                int max_scan_candidates) -> py::list {
+                 std::vector<float> qdata = ToVector(query);
+                 lsm_vec::SearchOptions opts;
+                 opts.k = k;
+                 opts.ef_search = ef_search;
+                 opts.max_scan_candidates = max_scan_candidates;
+                 std::vector<lsm_vec::SearchResult> out;
+                 if (filter.is_none()) {
+                     RaiseStatus(db.SearchKnn(MakeSpan(qdata), opts, &out));
+                 } else {
+                     py::object json_mod = py::module_::import("json");
+                     std::string filter_json = json_mod.attr("dumps")(filter).cast<std::string>();
+                     RaiseStatus(db.SearchKnn(MakeSpan(qdata), opts, filter_json, &out));
+                 }
+                 py::list result;
+                 for (const auto& r : out) {
+                     py::dict d;
+                     d["id"] = r.id;
+                     d["distance"] = r.distance;
+                     result.append(d);
+                 }
+                 return result;
+             },
+             py::arg("query"),
+             py::arg("k") = 10,
+             py::arg("ef_search") = 64,
+             py::arg("filter") = py::none(),
+             py::arg("max_scan_candidates") = 0,
+             "kNN search with optional metadata filter. Returns list of dicts {id, distance}.")
+        .def("search",
+             [](lsm_vec::LSMVecDB& db,
+                const py::sequence& query,
+                int k, int ef_search,
+                py::object filter,
+                int max_scan_candidates) -> py::list {
+                 std::vector<float> qdata = ToVector(query);
+                 lsm_vec::SearchOptions opts;
+                 opts.k = k;
+                 opts.ef_search = ef_search;
+                 opts.max_scan_candidates = max_scan_candidates;
+                 std::vector<lsm_vec::SearchResult> out;
+                 if (filter.is_none()) {
+                     RaiseStatus(db.SearchKnn(MakeSpan(qdata), opts, &out));
+                 } else {
+                     py::object json_mod = py::module_::import("json");
+                     std::string filter_json = json_mod.attr("dumps")(filter).cast<std::string>();
+                     RaiseStatus(db.SearchKnn(MakeSpan(qdata), opts, filter_json, &out));
+                 }
+                 py::list result;
+                 for (const auto& r : out) {
+                     py::dict d;
+                     d["id"] = r.id;
+                     d["distance"] = r.distance;
+                     result.append(d);
+                 }
+                 return result;
+             },
+             py::arg("query"),
+             py::arg("k") = 10,
+             py::arg("ef_search") = 64,
+             py::arg("filter") = py::none(),
+             py::arg("max_scan_candidates") = 0,
+             "kNN search with optional metadata filter. Returns list of dicts {id, distance}.")
+        .def("set_payload",
+             [](lsm_vec::LSMVecDB& db, lsm_vec::node_id_t id, py::object metadata) {
+                 py::object json_mod = py::module_::import("json");
+                 std::string s = json_mod.attr("dumps")(metadata).cast<std::string>();
+                 RaiseStatus(db.SetPayload(id, s));
+             },
+             py::arg("id"), py::arg("metadata"),
+             "Replace the metadata associated with id.")
+        .def("update_payload",
+             [](lsm_vec::LSMVecDB& db, lsm_vec::node_id_t id, py::object partial) {
+                 py::object json_mod = py::module_::import("json");
+                 std::string s = json_mod.attr("dumps")(partial).cast<std::string>();
+                 RaiseStatus(db.UpdatePayload(id, s));
+             },
+             py::arg("id"), py::arg("metadata"),
+             "Merge-patch (RFC 7396) metadata for id; None values delete fields.")
+        .def("delete_payload_keys",
+             [](lsm_vec::LSMVecDB& db, lsm_vec::node_id_t id,
+                const std::vector<std::string>& keys) {
+                 lsm_vec::Span<const std::string> span(keys);
+                 RaiseStatus(db.DeletePayloadKeys(id, span));
+             },
+             py::arg("id"), py::arg("keys"),
+             "Remove the specified keys from the metadata object for id.")
+        .def("get_payload",
+             [](lsm_vec::LSMVecDB& db, lsm_vec::node_id_t id) -> py::object {
+                 std::string s;
+                 RaiseStatus(db.GetPayload(id, &s));
+                 py::object json_mod = py::module_::import("json");
+                 return json_mod.attr("loads")(s);
+             },
+             py::arg("id"),
+             "Return the metadata dict for id (empty dict if no metadata row).")
+        .def("flush_vector_writes",
+             [](lsm_vec::LSMVecDB& db) { db.flushVectorWrites(); },
+             "Flush any pending vector writes to the on-disk vector storage.")
         .def("close", [](lsm_vec::LSMVecDB& db) {
             RaiseStatus(db.Close());
         });
