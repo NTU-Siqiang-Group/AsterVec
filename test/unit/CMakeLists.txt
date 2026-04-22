@@ -2,6 +2,14 @@
 add_executable(lsmvec_unit_tests
     main.cc
     test_sanity.cc
+    test_predicate_eq.cc
+    test_predicate_comparison.cc
+    test_predicate_set.cc
+    test_predicate_exists_contains.cc
+    test_predicate_logical.cc
+    test_predicate_path.cc
+    test_predicate_parse.cc
+    test_predicate_parse_errors.cc
 )
 target_include_directories(lsmvec_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/doctest

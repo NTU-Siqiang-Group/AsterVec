@@ -96,6 +96,7 @@ set(LIB_SOURCES
     src/lsm_vec_index.cc
     src/lsm_vec_db.cc
     src/utils.cc
+    src/metadata.cc
 )
 
 find_library(ZSTD_LIB zstd
