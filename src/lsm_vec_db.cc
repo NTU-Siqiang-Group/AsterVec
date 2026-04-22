@@ -1,5 +1,6 @@
 #include "lsm_vec_db.h"
 
+#include <cctype>
 #include <cmath>
 #include <exception>
 #include <fstream>
@@ -10,6 +11,7 @@
 #include "json.hpp"
 #include "lsm_vec_index.h"
 #include "logger.h"
+#include "metadata.h"
 #include "metadata_store.h"
 #include "rocksdb/db.h"
 #include "rocksdb/filter_policy.h"
@@ -383,6 +385,72 @@ Status LSMVecDB::SearchKnn(Span<float> query,
         return Status::NotFound("no available neighbors");
     }
 
+    return Status::OK();
+}
+
+Status LSMVecDB::SearchKnn(Span<float> query,
+                           const SearchOptions& options,
+                           std::string_view filter_json,
+                           std::vector<SearchResult>* out)
+{
+    if (!out) {
+        return Status::InvalidArgument("output results must not be null");
+    }
+    if (options.k <= 0) {
+        return Status::InvalidArgument("k must be positive");
+    }
+
+    Status metric_status = EnsureMetricSupported();
+    if (!metric_status.ok()) {
+        return metric_status;
+    }
+
+    Status vec_status = ValidateVector(query);
+    if (!vec_status.ok()) {
+        return vec_status;
+    }
+
+    // Fast path: empty or whitespace-only / "{}" filter routes to unfiltered overload.
+    bool effectively_empty = true;
+    size_t s = 0, e = filter_json.size();
+    while (s < e && std::isspace(static_cast<unsigned char>(filter_json[s]))) ++s;
+    while (e > s && std::isspace(static_cast<unsigned char>(filter_json[e - 1]))) --e;
+    auto trimmed = filter_json.substr(s, e - s);
+    if (!trimmed.empty() && trimmed != "{}") effectively_empty = false;
+
+    if (effectively_empty) {
+        return SearchKnn(query, options, out);
+    }
+
+    // Parse the filter predicate.
+    metadata::Predicate pred;
+    auto pst = metadata::ParsePredicate(filter_json, &pred);
+    if (!pst.ok()) {
+        return pst;
+    }
+
+    // Run filtered search.
+    std::vector<float> qvec(query.begin(), query.end());
+    std::vector<SearchResult> results = index_->knnSearchKFiltered(
+        qvec,
+        options.k,
+        options.ef_search,
+        &pred,
+        options.max_scan_candidates,
+        metadata_store_.get());
+
+    out->clear();
+    out->reserve(results.size());
+    for (const auto& result : results) {
+        if (deleted_ids_.count(result.id) > 0) {
+            continue;
+        }
+        out->push_back(result);
+    }
+
+    if (out->empty()) {
+        return Status::NotFound("no available neighbors");
+    }
     return Status::OK();
 }
 

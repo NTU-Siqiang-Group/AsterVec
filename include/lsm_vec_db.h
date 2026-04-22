@@ -75,6 +75,7 @@ struct LSMVecDBOptions {
 struct SearchOptions {
     int k = 1;
     int ef_search = 64;
+    int max_scan_candidates = 0;   // 0 = auto (k * 50 when filter present)
 };
 
 struct SearchResult {
@@ -102,6 +103,11 @@ public:
     Status Get(node_id_t id, std::vector<float>* vec);
     Status SearchKnn(Span<float> query,
                      const SearchOptions& options,
+                     std::vector<SearchResult>* out);
+
+    Status SearchKnn(Span<float> query,
+                     const SearchOptions& options,
+                     std::string_view filter_json,
                      std::vector<SearchResult>* out);
 
     Status SearchKnn(Span<float> query,

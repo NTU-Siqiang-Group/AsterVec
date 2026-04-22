@@ -16,6 +16,8 @@ add_executable(lsmvec_unit_tests
     test_lsm_vec_db_delete_cascade.cc
     test_metadata_backward_compat.cc
     test_payload_crud.cc
+    test_filtered_search.cc
+    test_filtered_search_no_regression.cc
 )
 target_include_directories(lsmvec_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/doctest

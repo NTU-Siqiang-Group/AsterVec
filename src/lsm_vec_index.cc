@@ -1,10 +1,13 @@
 #include "lsm_vec_index.h"
 #include "disk_vector.h"
 #include "distance.h"
+#include "metadata_store.h"
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <queue>
 #include <string>
 #include <sstream>
@@ -715,6 +718,29 @@ using namespace ROCKSDB_NAMESPACE;
         return filtered;
     }
 
+    std::vector<SearchResult> LSMVec::knnSearchKFiltered(
+        const std::vector<float>& query,
+        int k,
+        int ef_search,
+        const metadata::Predicate* pred,
+        int max_scan_candidates,
+        const MetadataStore* meta_store)
+    {
+        if (entry_point_ == k_invalid_node_id || k <= 0) {
+            return {};
+        }
+
+        // Greedy descent through upper layers (filter-blind).
+        node_id_t currentEntryPoint = entry_point_;
+        for (int lvl = max_layer_; lvl > 0; --lvl) {
+            currentEntryPoint = greedySearchUpperLayer(query, currentEntryPoint, lvl);
+        }
+
+        // Layer-0 filtered iterative expansion.
+        return searchLayer(query, currentEntryPoint, ef_search, /*layer=*/0,
+                           pred, k, max_scan_candidates, meta_store);
+    }
+
     // Links neighbors for upper layers stored in memory
     void LSMVec::linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer)
     {
@@ -1362,6 +1388,134 @@ using namespace ROCKSDB_NAMESPACE;
             result.push_back({p.second, p.first});
         }
         return result;
+    }
+
+    std::vector<SearchResult> LSMVec::searchLayer(
+        const std::vector<float>& queryVector,
+        node_id_t entryPointId,
+        int efSearch,
+        int layer,
+        const metadata::Predicate* pred,
+        int k,
+        int max_scan_candidates,
+        const MetadataStore* meta_store) {
+
+        (void)efSearch;  // In filter mode, k + max_scan_candidates control termination.
+
+        // No predicate → unfiltered path.
+        if (pred == nullptr) {
+            return searchLayer(queryVector, entryPointId, efSearch, layer);
+        }
+        // Filtered searchLayer is only supported on layer 0.
+        assert(layer == 0 && "filtered searchLayer only supported on layer 0");
+
+        if (k <= 0) {
+            return {};
+        }
+        if (max_scan_candidates <= 0) {
+            max_scan_candidates = k * 50;
+        }
+
+        // Bump visited version (same pattern as the unfiltered overload).
+        ++visited_version_;
+        if (visited_version_ == 0) {
+            visited_map_.clear();
+            visited_version_ = 1;
+        }
+        auto visitedInsert = [&](node_id_t id) -> bool {
+            auto [it, inserted] = visited_map_.emplace(id, visited_version_);
+            if (inserted || it->second != visited_version_) {
+                it->second = visited_version_;
+                return true;  // newly visited
+            }
+            return false;  // already visited
+        };
+
+        // Helper: fetch & parse metadata for node id.
+        // Returns an empty object if the row is NotFound (so nothing matches
+        // unless the predicate is empty); std::nullopt on any other store
+        // error → treated as a non-match for safety.
+        auto fetch_meta = [&](node_id_t id) -> std::optional<metadata::Json> {
+            if (meta_store == nullptr) return metadata::Json::object();
+            metadata::Json j;
+            auto st = meta_store->Get(id, &j);
+            if (st.IsNotFound()) return metadata::Json::object();
+            if (!st.ok()) return std::nullopt;
+            return j;
+        };
+        auto node_matches = [&](node_id_t id) -> bool {
+            auto doc = fetch_meta(id);
+            if (!doc.has_value()) return false;
+            return pred->matches(*doc);
+        };
+
+        // candidates: min-heap by distance (stored as max-heap of -distance).
+        using Cand = std::pair<float, node_id_t>;
+        std::priority_queue<Cand> candidates;   // key = -distance → top is nearest
+        std::priority_queue<Cand> results;      // key = distance  → top is farthest
+        const size_t kcap = static_cast<size_t>(k);
+
+        // Seed with entry point — routing always, filter only for results.
+        std::vector<float> entry_vec;
+        readVectorWithStats(entryPointId, entry_vec);
+        float d_entry = computeDistance(Span<const float>(queryVector),
+                                        Span<const float>(entry_vec));
+        visitedInsert(entryPointId);
+        candidates.emplace(-d_entry, entryPointId);
+        if (node_matches(entryPointId)) {
+            results.emplace(d_entry, entryPointId);
+        }
+
+        size_t scanned = 0;
+        while (!candidates.empty()) {
+            float cd = -candidates.top().first;
+            node_id_t cid = candidates.top().second;
+            candidates.pop();
+
+            // Convergence: no reachable point can improve top-k.
+            if (results.size() >= kcap && cd > results.top().first) {
+                break;
+            }
+            // Expansion cap (Tier B safety bound).
+            if (scanned >= static_cast<size_t>(max_scan_candidates)) {
+                break;
+            }
+
+            // Layer-0 adjacency.
+            auto neighborList = getEdgesCached(cid);
+            for (node_id_t nb : neighborList) {
+                if (!visitedInsert(nb)) continue;
+
+                std::vector<float> nb_vec;
+                readVectorWithStats(nb, nb_vec);
+                float d = computeDistance(Span<const float>(queryVector),
+                                          Span<const float>(nb_vec));
+                ++scanned;
+
+                // Routing: filter-agnostic (all neighbors can serve as bridges).
+                if (results.size() < kcap || d < results.top().first) {
+                    candidates.emplace(-d, nb);
+                }
+
+                // Filtering: only matching nodes enter results.
+                if (node_matches(nb)) {
+                    if (results.size() < kcap || d < results.top().first) {
+                        results.emplace(d, nb);
+                        if (results.size() > kcap) results.pop();
+                    }
+                }
+            }
+        }
+
+        // Drain max-heap → sorted ascending by distance.
+        std::vector<SearchResult> out;
+        out.reserve(results.size());
+        while (!results.empty()) {
+            out.push_back({results.top().second, results.top().first});
+            results.pop();
+        }
+        std::reverse(out.begin(), out.end());
+        return out;
     }
 
 

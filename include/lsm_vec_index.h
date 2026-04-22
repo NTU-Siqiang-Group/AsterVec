@@ -13,6 +13,7 @@
 #include <iostream>
 #include "disk_vector.h"
 #include "lsm_vec_db.h"
+#include "metadata.h"
 #include "statistics.h"
 #include "logger.h"
 
@@ -104,6 +105,13 @@ using namespace ROCKSDB_NAMESPACE;
         Status updateNode(node_id_t id, const std::vector<float>& vec);
         Status getNodeVector(node_id_t id, std::vector<float>* out);
         std::vector<SearchResult> knnSearchK(const std::vector<float>& query, int k, int ef_search);
+        std::vector<SearchResult> knnSearchKFiltered(
+            const std::vector<float>& query,
+            int k,
+            int ef_search,
+            const metadata::Predicate* pred,
+            int max_scan_candidates,
+            const class MetadataStore* meta_store);
         std::unordered_set<node_id_t> highest_layer_nodes_;
 
         void printIndexStatus() const;
@@ -129,6 +137,14 @@ using namespace ROCKSDB_NAMESPACE;
                                               node_id_t entryPointId,
                                               int efSearch,
                                               int layer);
+        std::vector<SearchResult> searchLayer(const std::vector<float> &queryVector,
+                                              node_id_t entryPointId,
+                                              int efSearch,
+                                              int layer,
+                                              const metadata::Predicate* pred,
+                                              int k,
+                                              int max_scan_candidates,
+                                              const class MetadataStore* meta_store);
         node_id_t greedySearchUpperLayer(const std::vector<float>& query,
                                           node_id_t entryPoint, int layer);
         void linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer);
