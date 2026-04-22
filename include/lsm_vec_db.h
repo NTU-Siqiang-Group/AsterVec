@@ -5,6 +5,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
@@ -12,8 +13,14 @@
 #include "disk_vector.h"
 #include "rocksdb/status.h"
 
+namespace ROCKSDB_NAMESPACE {
+class DB;
+class ColumnFamilyHandle;
+}  // namespace ROCKSDB_NAMESPACE
+
 namespace lsm_vec
 {
+class MetadataStore;  // forward declaration
 using Status = ROCKSDB_NAMESPACE::Status;
 
 enum class DistanceMetric {
@@ -85,6 +92,11 @@ public:
     Status Close();
 
     Status Insert(node_id_t id, Span<float> vec);
+    Status Insert(node_id_t id, Span<float> vec, std::string_view metadata_json);
+    Status GetPayload(node_id_t id, std::string* out_json);
+    Status SetPayload(node_id_t id, std::string_view metadata_json);
+    Status UpdatePayload(node_id_t id, std::string_view partial_json);
+    Status DeletePayloadKeys(node_id_t id, Span<const std::string> keys);
     Status Update(node_id_t id, Span<float> vec);
     Status Delete(node_id_t id);
     Status Get(node_id_t id, std::vector<float>* vec);
@@ -108,10 +120,18 @@ private:
     Status EnsureMetricSupported() const;
     float ComputeDistance(Span<float> a, Span<float> b) const;
 
+    // True iff id has a live vector in the index (not deleted, slot assigned).
+    // Centralizes the "id must have a vector" invariant used by payload CRUD.
+    bool HasLiveVector(node_id_t id) const;
+
     std::string db_path_;
     LSMVecDBOptions options_;
     std::unique_ptr<std::ostream> log_stream_;
     std::unique_ptr<class LSMVec> index_;
     std::unordered_set<node_id_t> deleted_ids_;
+
+    std::unique_ptr<ROCKSDB_NAMESPACE::DB>  metadata_db_;
+    ROCKSDB_NAMESPACE::ColumnFamilyHandle*  metadata_cf_ = nullptr;
+    std::unique_ptr<MetadataStore>          metadata_store_;
 };
 } // namespace lsm_vec

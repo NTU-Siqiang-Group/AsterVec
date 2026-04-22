@@ -12,6 +12,10 @@ add_executable(lsmvec_unit_tests
     test_predicate_parse_errors.cc
     test_metadata_store_basic.cc
     test_metadata_store_update.cc
+    test_lsm_vec_db_insert_metadata.cc
+    test_lsm_vec_db_delete_cascade.cc
+    test_metadata_backward_compat.cc
+    test_payload_crud.cc
 )
 target_include_directories(lsmvec_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/doctest

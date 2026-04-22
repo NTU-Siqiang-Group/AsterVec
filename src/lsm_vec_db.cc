@@ -4,10 +4,17 @@
 #include <exception>
 #include <fstream>
 #include <limits>
+#include <vector>
 
 #include "distance.h"
+#include "json.hpp"
 #include "lsm_vec_index.h"
 #include "logger.h"
+#include "metadata_store.h"
+#include "rocksdb/db.h"
+#include "rocksdb/filter_policy.h"
+#include "rocksdb/options.h"
+#include "rocksdb/table.h"
 
 namespace lsm_vec
 {
@@ -17,7 +24,16 @@ constexpr char kDefaultLogFileName[] = "lsm_vec_db.log";
 constexpr char kMetadataFileName[] = "lsm_vec_db.meta";
 } // namespace
 
-LSMVecDB::~LSMVecDB() = default;
+LSMVecDB::~LSMVecDB()
+{
+    // Tear down metadata resources in the right order if Close() was not called.
+    metadata_store_.reset();
+    if (metadata_cf_ && metadata_db_) {
+        metadata_db_->DestroyColumnFamilyHandle(metadata_cf_);
+        metadata_cf_ = nullptr;
+    }
+    metadata_db_.reset();
+}
 
 LSMVecDB::LSMVecDB(const std::string& db_path,
                    const LSMVecDBOptions& options,
@@ -76,6 +92,47 @@ Status LSMVecDB::Open(const std::string& path,
             (*db)->deleted_ids_ = (*db)->index_->deletedIds();
         }
     }
+
+    // Open sibling rocksdb::DB at <path>/metadata for the metadata column family.
+    {
+        std::string meta_path = path + "/metadata";
+        rocksdb::Options meta_opts;
+        meta_opts.create_if_missing = true;
+        meta_opts.create_missing_column_families = true;
+        meta_opts.compression = rocksdb::kZSTD;
+
+        std::vector<rocksdb::ColumnFamilyDescriptor> cfds;
+        cfds.emplace_back(rocksdb::kDefaultColumnFamilyName,
+                          rocksdb::ColumnFamilyOptions());
+
+        rocksdb::ColumnFamilyOptions cfopts;
+        cfopts.compression = rocksdb::kZSTD;
+        rocksdb::BlockBasedTableOptions table_opts;
+        table_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false));
+        cfopts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
+        cfds.emplace_back("metadata", cfopts);
+
+        std::vector<rocksdb::ColumnFamilyHandle*> handles;
+        rocksdb::DB* meta_raw = nullptr;
+        auto mst = rocksdb::DB::Open(meta_opts, meta_path, cfds, &handles, &meta_raw);
+        if (!mst.ok()) {
+            // Some RocksDB versions populate handles even on partial failure — clean up.
+            for (auto* h : handles) {
+                if (h && meta_raw) meta_raw->DestroyColumnFamilyHandle(h);
+            }
+            delete meta_raw;
+            db->reset();  // API contract: *db is null on error.
+            return mst;
+        }
+
+        (*db)->metadata_db_.reset(meta_raw);
+        (*db)->metadata_cf_ = handles[1];
+        (*db)->metadata_store_ =
+            std::make_unique<MetadataStore>(meta_raw, handles[1]);
+        // Default CF not used; destroy its handle now.
+        meta_raw->DestroyColumnFamilyHandle(handles[0]);
+    }
+
     return Status::OK();
 }
 
@@ -125,6 +182,99 @@ Status LSMVecDB::Insert(node_id_t id, Span<float> vec)
     return Status::OK();
 }
 
+namespace {
+// Parse and validate a metadata JSON string into a json object. Returns
+// InvalidArgument on parse error or if the top-level value is not an object.
+Status ParseMetadataObject(std::string_view json, nlohmann::json* out) {
+    try {
+        *out = nlohmann::json::parse(json);
+    } catch (const std::exception& e) {
+        return Status::InvalidArgument(std::string("metadata parse error: ") + e.what());
+    }
+    if (!out->is_object()) {
+        return Status::InvalidArgument("metadata must be a JSON object");
+    }
+    return Status::OK();
+}
+}  // namespace
+
+bool LSMVecDB::HasLiveVector(node_id_t id) const {
+    return index_
+        && index_->vector_storage_
+        && deleted_ids_.count(id) == 0
+        && index_->vector_storage_->exists(id);
+}
+
+Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata_json)
+{
+    // 1. Validate vector up front (fail-fast; no writes yet).
+    auto vst = ValidateVector(vec);
+    if (!vst.ok()) return vst;
+
+    // 2. Pre-parse metadata (fail-fast; no writes yet).
+    const bool has_metadata = !metadata_json.empty() && metadata_json != "{}";
+    if (has_metadata) {
+        nlohmann::json parsed;
+        auto pst = ParseMetadataObject(metadata_json, &parsed);
+        if (!pst.ok()) return pst;
+    }
+
+    // 3. Insert vector via existing path.
+    auto ist = Insert(id, vec);
+    if (!ist.ok()) return ist;
+
+    // 4. Persist metadata (if any). If this fails the vector remains inserted.
+    if (has_metadata && metadata_store_) {
+        auto mst = metadata_store_->Put(id, metadata_json);
+        if (!mst.ok()) {
+            return mst;
+        }
+    }
+    return Status::OK();
+}
+
+Status LSMVecDB::GetPayload(node_id_t id, std::string* out_json)
+{
+    if (!metadata_store_) return Status::NotFound("metadata store unavailable");
+    auto st = metadata_store_->Get(id, out_json);
+    if (st.IsNotFound()) {
+        *out_json = "{}";
+        return Status::OK();
+    }
+    return st;
+}
+
+Status LSMVecDB::SetPayload(node_id_t id, std::string_view metadata_json)
+{
+    if (!metadata_store_) return Status::NotFound("metadata store unavailable");
+    if (!HasLiveVector(id)) return Status::NotFound("vector not found for id");
+
+    nlohmann::json parsed;
+    auto pst = ParseMetadataObject(metadata_json, &parsed);
+    if (!pst.ok()) return pst;
+
+    return metadata_store_->Put(id, metadata_json);
+}
+
+Status LSMVecDB::UpdatePayload(node_id_t id, std::string_view partial_json)
+{
+    if (!metadata_store_) return Status::NotFound("metadata store unavailable");
+    if (!HasLiveVector(id)) return Status::NotFound("vector not found for id");
+
+    nlohmann::json patch;
+    auto pst = ParseMetadataObject(partial_json, &patch);
+    if (!pst.ok()) return pst;
+
+    return metadata_store_->Update(id, patch);
+}
+
+Status LSMVecDB::DeletePayloadKeys(node_id_t id, Span<const std::string> keys)
+{
+    if (!metadata_store_) return Status::NotFound("metadata store unavailable");
+    std::vector<std::string> key_vec(keys.data(), keys.data() + keys.size());
+    return metadata_store_->DeleteKeys(id, key_vec);
+}
+
 Status LSMVecDB::Update(node_id_t id, Span<float> vec)
 {
     Status vec_status = ValidateVector(vec);
@@ -156,6 +306,14 @@ Status LSMVecDB::Delete(node_id_t id)
     if (!delete_status.ok()) {
         deleted_ids_.erase(id);
         return delete_status;
+    }
+
+    if (metadata_store_) {
+        // Best-effort: ignore NotFound (id may have had no metadata).
+        auto mst = metadata_store_->Delete(id);
+        if (!mst.ok() && !mst.IsNotFound()) {
+            return mst;
+        }
     }
     return Status::OK();
 }
@@ -275,6 +433,16 @@ Status LSMVecDB::Close()
     }
 
     index_->close();
+
+    // Tear down the metadata column family / DB.
+    if (metadata_store_) {
+        metadata_store_.reset();
+    }
+    if (metadata_cf_ && metadata_db_) {
+        metadata_db_->DestroyColumnFamilyHandle(metadata_cf_);
+        metadata_cf_ = nullptr;
+    }
+    metadata_db_.reset();
 
     return Status::OK();
 }
