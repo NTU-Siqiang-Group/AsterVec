@@ -13,6 +13,7 @@
 #include "logger.h"
 #include "metadata.h"
 #include "metadata_store.h"
+#include "rocksdb/cache.h"
 #include "rocksdb/db.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/options.h"
@@ -102,14 +103,30 @@ Status LSMVecDB::Open(const std::string& path,
         meta_opts.create_if_missing = true;
         meta_opts.create_missing_column_families = true;
         meta_opts.compression = rocksdb::kZSTD;
+        // Cap total memtable memory across all CFs at 16 MB.
+        meta_opts.db_write_buffer_size = 16 << 20;
+
+        // One 16 MB LRU cache shared by default + metadata CFs. Without this,
+        // each BlockBasedTableFactory would instantiate its own default cache
+        // (32 MB each in current RocksDB). The default CF is never written to
+        // so its contribution to the cache stays ~0.
+        auto shared_block_cache = rocksdb::NewLRUCache(16 << 20);
 
         std::vector<rocksdb::ColumnFamilyDescriptor> cfds;
-        cfds.emplace_back(rocksdb::kDefaultColumnFamilyName,
-                          rocksdb::ColumnFamilyOptions());
+
+        rocksdb::BlockBasedTableOptions default_table_opts;
+        default_table_opts.block_cache = shared_block_cache;
+        rocksdb::ColumnFamilyOptions default_cfopts;
+        default_cfopts.table_factory.reset(
+            rocksdb::NewBlockBasedTableFactory(default_table_opts));
+        cfds.emplace_back(rocksdb::kDefaultColumnFamilyName, default_cfopts);
 
         rocksdb::ColumnFamilyOptions cfopts;
         cfopts.compression = rocksdb::kZSTD;
+        cfopts.write_buffer_size = 8 << 20;   // 8 MB per memtable
+        cfopts.max_write_buffer_number = 2;   // up to 2 memtables: 2 * 8 MB = 16 MB
         rocksdb::BlockBasedTableOptions table_opts;
+        table_opts.block_cache = shared_block_cache;
         table_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false));
         cfopts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
         cfds.emplace_back("metadata", cfopts);
@@ -185,9 +202,19 @@ Status LSMVecDB::Insert(node_id_t id, Span<float> vec)
 }
 
 namespace {
+// Hard cap on untrusted metadata input. Rejected before json::parse to
+// prevent DoS via pathologically large payloads. Matches Milvus's
+// JSON-field size limit. See docs/METADATA_FILTERING_FOLLOWUP.md (I1).
+constexpr size_t kMaxMetadataJsonBytes = 64 * 1024;
+
 // Parse and validate a metadata JSON string into a json object. Returns
-// InvalidArgument on parse error or if the top-level value is not an object.
+// InvalidArgument on parse error, oversize input, or if the top-level
+// value is not an object.
 Status ParseMetadataObject(std::string_view json, nlohmann::json* out) {
+    if (json.size() > kMaxMetadataJsonBytes) {
+        return Status::InvalidArgument(
+            "metadata JSON exceeds " + std::to_string(kMaxMetadataJsonBytes) + " bytes");
+    }
     try {
         *out = nlohmann::json::parse(json);
     } catch (const std::exception& e) {
@@ -481,6 +508,20 @@ Status LSMVecDB::Close()
         return Status::InvalidArgument("database not initialized");
     }
 
+    // Tear down the metadata column family / DB FIRST, so file locks on
+    // <path>/metadata are released even if the index-metadata file write
+    // below fails (I3). These teardown steps do not fail; the destructor
+    // performs the same sequence idempotently.
+    if (metadata_store_) {
+        metadata_store_.reset();
+    }
+    if (metadata_cf_ && metadata_db_) {
+        metadata_db_->DestroyColumnFamilyHandle(metadata_cf_);
+        metadata_cf_ = nullptr;
+    }
+    metadata_db_.reset();
+
+    // Now persist the HNSW index metadata (may fail on disk-full etc.).
     std::string metadata_path = db_path_ + "/" + kMetadataFileName;
     std::ofstream metadata_stream(metadata_path, std::ios::binary | std::ios::trunc);
     if (!metadata_stream.is_open()) {
@@ -501,17 +542,6 @@ Status LSMVecDB::Close()
     }
 
     index_->close();
-
-    // Tear down the metadata column family / DB.
-    if (metadata_store_) {
-        metadata_store_.reset();
-    }
-    if (metadata_cf_ && metadata_db_) {
-        metadata_db_->DestroyColumnFamilyHandle(metadata_cf_);
-        metadata_cf_ = nullptr;
-    }
-    metadata_db_.reset();
-
     return Status::OK();
 }
 } // namespace lsm_vec

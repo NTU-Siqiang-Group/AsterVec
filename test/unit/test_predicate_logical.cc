@@ -59,3 +59,23 @@ TEST_CASE("Nested $and/$or") {
     CHECK_FALSE(outer.matches(Json{{"a",3},{"b",10}}));
     CHECK_FALSE(outer.matches(Json{{"a",1},{"b",99}}));
 }
+
+TEST_CASE("matches: runtime depth guard (M5)") {
+    // Hand-construct a predicate 64 levels deep — past the parser's cap
+    // but reachable if someone builds a Predicate programmatically.
+    // Each wrapper is a single-child $and around a leaf that WOULD match
+    // the document at depth 0. Without the runtime depth guard this would
+    // either overflow the stack or return true; with the guard, matches()
+    // returns false safely.
+    Predicate cur = eqLeaf({"x"}, 1);
+    for (int i = 0; i < 64; ++i) {
+        Predicate wrap;
+        wrap.kind = Predicate::Kind::And;
+        wrap.children.push_back(std::move(cur));
+        cur = std::move(wrap);
+    }
+    Json doc = Json{{"x", 1}};
+    // The leaf is satisfiable, but the depth guard should short-circuit
+    // to false before reaching it.
+    CHECK_FALSE(cur.matches(doc));
+}

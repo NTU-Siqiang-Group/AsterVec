@@ -1438,7 +1438,7 @@ using namespace ROCKSDB_NAMESPACE;
         auto fetch_meta = [&](node_id_t id) -> std::optional<metadata::Json> {
             if (meta_store == nullptr) return metadata::Json::object();
             metadata::Json j;
-            ++stats.metadata_gets;
+            stats.addCount(1, stats.metadata_gets);
             auto st = meta_store->Get(id, &j);
             if (st.IsNotFound()) return metadata::Json::object();
             if (!st.ok()) return std::nullopt;
@@ -1447,9 +1447,9 @@ using namespace ROCKSDB_NAMESPACE;
         auto node_matches = [&](node_id_t id) -> bool {
             auto doc = fetch_meta(id);
             if (!doc.has_value()) return false;
-            ++stats.filter_evaluations;
+            stats.addCount(1, stats.filter_evaluations);
             bool m = pred->matches(*doc);
-            if (m) ++stats.filter_matches;
+            if (m) stats.addCount(1, stats.filter_matches);
             return m;
         };
 
@@ -1522,9 +1522,9 @@ using namespace ROCKSDB_NAMESPACE;
         }
         std::reverse(out.begin(), out.end());
 
-        // Record filter-path stats.
-        stats.filter_scanned += scanned;
-        if (cap_hit) ++stats.filter_cap_hits;
+        // Record filter-path stats (no-op when stats are disabled).
+        stats.addCount(scanned, stats.filter_scanned);
+        if (cap_hit) stats.addCount(1, stats.filter_cap_hits);
 
         return out;
     }

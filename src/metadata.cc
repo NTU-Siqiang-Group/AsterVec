@@ -1,10 +1,18 @@
 #include "metadata.h"
 
 #include <cctype>
+#include <string>
 
 namespace lsm_vec::metadata {
 
 namespace {
+
+// Hard caps on untrusted filter input. Rejected before json::parse or
+// before deep AST construction/traversal, to prevent DoS via
+// pathologically large or nested payloads. See
+// docs/METADATA_FILTERING_FOLLOWUP.md (I1/M5).
+constexpr size_t kMaxFilterJsonBytes = 8 * 1024;
+constexpr int    kMaxPredicateDepth  = 32;
 
 // Resolve a dot-path against a JSON document.
 // Returns nullptr if any segment is missing or its parent is not an object.
@@ -46,7 +54,13 @@ FieldPath SplitPath(std::string_view key) {
 }
 
 // Forward declaration used by ParseLogicalArray.
-Status ParseObject(const Json& obj, Predicate* out);
+Status ParseObject(const Json& obj, Predicate* out, int depth);
+
+Status DepthLimitExceeded() {
+    return Status::InvalidArgument(
+        "filter predicate nesting exceeds " +
+        std::to_string(kMaxPredicateDepth) + " levels");
+}
 
 // Convert an operator-object like {"$gt":5,"$lt":10} on `path` to a Predicate.
 // Multiple operator keys -> Predicate::Kind::And with one child per operator.
@@ -100,7 +114,8 @@ Status ParseOperatorObject(const FieldPath& path, const Json& obj, Predicate* ou
     return Status::OK();
 }
 
-Status ParseLogicalArray(const Json& arr, Predicate::Kind kind, Predicate* out) {
+Status ParseLogicalArray(const Json& arr, Predicate::Kind kind, Predicate* out, int depth) {
+    if (depth > kMaxPredicateDepth) return DepthLimitExceeded();
     if (!arr.is_array()) {
         return Status::InvalidArgument("$and/$or requires an array");
     }
@@ -110,14 +125,15 @@ Status ParseLogicalArray(const Json& arr, Predicate::Kind kind, Predicate* out) 
             return Status::InvalidArgument("$and/$or element must be an object");
         }
         Predicate child;
-        auto st = ParseObject(el, &child);
+        auto st = ParseObject(el, &child, depth + 1);
         if (!st.ok()) return st;
         out->children.push_back(std::move(child));
     }
     return Status::OK();
 }
 
-Status ParseObject(const Json& obj, Predicate* out) {
+Status ParseObject(const Json& obj, Predicate* out, int depth) {
+    if (depth > kMaxPredicateDepth) return DepthLimitExceeded();
     if (!obj.is_object()) {
         return Status::InvalidArgument("filter must be an object");
     }
@@ -132,7 +148,8 @@ Status ParseObject(const Json& obj, Predicate* out) {
             auto st = ParseLogicalArray(
                 val,
                 key == "$and" ? Predicate::Kind::And : Predicate::Kind::Or,
-                &child);
+                &child,
+                depth + 1);
             if (!st.ok()) return st;
         } else {
             FieldPath path = SplitPath(key);
@@ -186,45 +203,50 @@ Status ParseObject(const Json& obj, Predicate* out) {
     return Status::OK();
 }
 
-}  // namespace
+// Depth-aware matcher. The public Predicate::matches is a thin wrapper
+// that enters with depth = 0; $and/$or arms recurse with depth + 1.
+// Above kMaxPredicateDepth the predicate is treated as non-match — a
+// safety valve against hand-built over-deep ASTs that bypassed the
+// parser's depth cap (M5).
+bool MatchesWithDepth(const Predicate& p, const Json& doc, int depth) {
+    if (depth > kMaxPredicateDepth) return false;
 
-bool Predicate::matches(const Json& doc) const {
-    const Json* v = Resolve(doc, path);
-    switch (kind) {
-        case Kind::Eq:
-            return v != nullptr && *v == value;
-        case Kind::Ne:
-            return v == nullptr || *v != value;  // missing → true
-        case Kind::Gt:
-            return CompareOrdered(v, value, [](auto& a, auto& b) { return a >  b; });
-        case Kind::Gte:
-            return CompareOrdered(v, value, [](auto& a, auto& b) { return a >= b; });
-        case Kind::Lt:
-            return CompareOrdered(v, value, [](auto& a, auto& b) { return a <  b; });
-        case Kind::Lte:
-            return CompareOrdered(v, value, [](auto& a, auto& b) { return a <= b; });
-        case Kind::In: {
+    const Json* v = Resolve(doc, p.path);
+    switch (p.kind) {
+        case Predicate::Kind::Eq:
+            return v != nullptr && *v == p.value;
+        case Predicate::Kind::Ne:
+            return v == nullptr || *v != p.value;  // missing → true
+        case Predicate::Kind::Gt:
+            return CompareOrdered(v, p.value, [](auto& a, auto& b) { return a >  b; });
+        case Predicate::Kind::Gte:
+            return CompareOrdered(v, p.value, [](auto& a, auto& b) { return a >= b; });
+        case Predicate::Kind::Lt:
+            return CompareOrdered(v, p.value, [](auto& a, auto& b) { return a <  b; });
+        case Predicate::Kind::Lte:
+            return CompareOrdered(v, p.value, [](auto& a, auto& b) { return a <= b; });
+        case Predicate::Kind::In: {
             if (v == nullptr) return false;
-            for (const auto& x : values) if (*v == x) return true;
+            for (const auto& x : p.values) if (*v == x) return true;
             return false;
         }
-        case Kind::Nin: {
+        case Predicate::Kind::Nin: {
             if (v == nullptr) return true;
-            for (const auto& x : values) if (*v == x) return false;
+            for (const auto& x : p.values) if (*v == x) return false;
             return true;
         }
-        case Kind::Exists:
-            return (v != nullptr) == exists_expected;
-        case Kind::ContainsAny: {
+        case Predicate::Kind::Exists:
+            return (v != nullptr) == p.exists_expected;
+        case Predicate::Kind::ContainsAny: {
             if (v == nullptr || !v->is_array()) return false;
-            for (const auto& target : values)
+            for (const auto& target : p.values)
                 for (const auto& el : *v)
                     if (el == target) return true;
             return false;
         }
-        case Kind::ContainsAll: {
+        case Predicate::Kind::ContainsAll: {
             if (v == nullptr || !v->is_array()) return false;
-            for (const auto& target : values) {
+            for (const auto& target : p.values) {
                 bool found = false;
                 for (const auto& el : *v)
                     if (el == target) { found = true; break; }
@@ -232,14 +254,22 @@ bool Predicate::matches(const Json& doc) const {
             }
             return true;
         }
-        case Kind::And:
-            for (const auto& c : children) if (!c.matches(doc)) return false;
+        case Predicate::Kind::And:
+            for (const auto& c : p.children)
+                if (!MatchesWithDepth(c, doc, depth + 1)) return false;
             return true;
-        case Kind::Or:
-            for (const auto& c : children) if (c.matches(doc)) return true;
+        case Predicate::Kind::Or:
+            for (const auto& c : p.children)
+                if (MatchesWithDepth(c, doc, depth + 1)) return true;
             return false;
     }
     return false;  // unreachable; silences compiler non-exhaustive-switch warning
+}
+
+}  // namespace
+
+bool Predicate::matches(const Json& doc) const {
+    return MatchesWithDepth(*this, doc, 0);
 }
 
 Status ParsePredicate(std::string_view json_str, Predicate* out) {
@@ -255,6 +285,11 @@ Status ParsePredicate(std::string_view json_str, Predicate* out) {
         return Status::OK();  // default empty PredAnd matches all
     }
 
+    if (trimmed.size() > kMaxFilterJsonBytes) {
+        return Status::InvalidArgument(
+            "filter JSON exceeds " + std::to_string(kMaxFilterJsonBytes) + " bytes");
+    }
+
     Json parsed;
     try {
         parsed = Json::parse(trimmed);
@@ -262,7 +297,7 @@ Status ParsePredicate(std::string_view json_str, Predicate* out) {
         return Status::InvalidArgument(std::string("filter JSON parse error: ") + e.what());
     }
 
-    return ParseObject(parsed, out);
+    return ParseObject(parsed, out, 0);
 }
 
 }  // namespace lsm_vec::metadata
