@@ -1438,6 +1438,7 @@ using namespace ROCKSDB_NAMESPACE;
         auto fetch_meta = [&](node_id_t id) -> std::optional<metadata::Json> {
             if (meta_store == nullptr) return metadata::Json::object();
             metadata::Json j;
+            ++stats.metadata_gets;
             auto st = meta_store->Get(id, &j);
             if (st.IsNotFound()) return metadata::Json::object();
             if (!st.ok()) return std::nullopt;
@@ -1446,7 +1447,10 @@ using namespace ROCKSDB_NAMESPACE;
         auto node_matches = [&](node_id_t id) -> bool {
             auto doc = fetch_meta(id);
             if (!doc.has_value()) return false;
-            return pred->matches(*doc);
+            ++stats.filter_evaluations;
+            bool m = pred->matches(*doc);
+            if (m) ++stats.filter_matches;
+            return m;
         };
 
         // candidates: min-heap by distance (stored as max-heap of -distance).
@@ -1467,6 +1471,7 @@ using namespace ROCKSDB_NAMESPACE;
         }
 
         size_t scanned = 0;
+        bool cap_hit = false;
         while (!candidates.empty()) {
             float cd = -candidates.top().first;
             node_id_t cid = candidates.top().second;
@@ -1478,6 +1483,7 @@ using namespace ROCKSDB_NAMESPACE;
             }
             // Expansion cap (Tier B safety bound).
             if (scanned >= static_cast<size_t>(max_scan_candidates)) {
+                cap_hit = true;
                 break;
             }
 
@@ -1515,6 +1521,11 @@ using namespace ROCKSDB_NAMESPACE;
             results.pop();
         }
         std::reverse(out.begin(), out.end());
+
+        // Record filter-path stats.
+        stats.filter_scanned += scanned;
+        if (cap_hit) ++stats.filter_cap_hits;
+
         return out;
     }
 

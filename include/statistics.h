@@ -52,6 +52,13 @@ public:
 
         page_cache_hits = 0;
         page_cache_misses = 0;
+
+        metadata_gets = 0;
+        metadata_cache_hits = 0;
+        filter_evaluations = 0;
+        filter_matches = 0;
+        filter_scanned = 0;
+        filter_cap_hits = 0;
     }
 
     // ------------------------------------------------------------
@@ -139,6 +146,14 @@ public:
     std::size_t page_cache_hits = 0;
     std::size_t page_cache_misses = 0;
 
+    // Metadata filtering counters
+    std::size_t metadata_gets        = 0;
+    std::size_t metadata_cache_hits  = 0;  // reserved; 0 in v1
+    std::size_t filter_evaluations   = 0;
+    std::size_t filter_matches       = 0;
+    std::size_t filter_scanned       = 0;
+    std::size_t filter_cap_hits      = 0;
+
     // ------------------------------------------------------------
     // Print helper
     // ------------------------------------------------------------
@@ -183,6 +198,16 @@ public:
                               static_cast<double>(total);
             os << "Page Cache Avoided I/O: " << page_cache_hits << "\n";
             os << "Page Cache Hit Rate: " << hit_rate << "%\n";
+        }
+
+        if (metadata_gets + filter_evaluations + filter_scanned > 0) {
+            os << "-------metadata filter part------\n";
+            os << "Metadata Gets: " << metadata_gets << "\n";
+            os << "Metadata Cache Hits: " << metadata_cache_hits << "\n";
+            os << "Filter Evaluations: " << filter_evaluations << "\n";
+            os << "Filter Matches: " << filter_matches << "\n";
+            os << "Filter Scanned: " << filter_scanned << "\n";
+            os << "Filter Cap Hits: " << filter_cap_hits << "\n";
         }
         os << std::endl;
     }
