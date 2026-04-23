@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "id_types.h"
+
 namespace lsm_vec
 {
 using node_id_t = std::uint64_t;
@@ -341,6 +343,76 @@ private:
     // For each sectionIdx, list of pages that still have free slots
     std::unordered_map<int,std::vector<size_t>> sectionOpenPages_;
     std::unordered_map<int,std::vector<std::pair<size_t,uint16_t>>> sectionFreeSlots_;
+
+    // C6: sparse map for update-allocated internal_ids (bit 63 = 1).
+    // Direct ids (bit 63 = 0) continue to use the dense idToPage_ /
+    // idToSlotInPage_ arrays above. The on-disk data file is shared across
+    // both ranges so allocateSlotForSection can co-locate a direct vector
+    // and an update vector on the same 4 KB page (E3 — locality).
+    // Update-id deletion is tracked by LSMVec::tombstoned_internal_ids_,
+    // not here, so no per-update-id deleted_flag is stored.
+    struct UpdateLoc {
+        int64_t  page = -1;
+        uint16_t slot = 0;
+    };
+    std::unordered_map<node_id_t, UpdateLoc> update_locations_;
+
+    // ----- Location dispatch helpers (V1, see DELETE_DESIGN.md §0.3) -----
+    // These transparently route direct ids to dense arrays and update ids to
+    // the sparse hashmap, so the public methods don't have to branch.
+
+    int64_t page_of(node_id_t id) const {
+        if (is_direct_id(id)) {
+            if (static_cast<size_t>(id) >= totalVectors_) return -1;
+            return idToPage_[static_cast<size_t>(id)];
+        }
+        auto it = update_locations_.find(id);
+        return (it == update_locations_.end()) ? -1 : it->second.page;
+    }
+
+    uint16_t slot_of(node_id_t id) const {
+        if (is_direct_id(id)) {
+            if (static_cast<size_t>(id) >= totalVectors_) return 0;
+            return idToSlotInPage_[static_cast<size_t>(id)];
+        }
+        auto it = update_locations_.find(id);
+        return (it == update_locations_.end()) ? 0 : it->second.slot;
+    }
+
+    bool is_deleted_at(node_id_t id) const {
+        if (is_direct_id(id)) {
+            if (static_cast<size_t>(id) >= totalVectors_) return false;
+            return deletedFlags_[static_cast<size_t>(id)] != 0;
+        }
+        return false;  // LSMVec owns tombstone state for update ids
+    }
+
+    // For write paths: ensure dense storage is large enough for direct ids.
+    // No-op for update ids (the hashmap auto-grows on assignment).
+    void ensure_dense_capacity(node_id_t id) {
+        if (is_direct_id(id) && static_cast<size_t>(id) >= totalVectors_) {
+            expandCapacity(static_cast<size_t>(id) + 1);
+        }
+    }
+
+    void assign_location(node_id_t id, size_t page, uint16_t slot) {
+        if (is_direct_id(id)) {
+            idToPage_[static_cast<size_t>(id)]       = static_cast<int64_t>(page);
+            idToSlotInPage_[static_cast<size_t>(id)] = slot;
+        } else {
+            UpdateLoc& loc = update_locations_[id];
+            loc.page = static_cast<int64_t>(page);
+            loc.slot = slot;
+        }
+    }
+
+    void mark_deleted_at(node_id_t id, bool deleted) {
+        if (is_direct_id(id) && static_cast<size_t>(id) < totalVectors_
+            && (deletedFlags_[static_cast<size_t>(id)] != 0) != deleted) {
+            writeDeleteFlag(id, deleted);
+        }
+        // update ids: no-op (LSMVec owns the canonical tombstone state)
+    }
 
     // Page cache (FIFO) in units of full pages (4KB each)
     size_t maxCachedPages_;
@@ -833,29 +905,24 @@ public:
                            const std::vector<float>& vec,
                            node_id_t sectionKey) override
     {
-        if (static_cast<size_t>(id) >= totalVectors_) {
-            expandCapacity(static_cast<size_t>(id) + 1);
-        }
+        ensure_dense_capacity(id);   // grows direct-id arrays if needed; no-op for update ids
         if (vec.size() != dim_) {
             throw std::runtime_error("Vector size mismatch.");
         }
 
-        int64_t curPage = idToPage_[static_cast<size_t>(id)];
-        uint16_t curSlot = idToSlotInPage_[static_cast<size_t>(id)];
+        int64_t curPage = page_of(id);
 
         if (curPage >= 0) {
             // Overwrite existing slot
+            uint16_t curSlot = slot_of(id);
             writeRecord(static_cast<size_t>(curPage), curSlot, vec);
             updateCacheAfterWrite(static_cast<size_t>(curPage), curSlot, vec);
-            if (deletedFlags_[static_cast<size_t>(id)] != 0) {
-                writeDeleteFlag(id, false);
-            }
+            mark_deleted_at(id, false);
             return;
         }
 
         auto [pageId, slot] = allocateSlotForSection(sectionKey);
-        idToPage_[static_cast<size_t>(id)]       = static_cast<int64_t>(pageId);
-        idToSlotInPage_[static_cast<size_t>(id)] = slot;
+        assign_location(id, pageId, slot);
 
         // Look up the internal sectionIdx for write buffer
         auto secIt = sectionKeyToIdx_.find(sectionKey);
@@ -867,9 +934,7 @@ public:
             writeRecord(pageId, slot, vec);
             updateCacheAfterWrite(pageId, slot, vec);
         }
-        if (deletedFlags_[static_cast<size_t>(id)] != 0) {
-            writeDeleteFlag(id, false);
-        }
+        mark_deleted_at(id, false);
     }
 
     // Backward-compatible version: if you don't care about sections,
@@ -881,18 +946,12 @@ public:
     // Read a vector by its logical ID.
     void readVectorFromDisk(node_id_t id, std::vector<float>& vec) override
     {
-        if (static_cast<size_t>(id) >= totalVectors_) {
-            throw std::out_of_range("Vector ID out of range.");
-        }
-
-        int64_t page = idToPage_[static_cast<size_t>(id)];
-        uint16_t slot = idToSlotInPage_[static_cast<size_t>(id)];
-
+        int64_t page = page_of(id);
         if (page < 0) {
             std::fprintf(stderr, "Problematic id: %lu\n", static_cast<unsigned long>(id));
             throw std::runtime_error("Vector slot not assigned for this ID.");
         }
-
+        uint16_t slot = slot_of(id);
         size_t pageId = static_cast<size_t>(page);
 
         // 0) Try unflushed write buffer first
@@ -933,37 +992,19 @@ public:
 
     void deleteVector(node_id_t id) override
     {
-        if (static_cast<size_t>(id) >= totalVectors_) {
-            throw std::out_of_range("Vector ID out of range.");
-        }
-        if (deletedFlags_[static_cast<size_t>(id)] != 0) {
-            return;
-        }
-
-        int64_t page = idToPage_[static_cast<size_t>(id)];
-        uint16_t slot = idToSlotInPage_[static_cast<size_t>(id)];
-        if (page >= 0) {
-            size_t pageIndex = static_cast<size_t>(page);
-            if (pageIndex < pages_.size()) {
-                int sectionIdx = pages_[pageIndex].sectionIdx;
-                sectionFreeSlots_[sectionIdx].emplace_back(pageIndex, slot);
-            }
-            idToPage_[static_cast<size_t>(id)] = -1;
-            idToSlotInPage_[static_cast<size_t>(id)] = 0;
-        }
-
-        writeDeleteFlag(id, true);
+        // C6 / C5a: Delete is a no-op at the storage layer. Tombstoning lives
+        // in LSMVec::tombstoned_internal_ids_; the slot stays bound so
+        // tombstoned nodes can still be read for routing (tombstone-as-router).
+        // The pre-C5a slot-freelist (sectionFreeSlots_) and the deletedFlags_
+        // bit-write are intentionally dropped: V1 has no slot reuse and the
+        // canonical "is this id deleted?" state is owned by LSMVec.
+        (void)id;
     }
 
     bool exists(node_id_t id) const override
     {
-        if (static_cast<size_t>(id) >= totalVectors_) {
-            return false;
-        }
-        if (deletedFlags_[static_cast<size_t>(id)] != 0) {
-            return false;
-        }
-        return idToPage_[static_cast<size_t>(id)] >= 0;
+        if (is_deleted_at(id)) return false;
+        return page_of(id) >= 0;
     }
 
     // Prefetch pages corresponding to given vector IDs.
@@ -973,8 +1014,7 @@ public:
 
         std::unordered_map<size_t, bool> seenPage;
         for (node_id_t id : ids) {
-            if (static_cast<size_t>(id) >= totalVectors_) continue;
-            int64_t page = idToPage_[static_cast<size_t>(id)];
+            int64_t page = page_of(id);
             if (page < 0) continue;
             size_t pageId = static_cast<size_t>(page);
             if (seenPage.emplace(pageId, true).second) {
@@ -993,11 +1033,7 @@ public:
         // Group indices by pageId
         std::unordered_map<size_t, std::vector<size_t>> pageToIndices;
         for (size_t i = 0; i < ids.size(); ++i) {
-            node_id_t id = ids[i];
-            if (static_cast<size_t>(id) >= totalVectors_) {
-                throw std::out_of_range("Vector ID out of range in batch read.");
-            }
-            int64_t page = idToPage_[static_cast<size_t>(id)];
+            int64_t page = page_of(ids[i]);
             if (page < 0) {
                 throw std::runtime_error("Vector slot not assigned in batch read.");
             }
@@ -1009,8 +1045,7 @@ public:
             loadPageToCache(pageId);
 
             for (size_t idx : indices) {
-                node_id_t id = ids[idx];
-                uint16_t slot = idToSlotInPage_[static_cast<size_t>(id)];
+                uint16_t slot = slot_of(ids[idx]);
                 if (!tryReadFromCache(pageId, slot, out[idx])) {
                     // Fallback: direct read + dequantize
                     if (out[idx].size() != dim_) out[idx].resize(dim_);
@@ -1029,16 +1064,12 @@ public:
         // Pass 1: serve cache hits directly, collect misses
         for (size_t i = 0; i < ids.size(); ++i) {
             node_id_t id = ids[i];
-            size_t sid = static_cast<size_t>(id);
-            if (sid >= totalVectors_) {
-                throw std::out_of_range("Vector ID out of range in batch flat read.");
-            }
-            int64_t page = idToPage_[sid];
+            int64_t page = page_of(id);
             if (page < 0) {
                 throw std::runtime_error("Vector slot not assigned in batch flat read.");
             }
             size_t pageId = static_cast<size_t>(page);
-            uint16_t slot = idToSlotInPage_[sid];
+            uint16_t slot = slot_of(id);
 
             // Try write buffer first (unflushed data)
             if (tryReadFromWriteBufFlat(pageId, slot, out + i * dim, dim_)) {
