@@ -116,6 +116,11 @@ public:
     void printStatistics() const;
     void flushVectorWrites();
 
+    // Test-only accessor: exposes the underlying LSMVec so unit tests can
+    // exercise low-level resolvers (resolve_internal / resolve_real / is_alive).
+    // Not intended for production use.
+    class LSMVec* index_for_test() { return index_.get(); }
+
 private:
     LSMVecDB(const std::string& db_path,
              const LSMVecDBOptions& options,

@@ -1799,4 +1799,56 @@ using namespace ROCKSDB_NAMESPACE;
     //     std::cout << std::endl;
     //     std::cout << std::endl;
     // }
+
+    // ----------------------------------------------------------------------
+    // Delete / update primitives — see docs/DELETE_DESIGN.md §4 and §5.6.
+    // Wired into LSMVecDB in chunk C5b; defined here so resolver tests in
+    // C3 can exercise them in isolation.
+    // ----------------------------------------------------------------------
+
+    internal_id_t LSMVec::resolve_internal(real_id_t r) const {
+        if (!update_bloom_.might_contain(r)) {
+            return static_cast<internal_id_t>(r);                  // 99% case
+        }
+        auto it = updated_real_to_internal_.find(r);
+        return (it == updated_real_to_internal_.end())
+             ? static_cast<internal_id_t>(r)                       // bloom FP fallback
+             : it->second;
+    }
+
+    real_id_t LSMVec::resolve_real(internal_id_t i) const {
+        if (is_direct_id(i)) return static_cast<real_id_t>(i);     // bit-test fast path
+        auto it = updated_internal_to_real_.find(i);
+        return (it == updated_internal_to_real_.end())
+             ? static_cast<real_id_t>(i)                           // defensive; should not happen
+             : it->second;
+    }
+
+    bool LSMVec::is_alive(real_id_t r) const {
+        internal_id_t i = resolve_internal(r);
+        if (tombstoned_internal_ids_.count(i) > 0) return false;
+        return vector_storage_ && vector_storage_->exists(i);
+    }
+
+    void LSMVec::record_update_mapping(real_id_t r, internal_id_t new_i) {
+        // A4: if r already has an update mapping, drop the stale reverse entry.
+        auto prev = updated_real_to_internal_.find(r);
+        if (prev != updated_real_to_internal_.end()) {
+            updated_internal_to_real_.erase(prev->second);
+        }
+        updated_real_to_internal_[r]     = new_i;
+        updated_internal_to_real_[new_i] = r;
+        update_bloom_.add(r);
+        if (update_bloom_.fill_ratio() >= 0.7) {
+            rebuild_bloom_to(update_bloom_.capacity() * 2);
+        }
+    }
+
+    void LSMVec::rebuild_bloom_to(std::size_t new_capacity) {
+        update_bloom_.reset(new_capacity, 0.01);
+        for (const auto& kv : updated_real_to_internal_) {
+            update_bloom_.add(kv.first);
+        }
+    }
+
 } // namespace ROCKSDB_NAMESPACE

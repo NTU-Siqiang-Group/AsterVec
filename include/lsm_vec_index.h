@@ -11,7 +11,9 @@
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
 #include <iostream>
+#include "bloom_filter.h"
 #include "disk_vector.h"
+#include "id_types.h"
 #include "lsm_vec_db.h"
 #include "metadata.h"
 #include "statistics.h"
@@ -124,6 +126,33 @@ using namespace ROCKSDB_NAMESPACE;
         std::unique_ptr<IVectorStorage> vector_storage_;
         LSMVecDBOptions db_options_;
 
+        // ----------------------------------------------------------------
+        // Delete / update primitives (V1; see docs/DELETE_DESIGN.md §4-§5).
+        // Public so LSMVecDB can drive the lifecycle and tests can verify
+        // the resolvers in isolation. Read-only accessors below for stats.
+        // ----------------------------------------------------------------
+        internal_id_t resolve_internal(real_id_t r) const;
+        real_id_t     resolve_real(internal_id_t i) const;
+        bool          is_alive(real_id_t r) const;
+
+        bool          is_tombstoned(internal_id_t i) const {
+            return tombstoned_internal_ids_.count(i) > 0;
+        }
+        void          tombstone(internal_id_t i) { tombstoned_internal_ids_.insert(i); }
+
+        internal_id_t allocate_update_id() { return next_update_internal_id_++; }
+        void          record_update_mapping(real_id_t r, internal_id_t i);
+
+        // Read-only accessors for stats / tests.
+        std::size_t   tombstone_count()    const { return tombstoned_internal_ids_.size(); }
+        std::size_t   updated_real_id_count() const { return updated_real_to_internal_.size(); }
+        std::size_t   updated_internal_to_real_size() const {
+            return updated_internal_to_real_.size();
+        }
+        std::size_t   bloom_capacity()     const { return update_bloom_.capacity(); }
+        double        bloom_fill_ratio()   const { return update_bloom_.fill_ratio(); }
+        internal_id_t next_update_internal_id() const { return next_update_internal_id_; }
+
     private:
         int randomLevel();
         float computeDistance(Span<const float> vectorA,
@@ -213,6 +242,17 @@ using namespace ROCKSDB_NAMESPACE;
         node_id_t entry_point_ = k_invalid_node_id; // Entry point for HNSW graph
 
         std::unordered_set<node_id_t> deleted_ids_;
+
+        // V1 delete/update infrastructure — sparse maps over the divergent
+        // subset of (real_id, internal_id) plus a Bloom shortcut for forward
+        // resolve. Wiring into the operation layer happens in C5b.
+        std::unordered_map<real_id_t, internal_id_t> updated_real_to_internal_;
+        std::unordered_map<internal_id_t, real_id_t> updated_internal_to_real_;
+        std::unordered_set<internal_id_t>            tombstoned_internal_ids_;
+        BloomFilter                                   update_bloom_{512, 0.01};
+        internal_id_t                                 next_update_internal_id_ = kFirstUpdateId;
+
+        void rebuild_bloom_to(std::size_t new_capacity);
 
         int section_layer_ = 1;
         bool enable_batch_read_ = true;
