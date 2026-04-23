@@ -98,6 +98,7 @@ set(LIB_SOURCES
     src/utils.cc
     src/metadata.cc
     src/metadata_store.cc
+    src/bloom_filter.cc
 )
 
 find_library(ZSTD_LIB zstd

@@ -18,6 +18,7 @@ add_executable(lsmvec_unit_tests
     test_payload_crud.cc
     test_filtered_search.cc
     test_filtered_search_no_regression.cc
+    test_bloom_filter.cc
 )
 target_include_directories(lsmvec_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/doctest
