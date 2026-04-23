@@ -98,13 +98,15 @@ using namespace ROCKSDB_NAMESPACE;
 
         Status SerializeMetadata(std::ostream& out) const;
         Status DeserializeMetadata(std::istream& in);
-        const std::unordered_set<node_id_t>& deletedIds() const { return deleted_ids_; }
-        void setDeletedIds(const std::unordered_set<node_id_t>& ids) { deleted_ids_ = ids; }
+        // Backward-compatible accessors: now backed by tombstoned_internal_ids_.
+        // node_id_t and internal_id_t are both aliases for uint64_t, so callers
+        // (LSMVecDB, persistence) compile unchanged.
+        const std::unordered_set<node_id_t>& deletedIds() const { return tombstoned_internal_ids_; }
+        void setDeletedIds(const std::unordered_set<node_id_t>& ids) { tombstoned_internal_ids_ = ids; }
 
         void insertNode(node_id_t nodeId, const std::vector<float> &vector);
         node_id_t knnSearch(const std::vector<float> &queryVector);
         Status deleteNode(node_id_t id);
-        Status updateNode(node_id_t id, const std::vector<float>& vec);
         Status getNodeVector(node_id_t id, std::vector<float>* out);
         std::vector<SearchResult> knnSearchK(const std::vector<float>& query, int k, int ef_search);
         std::vector<SearchResult> knnSearchKFiltered(
@@ -240,8 +242,6 @@ using namespace ROCKSDB_NAMESPACE;
         std::uniform_real_distribution<> uniform_distribution_;
         int max_layer_;
         node_id_t entry_point_ = k_invalid_node_id; // Entry point for HNSW graph
-
-        std::unordered_set<node_id_t> deleted_ids_;
 
         // V1 delete/update infrastructure — sparse maps over the divergent
         // subset of (real_id, internal_id) plus a Bloom shortcut for forward

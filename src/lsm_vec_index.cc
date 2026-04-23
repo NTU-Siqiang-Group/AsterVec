@@ -211,7 +211,7 @@ using namespace ROCKSDB_NAMESPACE;
         uint64_t entryPoint = static_cast<uint64_t>(entry_point_);
         int32_t maxLayer = static_cast<int32_t>(max_layer_);
         uint64_t nodeCount = static_cast<uint64_t>(nodes_.size());
-        uint64_t deletedCount = static_cast<uint64_t>(deleted_ids_.size());
+        uint64_t deletedCount = static_cast<uint64_t>(tombstoned_internal_ids_.size());
 
         if (!WriteValue(out, entryPoint) ||
             !WriteValue(out, maxLayer) ||
@@ -256,7 +256,7 @@ using namespace ROCKSDB_NAMESPACE;
             }
         }
 
-        for (node_id_t id : deleted_ids_) {
+        for (node_id_t id : tombstoned_internal_ids_) {
             if (!WriteValue(out, id)) {
                 return Status::IOError("failed to write deleted id");
             }
@@ -352,13 +352,13 @@ using namespace ROCKSDB_NAMESPACE;
             nodes_.emplace(nodeId, std::move(node));
         }
 
-        deleted_ids_.clear();
+        tombstoned_internal_ids_.clear();
         for (uint64_t i = 0; i < deletedCount; ++i) {
             node_id_t id = 0;
             if (!ReadValue(in, &id)) {
                 return Status::IOError("failed to read deleted ids");
             }
-            deleted_ids_.insert(id);
+            tombstoned_internal_ids_.insert(id);
         }
 
         int32_t storageType = 0;
@@ -443,7 +443,10 @@ using namespace ROCKSDB_NAMESPACE;
 
     void LSMVec::insertNode(node_id_t nodeId, const std::vector<float> &vector)
     {
-        deleted_ids_.erase(nodeId);
+        // C5a: removed deleted_ids_.erase(nodeId). Re-insert of a tombstoned id
+        // is now routed by LSMVecDB::Insert (C5b) to allocate a fresh
+        // internal_id via Update semantics; this function never sees a
+        // tombstoned nodeId in the new design.
         bool vectorStored = false;  // Track whether we've stored this vector
 
         auto insert_timer = stats.startTimer();
@@ -610,59 +613,27 @@ using namespace ROCKSDB_NAMESPACE;
         stats.addCount(1, stats.insert_count);
     }
 
+    // C5a pivot: deleteNode is a tombstone insertion only. The HNSW graph is
+    // intentionally left untouched (no edge removal, no nodes_ erase, no
+    // vector_storage_->deleteVector call); deleted nodes remain valid routing
+    // infrastructure per docs/DELETE_DESIGN.md §1.3. Search filters them out
+    // at the result-emission step (see knnSearchK below).
     Status LSMVec::deleteNode(node_id_t id)
     {
-        deleted_ids_.insert(id);
-        try {
-            vector_storage_->deleteVector(id);
-        } catch (const std::exception& ex) {
-            return Status::IOError(ex.what());
-        }
-
-        for (auto& kv : nodes_) {
-            auto& neighbor_map = kv.second.neighbors;
-            for (auto& layer_entry : neighbor_map) {
-                auto& neighbors = layer_entry.second;
-                neighbors.erase(std::remove(neighbors.begin(), neighbors.end(), id), neighbors.end());
-            }
-        }
-
-        nodes_.erase(id);
-
-        rocksdb::Edges edges;
-        db_->GetAllEdges(id, &edges);
-        for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
-            node_id_t neighborId = static_cast<node_id_t>(edges.nxts_out[i].nxt);
-            db_->DeleteEdge(id, neighborId);
-            db_->DeleteEdge(neighborId, id);
-        }
-        rocksdb::free_edges(&edges);
-
+        tombstoned_internal_ids_.insert(id);
         return Status::OK();
     }
 
-    Status LSMVec::updateNode(node_id_t id, const std::vector<float>& vec)
-    {
-        Status delete_status = deleteNode(id);
-        if (!delete_status.ok()) {
-            return delete_status;
-        }
-
-        try {
-            insertNode(id, vec);
-        } catch (const std::exception& ex) {
-            return Status::IOError(ex.what());
-        }
-
-        return Status::OK();
-    }
+    // updateNode was removed in C5a. Update is now composed at the LSMVecDB
+    // layer (C5b): allocate a fresh internal_id, insertNode at it, tombstone
+    // the old internal_id. See docs/DELETE_DESIGN.md §5.2.
 
     Status LSMVec::getNodeVector(node_id_t id, std::vector<float>* out)
     {
         if (!out) {
             return Status::InvalidArgument("output vector must not be null");
         }
-        if (deleted_ids_.count(id) > 0) {
+        if (tombstoned_internal_ids_.count(id) > 0) {
             return Status::NotFound("vector deleted");
         }
         if (!vector_storage_->exists(id)) {
@@ -700,7 +671,7 @@ using namespace ROCKSDB_NAMESPACE;
         std::vector<SearchResult> filtered;
         filtered.reserve(static_cast<size_t>(k));
         for (const auto& result : neighbors) {
-            if (deleted_ids_.count(result.id) > 0) {
+            if (tombstoned_internal_ids_.count(result.id) > 0) {
                 continue;
             }
             filtered.push_back(result);
