@@ -135,11 +135,14 @@ private:
     // Centralizes the "id must have a vector" invariant used by payload CRUD.
     bool HasLiveVector(node_id_t id) const;
 
+    // C5b internal helpers (declared private; callers use public Update/Insert).
+    Status UpdateInternal(node_id_t id, Span<float> vec,
+                          std::string_view metadata_json);
+
     std::string db_path_;
     LSMVecDBOptions options_;
     std::unique_ptr<std::ostream> log_stream_;
     std::unique_ptr<class LSMVec> index_;
-    std::unordered_set<node_id_t> deleted_ids_;
 
     std::unique_ptr<ROCKSDB_NAMESPACE::DB>  metadata_db_;
     ROCKSDB_NAMESPACE::ColumnFamilyHandle*  metadata_cf_ = nullptr;

@@ -145,6 +145,11 @@ using namespace ROCKSDB_NAMESPACE;
         internal_id_t allocate_update_id() { return next_update_internal_id_++; }
         void          record_update_mapping(real_id_t r, internal_id_t i);
 
+        // A4: Drop both forward and reverse sparse-map entries for real_id.
+        // Used by LSMVecDB::Delete so future resolve_internal(r) returns
+        // identity. Bloom-filter bit stays set (FP falls through harmlessly).
+        void          forget_update_mapping(real_id_t r);
+
         // Read-only accessors for stats / tests.
         std::size_t   tombstone_count()    const { return tombstoned_internal_ids_.size(); }
         std::size_t   updated_real_id_count() const { return updated_real_to_internal_.size(); }

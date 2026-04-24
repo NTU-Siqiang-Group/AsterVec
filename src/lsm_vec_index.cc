@@ -126,12 +126,18 @@ using namespace ROCKSDB_NAMESPACE;
             options_.compression = rocksdb::kNoCompression;
         }
 
+        // Aster minimal_mode=true disables MorrisCounter degree-tracking and
+        // in-neighbor maintenance. LSM-Vec doesn't use either, and minimal_mode
+        // also makes the graph tolerate u64 ids with bit 63 set (our update_id
+        // namespace) without the counter array trying to allocate ~exabytes.
+        // Requires Aster's feature/minimal-mode branch.
         db_ = std::make_unique<rocksdb::RocksGraph>(
             options_,
             EDGE_UPDATE_EAGER,
             ENCODING_TYPE_NONE,
             db_options_.reinit,
-            db_path
+            db_path,
+            /*minimal_mode=*/true
         );
 
         nodes_.reserve(10000);
@@ -1820,6 +1826,16 @@ using namespace ROCKSDB_NAMESPACE;
         for (const auto& kv : updated_real_to_internal_) {
             update_bloom_.add(kv.first);
         }
+    }
+
+    void LSMVec::forget_update_mapping(real_id_t r) {
+        auto it = updated_real_to_internal_.find(r);
+        if (it != updated_real_to_internal_.end()) {
+            updated_internal_to_real_.erase(it->second);
+            updated_real_to_internal_.erase(it);
+        }
+        // Bloom filter bit stays set; FP is harmless (falls through to the
+        // now-empty hashmap and returns identity).
     }
 
 } // namespace ROCKSDB_NAMESPACE

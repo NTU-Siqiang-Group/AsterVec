@@ -12,6 +12,11 @@ using real_id_t = uint64_t;
 //   0 => internal_id is identical to its owning real_id (direct mapping)
 //   1 => internal_id was allocated by Update / Delete-then-Insert
 //        (sparse maps carry its real_id)
+// Note: passing u64 with bit 63 set into Aster's RocksGraph is only safe under
+// the minimal_mode=true configuration (feature/minimal-mode branch), which
+// disables MorrisCounter and in-neighbor tracking — those structures use the
+// id as a vector index and would try to allocate ~exabytes for a value that
+// reinterprets as INT64_MIN.
 using internal_id_t = uint64_t;
 
 constexpr internal_id_t kUpdateIdBit   = 1ULL << 63;

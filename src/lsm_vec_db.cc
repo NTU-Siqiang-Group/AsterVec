@@ -92,7 +92,7 @@ Status LSMVecDB::Open(const std::string& path,
             if (!metadata_status.ok()) {
                 return metadata_status;
             }
-            (*db)->deleted_ids_ = (*db)->index_->deletedIds();
+            // C5b: tombstoned set now lives inside LSMVec; no separate copy needed.
         }
     }
 
@@ -181,24 +181,7 @@ float LSMVecDB::ComputeDistance(Span<float> a, Span<float> b) const
 
 Status LSMVecDB::Insert(node_id_t id, Span<float> vec)
 {
-    Status metric_status = EnsureMetricSupported();
-    if (!metric_status.ok()) {
-        return metric_status;
-    }
-    Status vec_status = ValidateVector(vec);
-    if (!vec_status.ok()) {
-        return vec_status;
-    }
-
-    try {
-        std::vector<float> data(vec.begin(), vec.end());
-        index_->insertNode(id, data);
-        deleted_ids_.erase(id);
-    } catch (const std::exception& ex) {
-        return Status::IOError(ex.what());
-    }
-
-    return Status::OK();
+    return Insert(id, vec, std::string_view{});
 }
 
 namespace {
@@ -228,19 +211,20 @@ Status ParseMetadataObject(std::string_view json, nlohmann::json* out) {
 }  // namespace
 
 bool LSMVecDB::HasLiveVector(node_id_t id) const {
-    return index_
-        && index_->vector_storage_
-        && deleted_ids_.count(id) == 0
-        && index_->vector_storage_->exists(id);
+    return index_ && index_->is_alive(static_cast<real_id_t>(id));
 }
 
 Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata_json)
 {
-    // 1. Validate vector up front (fail-fast; no writes yet).
-    auto vst = ValidateVector(vec);
-    if (!vst.ok()) return vst;
+    const real_id_t r = static_cast<real_id_t>(id);
+    if (r > kMaxRealId) {
+        return Status::InvalidArgument("real_id must fit in 63 bits");
+    }
 
-    // 2. Pre-parse metadata (fail-fast; no writes yet).
+    if (auto s = EnsureMetricSupported(); !s.ok()) return s;
+    if (auto s = ValidateVector(vec); !s.ok()) return s;
+
+    // Pre-parse metadata (fail-fast; no writes yet).
     const bool has_metadata = !metadata_json.empty() && metadata_json != "{}";
     if (has_metadata) {
         nlohmann::json parsed;
@@ -248,16 +232,32 @@ Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata
         if (!pst.ok()) return pst;
     }
 
-    // 3. Insert vector via existing path.
-    auto ist = Insert(id, vec);
-    if (!ist.ok()) return ist;
+    // A1: upsert on an alive real_id → route to Update.
+    if (index_->is_alive(r)) {
+        return UpdateInternal(id, vec, metadata_json);
+    }
 
-    // 4. Persist metadata (if any). If this fails the vector remains inserted.
+    // Q2: Insert after Delete → allocate a fresh update_id (matches Update path).
+    // First-time Insert → use direct mapping.
+    internal_id_t target_internal;
+    const internal_id_t direct = static_cast<internal_id_t>(r);
+    if (index_->is_tombstoned(direct)) {
+        target_internal = index_->allocate_update_id();
+        index_->record_update_mapping(r, target_internal);
+    } else {
+        target_internal = direct;
+    }
+
+    try {
+        std::vector<float> data(vec.begin(), vec.end());
+        index_->insertNode(target_internal, data);
+    } catch (const std::exception& ex) {
+        return Status::IOError(ex.what());
+    }
+
     if (has_metadata && metadata_store_) {
-        auto mst = metadata_store_->Put(id, metadata_json);
-        if (!mst.ok()) {
-            return mst;
-        }
+        auto mst = metadata_store_->Put(target_internal, metadata_json);
+        if (!mst.ok()) return mst;
     }
     return Status::OK();
 }
@@ -265,7 +265,8 @@ Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata
 Status LSMVecDB::GetPayload(node_id_t id, std::string* out_json)
 {
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
-    auto st = metadata_store_->Get(id, out_json);
+    const internal_id_t i = index_->resolve_internal(static_cast<real_id_t>(id));
+    auto st = metadata_store_->Get(i, out_json);
     if (st.IsNotFound()) {
         *out_json = "{}";
         return Status::OK();
@@ -276,89 +277,146 @@ Status LSMVecDB::GetPayload(node_id_t id, std::string* out_json)
 Status LSMVecDB::SetPayload(node_id_t id, std::string_view metadata_json)
 {
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
-    if (!HasLiveVector(id)) return Status::NotFound("vector not found for id");
+    const real_id_t r = static_cast<real_id_t>(id);
+    if (!index_->is_alive(r)) return Status::NotFound("vector not found for id");
 
     nlohmann::json parsed;
     auto pst = ParseMetadataObject(metadata_json, &parsed);
     if (!pst.ok()) return pst;
 
-    return metadata_store_->Put(id, metadata_json);
+    const internal_id_t i = index_->resolve_internal(r);
+    return metadata_store_->Put(i, metadata_json);
 }
 
 Status LSMVecDB::UpdatePayload(node_id_t id, std::string_view partial_json)
 {
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
-    if (!HasLiveVector(id)) return Status::NotFound("vector not found for id");
+    const real_id_t r = static_cast<real_id_t>(id);
+    if (!index_->is_alive(r)) return Status::NotFound("vector not found for id");
 
     nlohmann::json patch;
     auto pst = ParseMetadataObject(partial_json, &patch);
     if (!pst.ok()) return pst;
 
-    return metadata_store_->Update(id, patch);
+    const internal_id_t i = index_->resolve_internal(r);
+    return metadata_store_->Update(i, patch);
 }
 
 Status LSMVecDB::DeletePayloadKeys(node_id_t id, Span<const std::string> keys)
 {
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
+    const internal_id_t i = index_->resolve_internal(static_cast<real_id_t>(id));
     std::vector<std::string> key_vec(keys.data(), keys.data() + keys.size());
-    return metadata_store_->DeleteKeys(id, key_vec);
+    return metadata_store_->DeleteKeys(i, key_vec);
 }
 
 Status LSMVecDB::Update(node_id_t id, Span<float> vec)
 {
-    Status vec_status = ValidateVector(vec);
-    if (!vec_status.ok()) {
-        return vec_status;
+    return UpdateInternal(id, vec, std::string_view{});
+}
+
+Status LSMVecDB::UpdateInternal(node_id_t id, Span<float> vec,
+                                std::string_view metadata_json)
+{
+    const real_id_t r = static_cast<real_id_t>(id);
+    if (r > kMaxRealId) {
+        return Status::InvalidArgument("real_id must fit in 63 bits");
     }
+
+    if (auto s = ValidateVector(vec); !s.ok()) return s;
+
+    const bool has_metadata = !metadata_json.empty() && metadata_json != "{}";
+    if (has_metadata) {
+        nlohmann::json parsed;
+        auto pst = ParseMetadataObject(metadata_json, &parsed);
+        if (!pst.ok()) return pst;
+    }
+
+    // If r is not alive, route to Insert (first-time or after-Delete).
+    // Insert's is_alive check will then fall through to the allocate-or-direct branch.
+    if (!index_->is_alive(r)) {
+        return Insert(id, vec, metadata_json);
+    }
+
+    // r is alive → allocate a fresh update internal_id, insert the new node,
+    // tombstone the old, and migrate metadata.
+    const internal_id_t old_internal = index_->resolve_internal(r);
+    const internal_id_t new_internal = index_->allocate_update_id();
 
     try {
         std::vector<float> data(vec.begin(), vec.end());
-        auto timer = index_->stats.startTimer();
-        index_->vector_storage_->storeVectorToDisk(id, data);
-        index_->stats.accumulateTime(timer, index_->stats.vec_write_time);
-        index_->stats.addCount(1, index_->stats.vec_write_count);
-        if (timer.active) {
-            DLOG(DEBUG) << "vector_write id=" << id << " time_s=" << timer.duration;
-        }
-        deleted_ids_.erase(id);
+        index_->insertNode(new_internal, data);
     } catch (const std::exception& ex) {
         return Status::IOError(ex.what());
     }
 
+    // Record the new forward mapping (also erases stale reverse per A4).
+    index_->record_update_mapping(r, new_internal);
+
+    // Tombstone the previous version. Its vector and edges remain as routing
+    // infrastructure; only its metadata row is deleted (see below).
+    index_->tombstone(old_internal);
+
+    // Metadata migration.
+    if (metadata_store_) {
+        if (has_metadata) {
+            auto mst = metadata_store_->Put(new_internal, metadata_json);
+            if (!mst.ok()) return mst;
+        } else {
+            // Preserve existing metadata across a vector-only Update.
+            std::string old_meta;
+            auto gst = metadata_store_->Get(old_internal, &old_meta);
+            if (gst.ok()) {
+                auto pst = metadata_store_->Put(new_internal, std::string_view{old_meta});
+                if (!pst.ok()) return pst;
+            }
+        }
+        auto dst = metadata_store_->Delete(old_internal);
+        if (!dst.ok() && !dst.IsNotFound()) return dst;
+    }
     return Status::OK();
 }
 
 Status LSMVecDB::Delete(node_id_t id)
 {
-    deleted_ids_.insert(id);
-    Status delete_status = index_->deleteNode(id);
-    if (!delete_status.ok()) {
-        deleted_ids_.erase(id);
-        return delete_status;
+    if (!index_) return Status::InvalidArgument("db not opened");
+    const real_id_t r = static_cast<real_id_t>(id);
+
+    const internal_id_t i = index_->resolve_internal(r);
+    // Idempotent: if r never had a live vector, nothing to do (per design §5.3).
+    if (!index_->vector_storage_ || !index_->vector_storage_->exists(i)) {
+        return Status::OK();
     }
 
+    // Tombstone the live internal (either direct real_id or current update_id).
+    index_->tombstone(i);
+
+    // A3: physical delete of the metadata row.
     if (metadata_store_) {
-        // Best-effort: ignore NotFound (id may have had no metadata).
-        auto mst = metadata_store_->Delete(id);
-        if (!mst.ok() && !mst.IsNotFound()) {
-            return mst;
-        }
+        auto mst = metadata_store_->Delete(i);
+        if (!mst.ok() && !mst.IsNotFound()) return mst;
     }
+
+    // A4: if r was update-allocated, drop the sparse-map entries so future
+    // resolve_internal(r) returns identity.
+    index_->forget_update_mapping(r);
     return Status::OK();
 }
 
 Status LSMVecDB::Get(node_id_t id, std::vector<float>* vec)
 {
-    if (!vec) {
-        return Status::InvalidArgument("output vector must not be null");
+    if (!vec) return Status::InvalidArgument("output vector must not be null");
+    if (!index_) return Status::InvalidArgument("db not opened");
+
+    const real_id_t r = static_cast<real_id_t>(id);
+    if (!index_->is_alive(r)) {
+        return Status::NotFound("vector deleted or missing");
     }
-    if (deleted_ids_.count(id) > 0) {
-        return Status::NotFound("vector deleted");
-    }
+    const internal_id_t i = index_->resolve_internal(r);
 
     try {
         auto timer = index_->stats.startTimer();
-        index_->vector_storage_->readVectorFromDisk(id, *vec);
+        index_->vector_storage_->readVectorFromDisk(i, *vec);
         index_->stats.accumulateTime(timer, index_->stats.vec_read_time);
         index_->stats.addCount(1, index_->stats.vec_read_count);
         if (timer.active) {
@@ -367,7 +425,6 @@ Status LSMVecDB::Get(node_id_t id, std::vector<float>* vec)
     } catch (const std::exception& ex) {
         return Status::IOError(ex.what());
     }
-
     return Status::OK();
 }
 
@@ -402,10 +459,14 @@ Status LSMVecDB::SearchKnn(Span<float> query,
     out->clear();
     out->reserve(results.size());
     for (const auto& result : results) {
-        if (deleted_ids_.count(result.id) > 0) {
-            continue;
-        }
-        out->push_back(result);
+        // Defense in depth: LSMVec::knnSearchK already filters tombstones,
+        // but redoing the check makes the translation safe if that changes.
+        if (index_->is_tombstoned(result.id)) continue;
+        SearchResult translated;
+        translated.id       = index_->resolve_real(result.id);
+        translated.distance = result.distance;
+        out->push_back(translated);
+        if (static_cast<int>(out->size()) >= options.k) break;
     }
 
     if (out->empty()) {
@@ -469,10 +530,11 @@ Status LSMVecDB::SearchKnn(Span<float> query,
     out->clear();
     out->reserve(results.size());
     for (const auto& result : results) {
-        if (deleted_ids_.count(result.id) > 0) {
-            continue;
-        }
-        out->push_back(result);
+        if (index_->is_tombstoned(result.id)) continue;
+        SearchResult translated;
+        translated.id       = index_->resolve_real(result.id);
+        translated.distance = result.distance;
+        out->push_back(translated);
     }
 
     if (out->empty()) {
@@ -528,7 +590,7 @@ Status LSMVecDB::Close()
         return Status::IOError("failed to open metadata file for writing");
     }
 
-    index_->setDeletedIds(deleted_ids_);
+    // C5b: LSMVec owns tombstoned_internal_ids_; no sync needed.
     Status metadata_status = index_->SerializeMetadata(metadata_stream);
     if (!metadata_status.ok()) {
         return metadata_status;
