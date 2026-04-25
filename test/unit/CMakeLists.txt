@@ -22,6 +22,7 @@ add_executable(lsmvec_unit_tests
     test_lsm_vec_resolvers.cc
     test_delete_robust_red.cc
     test_delete_persistence.cc
+    test_delete_stress.cc
 )
 target_include_directories(lsmvec_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/doctest
