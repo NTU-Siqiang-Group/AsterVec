@@ -160,6 +160,19 @@ using namespace ROCKSDB_NAMESPACE;
         double        bloom_fill_ratio()   const { return update_bloom_.fill_ratio(); }
         internal_id_t next_update_internal_id() const { return next_update_internal_id_; }
 
+        // C8 observability counters. `total_inserts_ever_` is in-memory-only
+        // (resets on Open — a long-running service's ratio becomes accurate
+        // only after the first Insert post-restart). Acceptable for V1.
+        std::size_t   total_inserts_ever() const { return total_inserts_ever_; }
+        std::size_t   bloom_rebuild_count() const { return bloom_rebuild_count_; }
+        // tombstones / total_inserts_ever; returns 0.0 if no inserts seen yet.
+        double        tombstone_ratio() const {
+            return total_inserts_ever_ == 0
+                 ? 0.0
+                 : static_cast<double>(tombstoned_internal_ids_.size()) /
+                   static_cast<double>(total_inserts_ever_);
+        }
+
     private:
         int randomLevel();
         float computeDistance(Span<const float> vectorA,
@@ -256,6 +269,10 @@ using namespace ROCKSDB_NAMESPACE;
         std::unordered_set<internal_id_t>            tombstoned_internal_ids_;
         BloomFilter                                   update_bloom_{512, 0.01};
         internal_id_t                                 next_update_internal_id_ = kFirstUpdateId;
+
+        // C8 transient observability counters (reset on Open).
+        std::size_t                                   total_inserts_ever_ = 0;
+        std::size_t                                   bloom_rebuild_count_ = 0;
 
         void rebuild_bloom_to(std::size_t new_capacity);
 

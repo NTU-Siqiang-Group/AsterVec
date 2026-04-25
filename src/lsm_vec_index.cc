@@ -503,6 +503,7 @@ using namespace ROCKSDB_NAMESPACE;
         // is now routed by LSMVecDB::Insert (C5b) to allocate a fresh
         // internal_id via Update semantics; this function never sees a
         // tombstoned nodeId in the new design.
+        ++total_inserts_ever_;       // C8: stats
         bool vectorStored = false;  // Track whether we've stored this vector
 
         auto insert_timer = stats.startTimer();
@@ -1876,6 +1877,7 @@ using namespace ROCKSDB_NAMESPACE;
         for (const auto& kv : updated_real_to_internal_) {
             update_bloom_.add(kv.first);
         }
+        ++bloom_rebuild_count_;  // C8: stats
     }
 
     void LSMVec::forget_update_mapping(real_id_t r) {

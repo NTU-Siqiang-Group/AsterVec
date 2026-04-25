@@ -564,6 +564,20 @@ void LSMVecDB::flushVectorWrites()
     }
 }
 
+LSMVecDB::DeleteStats LSMVecDB::GetDeleteStats() const
+{
+    DeleteStats s{};
+    if (!index_) return s;
+    s.tombstones          = index_->tombstone_count();
+    s.updated_real_ids    = index_->updated_real_id_count();
+    s.total_inserts_ever  = index_->total_inserts_ever();
+    s.tombstone_ratio     = index_->tombstone_ratio();
+    s.bloom_capacity      = index_->bloom_capacity();
+    s.bloom_fill_ratio    = index_->bloom_fill_ratio();
+    s.bloom_rebuild_count = index_->bloom_rebuild_count();
+    return s;
+}
+
 Status LSMVecDB::Close()
 {
     if (!index_) {

@@ -154,6 +154,75 @@ TEST_CASE("P2: Bloom filter is rebuilt from the forward map on Open") {
     std::filesystem::remove_all(path);
 }
 
+TEST_CASE("C8: GetDeleteStats reports consistent counters after Insert/Update/Delete") {
+    auto path = make_path();
+    auto db = open_db(path, 4, 2000);
+
+    // Initial state: nothing happened yet.
+    auto s0 = db->GetDeleteStats();
+    CHECK(s0.tombstones          == 0);
+    CHECK(s0.updated_real_ids    == 0);
+    CHECK(s0.total_inserts_ever  == 0);
+    CHECK(s0.tombstone_ratio     == 0.0);
+    CHECK(s0.bloom_rebuild_count == 0);
+    CHECK(s0.bloom_capacity      >= 512);
+
+    // 10 fresh inserts → 10 HNSW inserts, 0 tombstones.
+    for (int i = 0; i < 10; ++i) {
+        std::vector<float> v(4, static_cast<float>(i));
+        REQUIRE(db->Insert(static_cast<uint64_t>(i), Span<float>(v)).ok());
+    }
+    auto s1 = db->GetDeleteStats();
+    CHECK(s1.total_inserts_ever  == 10);
+    CHECK(s1.tombstones          == 0);
+    CHECK(s1.tombstone_ratio     == 0.0);
+
+    // Update real_id=3 once → +1 HNSW insert, +1 tombstone, +1 sparse map entry.
+    std::vector<float> v33{30, 30, 30, 30};
+    REQUIRE(db->Update(3, Span<float>(v33)).ok());
+    auto s2 = db->GetDeleteStats();
+    CHECK(s2.total_inserts_ever  == 11);
+    CHECK(s2.tombstones          == 1);
+    CHECK(s2.updated_real_ids    == 1);
+    CHECK(s2.tombstone_ratio == doctest::Approx(1.0 / 11.0));
+
+    // Delete real_id=5 → +1 tombstone, no new HNSW insert.
+    REQUIRE(db->Delete(5).ok());
+    auto s3 = db->GetDeleteStats();
+    CHECK(s3.total_inserts_ever  == 11);
+    CHECK(s3.tombstones          == 2);
+    CHECK(s3.updated_real_ids    == 1);   // r=5 was direct, no sparse entry was created
+    CHECK(s3.tombstone_ratio == doctest::Approx(2.0 / 11.0));
+
+    db->Close();
+    std::filesystem::remove_all(path);
+}
+
+TEST_CASE("C8: Bloom rebuild count increments on auto-rebuild") {
+    auto path = make_path();
+    auto db = open_db(path, 4, 5000);
+
+    // First populate enough fresh inserts so we have updateable real_ids.
+    for (int i = 0; i < 600; ++i) {
+        std::vector<float> v(4, static_cast<float>(i));
+        REQUIRE(db->Insert(static_cast<uint64_t>(i), Span<float>(v)).ok());
+    }
+    CHECK(db->GetDeleteStats().bloom_rebuild_count == 0);
+
+    // Update enough to force the Bloom filter past 70% fill — bloom_capacity
+    // starts at 512, so ~360 entries cross the threshold.
+    for (int i = 0; i < 400; ++i) {
+        std::vector<float> v(4, static_cast<float>(i + 1000));
+        REQUIRE(db->Update(static_cast<uint64_t>(i), Span<float>(v)).ok());
+    }
+    auto s = db->GetDeleteStats();
+    CHECK(s.bloom_rebuild_count >= 1);
+    CHECK(s.bloom_capacity      >= 1024);  // at least 2x growth from 512
+
+    db->Close();
+    std::filesystem::remove_all(path);
+}
+
 TEST_CASE("Backward compat: v1 metadata file (no update map, no update_locations) loads cleanly") {
     // Simulate this by writing a fresh DB, closing without ever Updating,
     // and confirming the v2 reader handles a "no updates ever" file (which

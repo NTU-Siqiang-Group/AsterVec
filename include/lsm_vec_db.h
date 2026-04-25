@@ -116,6 +116,22 @@ public:
     void printStatistics() const;
     void flushVectorWrites();
 
+    // C8: snapshot of delete-related observability counters.
+    // tombstone_ratio thresholds (advisory):
+    //   < 0.10  → healthy
+    //   0.10–0.25 → consider Rebuild() at next maintenance window (V2)
+    //   ≥ 0.25  → expected recall degradation; run Rebuild() soon
+    struct DeleteStats {
+        std::size_t tombstones;
+        std::size_t updated_real_ids;
+        std::size_t total_inserts_ever;   // resets on Open in V1 (in-memory only)
+        double      tombstone_ratio;      // tombstones / total_inserts_ever
+        std::size_t bloom_capacity;
+        double      bloom_fill_ratio;
+        std::size_t bloom_rebuild_count;
+    };
+    DeleteStats GetDeleteStats() const;
+
     // Test-only accessor: exposes the underlying LSMVec so unit tests can
     // exercise low-level resolvers (resolve_internal / resolve_real / is_alive).
     // Not intended for production use.
