@@ -1128,7 +1128,9 @@ public:
     }
 
     bool serializeMetadata(std::ostream& out) const {
-        constexpr uint32_t kMetaVersion = 1;
+        // v1: original (totalVectors, pages, sections, idToPage, idToSlotInPage)
+        // v2: + update_locations_ sparse map (C7 robust delete)
+        constexpr uint32_t kMetaVersion = 2;
         auto write = [&](const auto& value) -> bool {
             out.write(reinterpret_cast<const char*>(&value), sizeof(value));
             return static_cast<bool>(out);
@@ -1179,11 +1181,21 @@ public:
             }
         }
 
+        // v2: update_locations_ sparse map.
+        uint64_t updateLocCount = static_cast<uint64_t>(update_locations_.size());
+        if (!write(updateLocCount)) return false;
+        for (const auto& kv : update_locations_) {
+            uint64_t id   = static_cast<uint64_t>(kv.first);
+            int64_t  page = kv.second.page;
+            uint16_t slot = kv.second.slot;
+            if (!write(id) || !write(page) || !write(slot)) return false;
+        }
+
         return static_cast<bool>(out);
     }
 
     bool deserializeMetadata(std::istream& in) {
-        constexpr uint32_t kMetaVersion = 1;
+        constexpr uint32_t kMaxKnownVersion = 2;
         auto read = [&](auto* value) -> bool {
             in.read(reinterpret_cast<char*>(value), sizeof(*value));
             return static_cast<bool>(in);
@@ -1204,7 +1216,7 @@ public:
             return false;
         }
 
-        if (version != kMetaVersion) {
+        if (version < 1 || version > kMaxKnownVersion) {
             return false;
         }
         if (dim != dim_ || vectorsPerPage != vectorsPerPage_) {
@@ -1310,6 +1322,23 @@ public:
                 if (slot < usedSlots[pageId].size() && usedSlots[pageId][slot] == 0) {
                     freeList.emplace_back(pageId, static_cast<uint16_t>(slot));
                 }
+            }
+        }
+
+        // v2: read update_locations_ sparse map. v1 files have no such block.
+        update_locations_.clear();
+        if (version >= 2) {
+            uint64_t updateLocCount = 0;
+            if (!read(&updateLocCount)) return false;
+            update_locations_.reserve(static_cast<size_t>(updateLocCount));
+            for (uint64_t i = 0; i < updateLocCount; ++i) {
+                uint64_t id = 0;
+                int64_t  page = 0;
+                uint16_t slot = 0;
+                if (!read(&id) || !read(&page) || !read(&slot)) return false;
+                UpdateLoc& loc = update_locations_[static_cast<node_id_t>(id)];
+                loc.page = page;
+                loc.slot = slot;
             }
         }
 

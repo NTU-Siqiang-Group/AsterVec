@@ -184,7 +184,9 @@ using namespace ROCKSDB_NAMESPACE;
 
     namespace {
     constexpr char kMetadataMagic[] = "LSMVMETA";
-    constexpr uint32_t kMetadataVersion = 1;
+    // v1: original metadata-filtering era format (entry_point, layers, nodes_, deleted_ids)
+    // v2: + update sparse map + next_update_internal_id_ counter (C7, robust delete)
+    constexpr uint32_t kMetadataVersion = 2;
 
     template <typename T>
     bool WriteValue(std::ostream& out, const T& value)
@@ -265,6 +267,21 @@ using namespace ROCKSDB_NAMESPACE;
         for (node_id_t id : tombstoned_internal_ids_) {
             if (!WriteValue(out, id)) {
                 return Status::IOError("failed to write deleted id");
+            }
+        }
+
+        // v2: update sparse forward map + monotonic counter.
+        // Reverse map and Bloom filter are reconstructed on Open from this map.
+        uint64_t updatedCount = static_cast<uint64_t>(updated_real_to_internal_.size());
+        uint64_t nextUpdateId = static_cast<uint64_t>(next_update_internal_id_);
+        if (!WriteValue(out, updatedCount) || !WriteValue(out, nextUpdateId)) {
+            return Status::IOError("failed to write update map header");
+        }
+        for (const auto& kv : updated_real_to_internal_) {
+            uint64_t r = static_cast<uint64_t>(kv.first);
+            uint64_t i = static_cast<uint64_t>(kv.second);
+            if (!WriteValue(out, r) || !WriteValue(out, i)) {
+                return Status::IOError("failed to write update map entry");
             }
         }
 
@@ -365,6 +382,39 @@ using namespace ROCKSDB_NAMESPACE;
                 return Status::IOError("failed to read deleted ids");
             }
             tombstoned_internal_ids_.insert(id);
+        }
+
+        // v2: read update sparse map + counter, then rebuild reverse map and Bloom.
+        // v1 files don't have this block — leave structures empty.
+        updated_real_to_internal_.clear();
+        updated_internal_to_real_.clear();
+        next_update_internal_id_ = kFirstUpdateId;
+        if (version >= 2) {
+            uint64_t updatedCount = 0;
+            uint64_t nextUpdateId = static_cast<uint64_t>(kFirstUpdateId);
+            if (!ReadValue(in, &updatedCount) || !ReadValue(in, &nextUpdateId)) {
+                return Status::IOError("failed to read update map header");
+            }
+            next_update_internal_id_ = static_cast<internal_id_t>(nextUpdateId);
+            updated_real_to_internal_.reserve(static_cast<size_t>(updatedCount));
+            for (uint64_t i = 0; i < updatedCount; ++i) {
+                uint64_t r = 0, inter = 0;
+                if (!ReadValue(in, &r) || !ReadValue(in, &inter)) {
+                    return Status::IOError("failed to read update map entry");
+                }
+                updated_real_to_internal_[static_cast<real_id_t>(r)] =
+                    static_cast<internal_id_t>(inter);
+                updated_internal_to_real_[static_cast<internal_id_t>(inter)] =
+                    static_cast<real_id_t>(r);
+            }
+        }
+        // Rebuild Bloom filter from forward map. Capacity sized to current
+        // entry count (with a 512 floor to match the constructor default).
+        const std::size_t bloom_cap =
+            std::max<std::size_t>(updated_real_to_internal_.size(), 512);
+        update_bloom_.reset(bloom_cap, 0.01);
+        for (const auto& kv : updated_real_to_internal_) {
+            update_bloom_.add(kv.first);
         }
 
         int32_t storageType = 0;
