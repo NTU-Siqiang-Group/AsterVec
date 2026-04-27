@@ -248,7 +248,7 @@ PYBIND11_MODULE(lsm_vec, m)
              },
              py::arg("query"),
              py::arg("k") = 10,
-             py::arg("ef_search") = 64,
+             py::arg("ef_search") = 128,
              py::arg("filter") = py::none(),
              py::arg("max_scan_candidates") = 0,
              "kNN search with optional metadata filter. Returns list of dicts {id, distance}.")
@@ -282,7 +282,7 @@ PYBIND11_MODULE(lsm_vec, m)
              },
              py::arg("query"),
              py::arg("k") = 10,
-             py::arg("ef_search") = 64,
+             py::arg("ef_search") = 128,
              py::arg("filter") = py::none(),
              py::arg("max_scan_candidates") = 0,
              "kNN search with optional metadata filter. Returns list of dicts {id, distance}.")

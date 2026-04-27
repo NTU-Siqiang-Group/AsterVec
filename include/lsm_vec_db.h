@@ -54,7 +54,7 @@ struct LSMVecDBOptions {
     int dim = 0;
     DistanceMetric metric = DistanceMetric::kL2;
     int m = 8;
-    int m_max = 16;
+    int m_max = 24;
     int m_level = 1;
     float ef_construction = 32.0f;
     size_t vec_file_capacity = 100000;
@@ -66,7 +66,7 @@ struct LSMVecDBOptions {
     bool enable_batch_read = true;
     bool reinit = false;
     int k = 1;
-    int ef_search = 64;
+    int ef_search = 128;
     size_t edge_cache_size = 100000;
     std::string vector_file_path;
     std::string log_file_path;
@@ -74,7 +74,7 @@ struct LSMVecDBOptions {
 
 struct SearchOptions {
     int k = 1;
-    int ef_search = 64;
+    int ef_search = 128;
     int max_scan_candidates = 0;   // 0 = auto (k * 50 when filter present)
 };
 

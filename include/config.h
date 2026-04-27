@@ -12,7 +12,7 @@
 struct Config {
     // --- Index / graph hyper-parameters ---
     int   M = 8;
-    int   Mmax = 16;
+    int   Mmax = 24;
     int   Ml = 1;
     float efConstruction = 32.0f;
     size_t input_size;
@@ -20,7 +20,7 @@ struct Config {
     bool enable_stats = false;
     bool enable_batch_read = true;
     int k = 1;
-    int ef_search = 64;
+    int ef_search = 128;
     bool reinit = true;
 
     size_t edge_cache_size = 100000;
