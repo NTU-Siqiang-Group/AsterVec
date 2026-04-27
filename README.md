@@ -46,6 +46,8 @@ Then users can simply link the library or import the module to get started.
 - Persistent metadata -- database can be closed and reopened without re-indexing
 - L2 (Euclidean) and Cosine distance metrics with SIMD acceleration (AVX2/SSE2)
 - Python SDK via pybind11 (`pip install .`)
+- Per-vector JSON payloads with filter-aware k-NN search (predicates over equality, comparison, exists/contains, set membership, logical and/or/not, dotted paths)
+- Soft delete + upsert -- `Delete()` is tombstoned and `Update()` rewires ids in place; the index reopens without re-indexing and exposes tombstone / Bloom-filter counters for maintenance
 
 ## Repository layout
 
@@ -145,6 +147,14 @@ make          # equivalent to: make lib bin
 make clean    # removes the build/ directory
 ```
 
+### Running the unit test suite
+
+```bash
+make unit_test    # builds and runs build/test/unit/lsmvec_unit_tests
+```
+
+Covers the Bloom filter, payload CRUD, predicate parsing, delete persistence, and filtered search.
+
 ---
 
 ## Running the Test Binary
@@ -221,11 +231,11 @@ Run `./build/bin/lsm_vec --help` for the full list.
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--M <int>` | `-m` | 8 | Number of bi-directional links per node |
-| `--Mmax <int>` | `-x` | 16 | Max neighbors per node per layer |
+| `--Mmax <int>` | `-x` | 24 | Max neighbors per node per layer |
 | `--Ml <int>` | `-l` | 1 | Level multiplier for random level generation |
 | `--efc <float>` | `-e` | 32 | Candidate pool size during construction (ef_construction) |
 | `--k <int>` | `-k` | 1 | Number of nearest neighbors to retrieve |
-| `--efs <int>` | `-f` | 64 | Candidate pool size during search (ef_search) |
+| `--efs <int>` | `-f` | 128 | Candidate pool size during search (ef_search) |
 
 ### Storage
 
@@ -233,7 +243,7 @@ Run `./build/bin/lsm_vec --help` for the full list.
 |------|-------|---------|-------------|
 | `--vec <path>` | `-v` | `<db>/vector.log` | Path to the vector data file |
 | `--vec-storage <int>` | `-V` | 1 | `0` = BasicVectorStorage, `1` = PagedVectorStorage |
-| `--paged-cache-pages <int>` | | 4096 | Number of 4 KB pages kept in the user-space page cache |
+| `--paged-cache-pages <int>` | | 8192 | Number of 4 KB pages kept in the user-space page cache |
 | `--db-target-size <bytes>` | `-s` | 107374182400 | RocksDB target file size (100 GiB) |
 
 ### Runtime / Feature Switches
@@ -257,8 +267,8 @@ Run `./build/bin/lsm_vec --help` for the full list.
 ./build/bin/lsm_vec \
   --db ./run/db \
   --data-dir ./data/sift_100k_ \
-  --M 8 --Mmax 16 --efc 32 --k 10 --efs 64 \
-  --vec-storage 1 --paged-cache-pages 4096 \
+  --M 8 --Mmax 24 --efc 32 --k 10 --efs 128 \
+  --vec-storage 1 --paged-cache-pages 8192 \
   --batch-read \
   --stats \
   --out ./run/output.txt
@@ -380,11 +390,11 @@ print(results[0].id, results[0].distance)
 | `dim` | int | 0 | Vector dimensionality (required) |
 | `metric` | DistanceMetric | `L2` | `lsm_vec.L2` or `lsm_vec.Cosine` |
 | `m` | int | 8 | HNSW M parameter |
-| `m_max` | int | 16 | Max neighbors per layer |
+| `m_max` | int | 24 | Max neighbors per layer |
 | `m_level` | int | 1 | Level multiplier |
 | `ef_construction` | float | 32.0 | Construction-time candidate pool size |
 | `vec_file_capacity` | int | 100000 | Initial vector file capacity |
-| `paged_max_cached_pages` | int | 4096 | Page cache capacity (number of pages) |
+| `paged_max_cached_pages` | int | 8192 | Page cache capacity (number of pages) |
 | `vector_storage_type` | int | 1 | 0 = Basic, 1 = Paged |
 | `db_target_size` | int | 107374182400 | RocksDB target file size (bytes) |
 | `random_seed` | int | 12345 | Seed for HNSW level generation |
@@ -392,7 +402,7 @@ print(results[0].id, results[0].distance)
 | `enable_batch_read` | bool | True | Batch vector reads during search |
 | `reinit` | bool | False | Wipe DB on open |
 | `k` | int | 1 | Default number of nearest neighbors for search |
-| `ef_search` | int | 64 | Default search-time candidate pool size |
+| `ef_search` | int | 128 | Default search-time candidate pool size |
 | `vector_file_path` | str | "" | Path to the vector data file |
 | `log_file_path` | str | "" | Path to the log file |
 
@@ -401,7 +411,8 @@ print(results[0].id, results[0].distance)
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `k` | int | 1 | Number of nearest neighbors |
-| `ef_search` | int | 64 | Search-time candidate pool size |
+| `ef_search` | int | 128 | Search-time candidate pool size |
+| `max_scan_candidates` | int | 0 | Cap on candidates scanned when a filter is set; 0 = auto (`k * 50`) |
 
 #### `lsm_vec.SearchResult`
 
@@ -415,13 +426,18 @@ print(results[0].id, results[0].distance)
 | Method | Description |
 |--------|-------------|
 | `LSMVecDB.open(path, opts)` | Open or create a database |
-| `db.insert(id, vector)` | Insert a vector (list or numpy array) |
-| `db.update(id, vector)` | Update an existing vector |
-| `db.delete(id)` | Delete a vector by ID |
+| `db.insert(id, vector, metadata=None)` | Insert a vector with an optional Python dict, serialized to JSON |
+| `db.update(id, vector)` | Update an existing vector (in-place upsert via id remap) |
+| `db.delete(id)` | Soft-delete a vector (tombstoned; survives reopen) |
 | `db.get(id) -> np.ndarray` | Retrieve a vector by ID |
 | `db.search_knn(query)` | Search using `k` and `ef_search` from `LSMVecDBOptions` |
-| `db.search_knn(query, k, ef_search)` | Search with explicit k and ef_search |
+| `db.search_knn(query, k, ef_search, filter=None, max_scan_candidates=0)` | Search with explicit params and an optional metadata filter (Python dict) |
 | `db.search_knn(query, opts)` | Search with a `SearchOptions` object |
+| `db.set_payload(id, metadata)` | Replace the metadata document for `id` |
+| `db.update_payload(id, metadata)` | RFC 7396 merge-patch the metadata; `None` values delete fields |
+| `db.delete_payload_keys(id, keys)` | Remove specific keys from the metadata document |
+| `db.get_payload(id) -> dict` | Return the metadata document (`{}` if none) |
+| `db.flush_vector_writes()` | Flush pending vector writes to disk |
 | `db.close()` | Flush and close the database |
 
 ### NumPy Example
@@ -450,6 +466,26 @@ for r in results:
 
 db.close()
 ```
+
+### Metadata payloads & filter-aware search
+
+Each vector can carry a JSON document. The same dict is accepted at insert
+time or via the dedicated payload endpoints, and any JSON-serializable
+predicate can be passed as a `filter=` to `search_knn`.
+
+```python
+db.insert(1, vec, metadata={"category": "shoes", "price": 89})
+db.set_payload(1, {"category": "shoes", "price": 79})    # full replace
+db.update_payload(1, {"price": 69})                       # merge-patch (RFC 7396)
+db.get_payload(1)                                         # -> {"category": "shoes", "price": 69}
+
+# Filter-aware search: pass any JSON-serializable predicate dict.
+results = db.search_knn(query, k=10, filter={"category": "shoes"})
+```
+
+See `docs/METADATA_FILTERING_USAGE.md` for the full predicate grammar
+(equality, comparison, exists/contains, set membership, logical and/or/not,
+dotted paths).
 
 ---
 
