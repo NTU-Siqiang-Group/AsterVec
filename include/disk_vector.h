@@ -325,8 +325,12 @@ private:
     std::fstream deleteStream_;
     std::vector<uint8_t> deletedFlags_;
 
-    // logical ID -> page & slot mapping
-    std::vector<int64_t>  idToPage_;       // -1 means unassigned
+    // logical ID -> page & slot mapping.
+    // 20260516_narrow_idtopage: page index is int32_t (was int64_t). -1 means
+    // unassigned. 2^31 pages × 4 KB = 8 TB capacity per backing file — well
+    // beyond practical sizes. The on-disk format still uses int64_t per entry
+    // for backwards compatibility; widen on serialize, narrow on deserialize.
+    std::vector<int32_t>  idToPage_;
     std::vector<uint16_t> idToSlotInPage_; // slot in [0, vectorsPerPage_)
 
     struct PageMeta {
@@ -364,7 +368,8 @@ private:
     int64_t page_of(node_id_t id) const {
         if (is_direct_id(id)) {
             if (static_cast<size_t>(id) >= totalVectors_) return -1;
-            return idToPage_[static_cast<size_t>(id)];
+            // 20260516_narrow_idtopage: idToPage_ is int32_t; widen for the API contract.
+            return static_cast<int64_t>(idToPage_[static_cast<size_t>(id)]);
         }
         auto it = update_locations_.find(id);
         return (it == update_locations_.end()) ? -1 : it->second.page;
@@ -397,7 +402,16 @@ private:
 
     void assign_location(node_id_t id, size_t page, uint16_t slot) {
         if (is_direct_id(id)) {
-            idToPage_[static_cast<size_t>(id)]       = static_cast<int64_t>(page);
+            // 20260516_narrow_idtopage: 2^31 page ceiling = 8 TB per backing
+            // file. Hitting this means a multi-TB single-file workload — bail
+            // out loudly rather than silently truncate the high bits.
+            if (page > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+                throw std::runtime_error(
+                    "PagedVectorStorage: page index exceeds int32_t ceiling "
+                    "(8 TB) — rebuild with int64_t idToPage_ or split the "
+                    "storage file");
+            }
+            idToPage_[static_cast<size_t>(id)]       = static_cast<int32_t>(page);
             idToSlotInPage_[static_cast<size_t>(id)] = slot;
         } else {
             UpdateLoc& loc = update_locations_[id];
@@ -1170,8 +1184,11 @@ public:
         if (!write(idToPageSize) || !write(idToSlotSize)) {
             return false;
         }
-        for (int64_t page : idToPage_) {
-            if (!write(page)) {
+        // 20260516_narrow_idtopage: on-disk format keeps int64_t per element
+        // for forward compatibility with v1/v2 readers; in-memory is int32_t.
+        for (int32_t page : idToPage_) {
+            int64_t widened = static_cast<int64_t>(page);
+            if (!write(widened)) {
                 return false;
             }
         }
@@ -1267,7 +1284,15 @@ public:
             if (!read(&page)) {
                 return false;
             }
-            idToPage_[static_cast<size_t>(i)] = page;
+            // 20260516_narrow_idtopage: on-disk is still int64_t; narrow with
+            // overflow guard. Out-of-int32 page values would mean > 8 TB of
+            // vector data per logical id — implausible, but refuse rather
+            // than silently truncate.
+            if (page > static_cast<int64_t>(std::numeric_limits<int32_t>::max())
+                || page < -1) {
+                return false;
+            }
+            idToPage_[static_cast<size_t>(i)] = static_cast<int32_t>(page);
         }
         for (uint64_t i = 0; i < idToSlotSize; ++i) {
             uint16_t slot = 0;
