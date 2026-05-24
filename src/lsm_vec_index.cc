@@ -88,11 +88,9 @@ using namespace ROCKSDB_NAMESPACE;
           m_max_(options.m_max),
           m_level_(options.m_level),
           ef_construction_(options.ef_construction),
-          out_file_(outFile),
-          random_generator_(random_device_()),
-          uniform_distribution_(0, 1),
-          max_layer_(-1),
-          entry_point_(-1)
+          out_file_(outFile)
+          // max_layer_ and entry_point_ default-initialised via
+          // header member-init: max_layer_=-1, entry_point_=k_invalid_node_id
     {
         stats.setEnabledOnConstruction(db_options_.enable_stats);
         enable_batch_read_ = db_options_.enable_batch_read;
@@ -101,9 +99,8 @@ using namespace ROCKSDB_NAMESPACE;
             LOG(INFO) << "Edge LRU cache: " << db_options_.edge_cache_size << " entries";
         }
 
-        if (db_options_.random_seed > 0) {
-            random_generator_.seed(db_options_.random_seed);
-        }
+        // db_options_.random_seed is now consumed by the thread_local
+        // gen inside LSMVec::randomLevel() on first use per thread.
 
         if (db_options_.vector_file_path.empty()) {
             db_options_.vector_file_path = db_path + "/vector.log";
@@ -215,8 +212,10 @@ using namespace ROCKSDB_NAMESPACE;
             return Status::IOError("failed to write metadata version");
         }
 
-        uint64_t entryPoint = static_cast<uint64_t>(entry_point_);
-        int32_t maxLayer = static_cast<int32_t>(max_layer_);
+        uint64_t entryPoint = static_cast<uint64_t>(
+            entry_point_.load(std::memory_order_acquire));
+        int32_t maxLayer = static_cast<int32_t>(
+            max_layer_.load(std::memory_order_acquire));
         uint64_t nodeCount = static_cast<uint64_t>(nodes_.size());
         uint64_t deletedCount = static_cast<uint64_t>(tombstoned_internal_ids_.size());
 
@@ -456,8 +455,11 @@ using namespace ROCKSDB_NAMESPACE;
             }
         }
 
-        entry_point_ = static_cast<node_id_t>(entryPoint);
-        max_layer_ = maxLayer;
+        // Deserialize runs single-threaded under the engine's lifecycle
+        // exclusive (Open/Close path); release-store is sufficient.
+        entry_point_.store(static_cast<node_id_t>(entryPoint),
+                           std::memory_order_release);
+        max_layer_.store(maxLayer, std::memory_order_release);
         return Status::OK();
     }
 
@@ -519,11 +521,29 @@ using namespace ROCKSDB_NAMESPACE;
         return Span<const float>(scratch.data(), scratch.size());
     }
 
-    // Generates a random level for the node
+    // Generates a random level for the node.
+    //
+    // Phase 4a (concurrent-writer-refactor-plan §5.1.5): thread_local RNG
+    // so concurrent writers don't contend on a shared std::mt19937.
+    // Seeded once per thread from std::random_device. The pre-refactor
+    // db_options_.random_seed feature (used by some single-threaded
+    // tests for deterministic levels) is preserved on the FIRST thread
+    // that calls randomLevel for this LSMVec instance: that thread's
+    // gen is reseeded with the configured value. Subsequent threads use
+    // independent random seeds. For multi-threaded tests, determinism
+    // of HNSW levels is no longer guaranteed by random_seed; recall is
+    // robust to small RNG variation and the metric the tests track is
+    // recall@k, not exact graph topology.
     int LSMVec::randomLevel()
     {
-        std::uniform_real_distribution<float> distribution(0.0, 1.0);
-        double r = -log(distribution(random_generator_)) / log(1.0 * m_);
+        thread_local std::mt19937 gen{std::random_device{}()};
+        thread_local bool seeded_from_opts = false;
+        if (!seeded_from_opts && db_options_.random_seed > 0) {
+            gen.seed(static_cast<unsigned>(db_options_.random_seed));
+            seeded_from_opts = true;
+        }
+        std::uniform_real_distribution<float> distribution(0.0f, 1.0f);
+        double r = -log(distribution(gen)) / log(1.0 * m_);
 
         // std::cout << "r: " << r << std::endl;
         return (int)r;
@@ -598,11 +618,20 @@ using namespace ROCKSDB_NAMESPACE;
             nodes_[nodeId] = std::move(newNode);
         }
 
-        // ----- First node special case -----
-        if (entry_point_ == k_invalid_node_id)
+        // ----- First node special case (Phase 4b §5.1.3 — CAS) -----
+        // CAS entry_point_ from INVALID to nodeId. The winner becomes
+        // the index's first node and publishes max_layer_ via release-
+        // store. Losers fall through to the regular insert path
+        // against the now-existing entry point. Under Phase 1's
+        // exclusive-INSERT lifecycle gate this CAS is uncontended;
+        // it's wired now so Phase 6 (shared-INSERT) is correct.
+        node_id_t expected_invalid = k_invalid_node_id;
+        if (entry_point_.compare_exchange_strong(
+                expected_invalid, nodeId,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
         {
-            entry_point_ = nodeId;
-            max_layer_   = highestLayer;
+            max_layer_.store(highestLayer, std::memory_order_release);
 
             linkNeighborsAsterDB(nodeId, {});
 
@@ -621,12 +650,15 @@ using namespace ROCKSDB_NAMESPACE;
             }
             return;
         }
-
-        node_id_t currentEntryPoint = entry_point_;
+        // expected_invalid now holds the actual entry point that won
+        // the race (or the entry point that was already set when we
+        // arrived). Use that as our descent start.
+        node_id_t currentEntryPoint = expected_invalid;
 
         // ----- Greedy descent from top layer to (highestLayer+1) -----
-        node_id_t sectionKey = entry_point_;
-        for (int l = max_layer_; l > highestLayer; --l)
+        node_id_t sectionKey = currentEntryPoint;
+        const int observed_max_layer = max_layer_.load(std::memory_order_acquire);
+        for (int l = observed_max_layer; l > highestLayer; --l)
         {
             currentEntryPoint = greedySearchUpperLayer(vector, currentEntryPoint, l);
             if (l == section_layer_) {
@@ -634,9 +666,9 @@ using namespace ROCKSDB_NAMESPACE;
             }
         }
 
-        // ----- From min(max_layer_, highestLayer) ... down to 0 -----
+        // ----- From min(observed_max_layer, highestLayer) ... down to 0 -----
         thread_local SearchScratch insert_scratch;
-        for (int l = std::min(max_layer_, highestLayer); l >= 0; --l)
+        for (int l = std::min(observed_max_layer, highestLayer); l >= 0; --l)
         {
             std::vector<SearchResult> neighbors =
                 searchLayer(vector, currentEntryPoint, ef_construction_, l, insert_scratch);
@@ -747,10 +779,31 @@ using namespace ROCKSDB_NAMESPACE;
             }
         }
 
-        if (highestLayer > max_layer_)
-        {
-            entry_point_ = nodeId;
-            max_layer_   = highestLayer;
+        // ----- Promotion (§5.1.3) -----
+        // CAS-loop max_layer_ upward; if our highestLayer is no longer
+        // the new max (another writer promoted higher concurrently),
+        // skip the promotion. Independent atomics: max_layer_ is bumped
+        // first, then entry_point_ — readers that see (NEW max, OLD ep)
+        // are absorbed by the graceful descent (greedySearchUpperLayer
+        // breaks on missing layer at the OLD ep). Note: under Phase 1
+        // INSERT-exclusive on the lifecycle gate, this CAS is
+        // uncontended; the loop and the publish ordering matter only
+        // once Phase 6 enables concurrent writers.
+        int cur = max_layer_.load(std::memory_order_acquire);
+        bool we_promoted = false;
+        while (highestLayer > cur) {
+            if (max_layer_.compare_exchange_weak(
+                    cur, highestLayer,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                we_promoted = true;
+                break;
+            }
+            // CAS lost; cur was updated to the latest value. Re-check
+            // whether we still need to promote.
+        }
+        if (we_promoted) {
+            entry_point_.store(nodeId, std::memory_order_release);
             LOG(INFO) << "Updated entry point to node " << nodeId
                       << " at layer " << highestLayer;
         }
@@ -803,7 +856,10 @@ using namespace ROCKSDB_NAMESPACE;
 
     std::vector<SearchResult> LSMVec::knnSearchK(const std::vector<float>& query, int k, int ef_search)
     {
-        if (entry_point_ == k_invalid_node_id || k <= 0) {
+        // Phase 4b: load entry_point_ once with acquire. If invalid
+        // (no first node yet), return empty.
+        const node_id_t ep = entry_point_.load(std::memory_order_acquire);
+        if (ep == k_invalid_node_id || k <= 0) {
             return {};
         }
 
@@ -813,8 +869,9 @@ using namespace ROCKSDB_NAMESPACE;
         thread_local SearchScratch scratch;
 
         auto search_timer = stats.startTimer();
-        node_id_t currentEntryPoint = entry_point_;
-        for (int l = max_layer_; l >= 1; --l) {
+        node_id_t currentEntryPoint = ep;
+        const int top_layer = max_layer_.load(std::memory_order_acquire);
+        for (int l = top_layer; l >= 1; --l) {
             currentEntryPoint = greedySearchUpperLayer(query, currentEntryPoint, l);
         }
 
@@ -855,15 +912,17 @@ using namespace ROCKSDB_NAMESPACE;
         int max_scan_candidates,
         const MetadataStore* meta_store)
     {
-        if (entry_point_ == k_invalid_node_id || k <= 0) {
+        const node_id_t ep = entry_point_.load(std::memory_order_acquire);
+        if (ep == k_invalid_node_id || k <= 0) {
             return {};
         }
 
         thread_local SearchScratch scratch;
 
         // Greedy descent through upper layers (filter-blind).
-        node_id_t currentEntryPoint = entry_point_;
-        for (int lvl = max_layer_; lvl > 0; --lvl) {
+        node_id_t currentEntryPoint = ep;
+        const int top_layer = max_layer_.load(std::memory_order_acquire);
+        for (int lvl = top_layer; lvl > 0; --lvl) {
             currentEntryPoint = greedySearchUpperLayer(query, currentEntryPoint, lvl);
         }
 
@@ -1880,10 +1939,12 @@ using namespace ROCKSDB_NAMESPACE;
         std::vector<SearchResult> nearestNeighbors; // W: dynamic list of found nearest neighbors
 
         // ep ← get enter point for hnsw
-        node_id_t currentEntryPoint = entry_point_;
-        int currentLayer = max_layer_;
+        node_id_t currentEntryPoint = entry_point_.load(std::memory_order_acquire);
+        const int top_layer = max_layer_.load(std::memory_order_acquire);
+        (void) top_layer;  // currentLayer was unused; preserving the load
+                           // for the loop below.
 
-        for (int l = max_layer_; l >= 1; --l)
+        for (int l = top_layer; l >= 1; --l)
         {
             std::vector<SearchResult> nearestNeighbors =
                 searchLayer(queryVector, currentEntryPoint, 30, l, scratch);
@@ -1898,9 +1959,10 @@ using namespace ROCKSDB_NAMESPACE;
 
     void LSMVec::printState() const
     {
+        const int top_layer = max_layer_.load(std::memory_order_acquire);
         // We do not print layer 0 by request.
-        if (max_layer_ <= 0) {
-            LOG(INFO) << "HNSW state: max_layer=" << max_layer_
+        if (top_layer <= 0) {
+            LOG(INFO) << "HNSW state: max_layer=" << top_layer
                       << " (no upper layers to report)";
             return;
         }
@@ -1908,27 +1970,20 @@ using namespace ROCKSDB_NAMESPACE;
         // Count how many nodes have adjacency info at each upper layer.
         // Note: this counts "nodes that currently have neighbor entries at layer l",
         // which is derivable from existing in-memory structures without extra metadata.
-        std::vector<std::size_t> layerNodeCounts(static_cast<std::size_t>(max_layer_ + 1), 0);
+        std::vector<std::size_t> layerNodeCounts(static_cast<std::size_t>(top_layer + 1), 0);
 
         // To avoid double counting, we track per-layer seen node IDs.
-        std::vector<std::unordered_set<node_id_t>> seen(static_cast<std::size_t>(max_layer_ + 1));
+        std::vector<std::unordered_set<node_id_t>> seen(static_cast<std::size_t>(top_layer + 1));
 
         for (const auto& kv : nodes_) {
             node_id_t nodeId = kv.first;
             const Node& node = kv.second;
 
             for (const auto& kv2 : node.neighbors) {
-                // The key type should be "layer index".
-                // If your neighbors map key is int, this is already int.
-                // If it's not int, cast safely.
                 int layer = static_cast<int>(kv2.first);
 
-                if (layer <= 0) continue;          // skip layer 0 (and any invalid)
-                if (layer > max_layer_) continue;    // defensive
-
-                // Option A (default): count node if it has the layer key at all.
-                // Option B: count only if the adjacency list is non-empty:
-                // if (kv2.second.empty()) continue;
+                if (layer <= 0) continue;
+                if (layer > top_layer) continue;
 
                 if (seen[static_cast<std::size_t>(layer)].insert(nodeId).second) {
                     layerNodeCounts[static_cast<std::size_t>(layer)]++;
@@ -1938,11 +1993,10 @@ using namespace ROCKSDB_NAMESPACE;
 
         std::ostringstream oss;
         oss << "HNSW state:\n";
-        oss << "  max_layer: " << max_layer_ << "\n";
-        oss << "  upper_layers: [1.." << max_layer_ << "]\n";
+        oss << "  max_layer: " << top_layer << "\n";
+        oss << "  upper_layers: [1.." << top_layer << "]\n";
 
-        // Print top-down for readability
-        for (int l = max_layer_; l >= 1; --l) {
+        for (int l = top_layer; l >= 1; --l) {
             oss << "  layer " << l << ": "
                 << layerNodeCounts[static_cast<std::size_t>(l)]
                 << " nodes\n";

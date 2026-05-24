@@ -452,11 +452,17 @@ using namespace ROCKSDB_NAMESPACE;
 
         std::unordered_map<node_id_t, Node> nodes_; // In-memory nodes for layers > 0
 
-        std::random_device random_device_;
-        std::mt19937 random_generator_;
-        std::uniform_real_distribution<> uniform_distribution_;
-        int max_layer_;
-        node_id_t entry_point_ = k_invalid_node_id; // Entry point for HNSW graph
+        // RNG removed — Phase 4a (§5.1.5) replaced shared mt19937 with
+        // thread_local in LSMVec::randomLevel().
+        //
+        // Phase 4b (§5.1.3): independent atomics on entry_point_ and
+        // max_layer_. Greedy descent at src/lsm_vec_index.cc is graceful
+        // (breaks on missing node or missing layer), so transient
+        // (NEW, OLD) / (OLD, NEW) observations are absorbed without a
+        // paired-publish primitive. First-insert + promotion use CAS.
+        // Search side guards against k_invalid_node_id explicitly.
+        std::atomic<int>       max_layer_{-1};
+        std::atomic<node_id_t> entry_point_{k_invalid_node_id};
 
         // V1 delete/update infrastructure — sparse maps over the divergent
         // subset of (real_id, internal_id) plus a Bloom shortcut for forward
