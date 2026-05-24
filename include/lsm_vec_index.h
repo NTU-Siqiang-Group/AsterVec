@@ -77,11 +77,68 @@ using namespace ROCKSDB_NAMESPACE;
     class LSMVec
     {
     public:
+        // 20260516_compact_neighbors: per-Node layer→neighbors store.
+        // The old type was std::unordered_map<int, std::vector<node_id_t>>;
+        // for typical 1-2-layer upper nodes the hash-table headers + bucket
+        // overhead (~64 bytes/empty + ~32 bytes/entry) dwarf the data. This
+        // adapter presents the same API but stores entries contiguously,
+        // dropping ~70 bytes/node on typical layouts. Linear scan is also
+        // faster than std::unordered_map lookup at N ≤ ~4 entries.
+        class LayerNeighbors {
+        public:
+            using value_type = std::pair<int, std::vector<node_id_t>>;
+            using container  = std::vector<value_type>;
+
+            std::vector<node_id_t>& operator[](int layer) {
+                for (auto& e : data_) if (e.first == layer) return e.second;
+                data_.emplace_back(layer, std::vector<node_id_t>{});
+                return data_.back().second;
+            }
+
+            container::iterator       find(int layer) {
+                for (auto it = data_.begin(); it != data_.end(); ++it)
+                    if (it->first == layer) return it;
+                return data_.end();
+            }
+            container::const_iterator find(int layer) const {
+                for (auto it = data_.begin(); it != data_.end(); ++it)
+                    if (it->first == layer) return it;
+                return data_.end();
+            }
+
+            void emplace(int layer, std::vector<node_id_t> vec) {
+                for (auto& e : data_) {
+                    if (e.first == layer) { e.second = std::move(vec); return; }
+                }
+                data_.emplace_back(layer, std::move(vec));
+            }
+
+            container::iterator       begin()       { return data_.begin(); }
+            container::const_iterator begin() const { return data_.begin(); }
+            container::iterator       end()         { return data_.end(); }
+            container::const_iterator end()   const { return data_.end(); }
+
+            size_t size()     const { return data_.size(); }
+            size_t capacity() const { return data_.capacity(); }
+            bool   empty()    const { return data_.empty(); }
+
+        private:
+            container data_;
+        };
+
         struct Node
         {
             node_id_t id;
+            // float32 vector. Empty once the node has been quantized
+            // (q8_data is non-empty in that case). Mutually exclusive with q8_data.
             std::vector<float> point;
-            std::unordered_map<int, std::vector<node_id_t>> neighbors; // Layer -> neighbors
+            // 20260516_upper_layer_sq8: SQ8-quantized payload for upper-layer
+            // nodes (layer ≥ 1). dim bytes; q_min/q_max are the dequant params.
+            // Mutually exclusive with `point` per node.
+            std::vector<uint8_t> q8_data;
+            float q_min = 0.0f;
+            float q_max = 0.0f;
+            LayerNeighbors neighbors;  // Layer -> neighbors
         };
 
         mutable HNSWStats stats;
@@ -174,6 +231,21 @@ using namespace ROCKSDB_NAMESPACE;
         }
 
     private:
+        // 20260516_upper_layer_sq8 helpers.
+        // quantizeNodePoint: destructive — writes n.q8_data/q_min/q_max from
+        // n.point, then swaps n.point to empty.
+        static void quantizeNodePoint(Node& n);
+        // dequantizeNodePoint: writes a fresh float vector into `out`
+        // (resized to q8_data.size()). Returns true if q8_data is non-empty;
+        // false if the node has neither point nor q8_data.
+        bool dequantizeNodePoint(const Node& n, std::vector<float>& out) const;
+        // nodePointView: returns a Span<const float> over the node's vector.
+        // If point is populated, returns a span over it directly. Else
+        // materializes into `scratch` and returns a span over scratch.
+        // Caller keeps scratch alive while the span is in use.
+        Span<const float> nodePointView(const Node& n,
+                                         std::vector<float>& scratch) const;
+
         int randomLevel();
         float computeDistance(Span<const float> vectorA,
                               Span<const float> vectorB) const;

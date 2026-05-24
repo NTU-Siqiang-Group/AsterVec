@@ -227,19 +227,33 @@ using namespace ROCKSDB_NAMESPACE;
             return Status::IOError("failed to write metadata header");
         }
 
+        std::vector<float> serialize_dequant_scratch;
         for (const auto& kv : nodes_) {
             node_id_t nodeId = kv.first;
             const Node& node = kv.second;
-            uint64_t pointSize = static_cast<uint64_t>(node.point.size());
+            // 20260516_upper_layer_sq8: on-disk format is float32; dequantize
+            // SQ8-resident nodes back to float for write. Format unchanged
+            // across the SQ8 switch.
+            const float* point_data = nullptr;
+            size_t point_size = 0;
+            if (!node.point.empty()) {
+                point_data = node.point.data();
+                point_size = node.point.size();
+            } else if (!node.q8_data.empty()) {
+                dequantizeNodePoint(node, serialize_dequant_scratch);
+                point_data = serialize_dequant_scratch.data();
+                point_size = serialize_dequant_scratch.size();
+            }
+            uint64_t pointSize = static_cast<uint64_t>(point_size);
             uint64_t neighborLayers = static_cast<uint64_t>(node.neighbors.size());
 
             if (!WriteValue(out, nodeId) ||
                 !WriteValue(out, pointSize)) {
                 return Status::IOError("failed to write node metadata");
             }
-            if (!node.point.empty()) {
-                out.write(reinterpret_cast<const char*>(node.point.data()),
-                          static_cast<std::streamsize>(node.point.size() * sizeof(float)));
+            if (point_data != nullptr && point_size > 0) {
+                out.write(reinterpret_cast<const char*>(point_data),
+                          static_cast<std::streamsize>(point_size * sizeof(float)));
                 if (!out) {
                     return Status::IOError("failed to write node vector");
                 }
@@ -353,7 +367,9 @@ using namespace ROCKSDB_NAMESPACE;
             if (!ReadValue(in, &neighborLayers)) {
                 return Status::IOError("failed to read neighbor layer count");
             }
-            Node node{nodeId, std::move(point), {}};
+            Node node;
+            node.id = nodeId;
+            node.point = std::move(point);
             for (uint64_t j = 0; j < neighborLayers; ++j) {
                 int32_t layer = 0;
                 uint64_t neighborCount = 0;
@@ -370,6 +386,13 @@ using namespace ROCKSDB_NAMESPACE;
                     neighbors.push_back(neighbor);
                 }
                 node.neighbors.emplace(layer, std::move(neighbors));
+            }
+            // 20260516_upper_layer_sq8: every node in nodes_ is an upper-layer
+            // node by construction (only highestLayer > 0 enters the map).
+            // Re-quantize unconditionally so the in-memory form matches what
+            // insertNode would have produced.
+            if (!node.point.empty()) {
+                quantizeNodePoint(node);
             }
             nodes_.emplace(nodeId, std::move(node));
         }
@@ -439,6 +462,62 @@ using namespace ROCKSDB_NAMESPACE;
     }
 
 
+
+    // 20260516_upper_layer_sq8: scalar quantize the float point to a (min, max,
+    // uint8[dim]) form. Destructive — writes q8_data/q_min/q_max and clears
+    // point. Idempotent: no-op if point is already empty.
+    void LSMVec::quantizeNodePoint(Node& n)
+    {
+        if (n.point.empty()) return;
+        const size_t d = n.point.size();
+        float lo = n.point[0], hi = n.point[0];
+        for (size_t i = 1; i < d; ++i) {
+            if (n.point[i] < lo) lo = n.point[i];
+            if (n.point[i] > hi) hi = n.point[i];
+        }
+        float range = hi - lo;
+        if (range < 1e-10f) range = 1e-10f;
+        n.q8_data.resize(d);
+        for (size_t i = 0; i < d; ++i) {
+            float norm = (n.point[i] - lo) / range;
+            int q = static_cast<int>(norm * 255.0f + 0.5f);
+            if (q < 0) q = 0; else if (q > 255) q = 255;
+            n.q8_data[i] = static_cast<uint8_t>(q);
+        }
+        n.q_min = lo;
+        n.q_max = hi;
+        std::vector<float>{}.swap(n.point);   // free the float buffer
+    }
+
+    bool LSMVec::dequantizeNodePoint(const Node& n, std::vector<float>& out) const
+    {
+        if (n.q8_data.empty()) return false;
+        const size_t d = n.q8_data.size();
+        out.resize(d);
+        const float range = n.q_max - n.q_min;
+        for (size_t i = 0; i < d; ++i) {
+            out[i] = n.q_min + range * (static_cast<float>(n.q8_data[i]) / 255.0f);
+        }
+        return true;
+    }
+
+    Span<const float> LSMVec::nodePointView(const Node& n,
+                                              std::vector<float>& scratch) const
+    {
+        if (!n.point.empty()) {
+            return Span<const float>(n.point.data(), n.point.size());
+        }
+        if (n.q8_data.empty()) {
+            return Span<const float>(nullptr, 0);
+        }
+        const size_t d = n.q8_data.size();
+        scratch.resize(d);
+        const float range = n.q_max - n.q_min;
+        for (size_t i = 0; i < d; ++i) {
+            scratch[i] = n.q_min + range * (static_cast<float>(n.q8_data[i]) / 255.0f);
+        }
+        return Span<const float>(scratch.data(), scratch.size());
+    }
 
     // Generates a random level for the node
     int LSMVec::randomLevel()
@@ -510,9 +589,13 @@ using namespace ROCKSDB_NAMESPACE;
 
         if (highestLayer > 0)
         {
-            Node newNode{nodeId, vector, {}};
-            newNode.neighbors = std::unordered_map<int, std::vector<node_id_t>>();
-            nodes_[nodeId] = newNode;
+            Node newNode;
+            newNode.id = nodeId;
+            newNode.point = vector;
+            // 20260516_upper_layer_sq8: quantize destructively at construction.
+            // Frees the float buffer; q8_data carries the dim-byte representation.
+            quantizeNodePoint(newNode);
+            nodes_[nodeId] = std::move(newNode);
         }
 
         // ----- First node special case -----
@@ -599,8 +682,19 @@ using namespace ROCKSDB_NAMESPACE;
                     std::vector<node_id_t> eConn = neighborIt->second.neighbors[l];
                     if (eConn.size() > static_cast<size_t>(m_max_))
                     {
+                        // 20260516_upper_layer_sq8: selectNeighbors takes
+                        // const vector<float>&; if this neighbor is SQ8 we
+                        // have to materialize.
+                        std::vector<float> neighborPt;
+                        const std::vector<float>* basis = nullptr;
+                        if (!neighborIt->second.point.empty()) {
+                            basis = &neighborIt->second.point;
+                        } else if (dequantizeNodePoint(neighborIt->second, neighborPt)) {
+                            basis = &neighborPt;
+                        }
+                        if (basis == nullptr) continue;
                         std::vector<node_id_t> eNewConn =
-                            selectNeighbors(neighborIt->second.point, eConn, m_max_, l);
+                            selectNeighbors(*basis, eConn, m_max_, l);
                         neighborIt->second.neighbors[l] = std::move(eNewConn);
                     }
                 }
@@ -849,6 +943,9 @@ using namespace ROCKSDB_NAMESPACE;
         }
         else
         {
+            // 20260516_upper_layer_sq8: scratch for dequantized upper-layer
+            // points. Reused across candidates within this select call.
+            std::vector<float> sn_simple_scratch;
             std::priority_queue<std::pair<float, node_id_t>> topCandidates;
             for (node_id_t candidateId : candidateIds)
             {
@@ -856,11 +953,16 @@ using namespace ROCKSDB_NAMESPACE;
                 if (layer > 0)
                 {
                     const auto nodeIt = nodes_.find(candidateId);
-                    if (nodeIt != nodes_.end() && !nodeIt->second.point.empty()) {
-                        const auto& candidateVec = nodeIt->second.point;
-                        dist = computeDistance(Span<const float>(vector),
-                                               Span<const float>(candidateVec));
-                    } else {
+                    bool got = false;
+                    if (nodeIt != nodes_.end()) {
+                        Span<const float> pt = nodePointView(
+                            nodeIt->second, sn_simple_scratch);
+                        if (!pt.empty()) {
+                            dist = computeDistance(Span<const float>(vector), pt);
+                            got = true;
+                        }
+                    }
+                    if (!got) {
                         std::vector<float> candidateVector;
                         readVectorWithStats(candidateId, candidateVector);
                         dist = computeDistance(Span<const float>(vector),
@@ -913,13 +1015,24 @@ using namespace ROCKSDB_NAMESPACE;
 
         // Optional cache for layer 0 to avoid reading the same vectors multiple times.
         // For layer > 0 we can use nodes_[id].point directly.
+        // 20260516_upper_layer_sq8: same cache also memoizes dequantized
+        // upper-layer points (where node.point is empty after quantization).
         std::unordered_map<node_id_t, std::vector<float>> vecCache;
 
         auto getVector = [&](node_id_t nodeId) -> const std::vector<float>& {
             if (layer > 0) {
                 auto nodeIt = nodes_.find(nodeId);
-                if (nodeIt != nodes_.end() && !nodeIt->second.point.empty()) {
-                    return nodeIt->second.point;
+                if (nodeIt != nodes_.end()) {
+                    if (!nodeIt->second.point.empty()) {
+                        return nodeIt->second.point;
+                    }
+                    auto cit = vecCache.find(nodeId);
+                    if (cit != vecCache.end()) return cit->second;
+                    std::vector<float> v;
+                    if (dequantizeNodePoint(nodeIt->second, v)) {
+                        auto res = vecCache.emplace(nodeId, std::move(v));
+                        return res.first->second;
+                    }
                 }
             }
 
@@ -1019,13 +1132,24 @@ using namespace ROCKSDB_NAMESPACE;
 
         // Optional cache for layer 0 to avoid reading the same vectors multiple times.
         // For layer > 0 we can use nodes_[id].point directly.
+        // 20260516_upper_layer_sq8: same cache also memoizes dequantized
+        // upper-layer points (where node.point is empty after quantization).
         std::unordered_map<node_id_t, std::vector<float>> vecCache;
 
         auto getVector = [&](node_id_t nodeId) -> const std::vector<float>& {
             if (layer > 0) {
                 auto nodeIt = nodes_.find(nodeId);
-                if (nodeIt != nodes_.end() && !nodeIt->second.point.empty()) {
-                    return nodeIt->second.point;
+                if (nodeIt != nodes_.end()) {
+                    if (!nodeIt->second.point.empty()) {
+                        return nodeIt->second.point;
+                    }
+                    auto cit = vecCache.find(nodeId);
+                    if (cit != vecCache.end()) return cit->second;
+                    std::vector<float> v;
+                    if (dequantizeNodePoint(nodeIt->second, v)) {
+                        auto res = vecCache.emplace(nodeId, std::move(v));
+                        return res.first->second;
+                    }
                 }
             }
 
@@ -1155,11 +1279,17 @@ using namespace ROCKSDB_NAMESPACE;
         // 3) Read all candidate vectors into a contiguous buffer
         std::vector<float> candVecs(N * dim);
         if (layer > 0) {
+            // 20260516_upper_layer_sq8: route through nodePointView; reuse one
+            // scratch buffer across all candidates within this select call.
+            std::vector<float> sn2_scratch;
             for (size_t i = 0; i < N; ++i) {
                 auto nodeIt = nodes_.find(candInfos[i].id);
                 if (nodeIt != nodes_.end()) {
-                    std::memcpy(candVecs.data() + i * dim,
-                                nodeIt->second.point.data(), dim * sizeof(float));
+                    Span<const float> pt = nodePointView(nodeIt->second, sn2_scratch);
+                    if (pt.size() == dim) {
+                        std::memcpy(candVecs.data() + i * dim,
+                                    pt.data(), dim * sizeof(float));
+                    }
                 }
             }
         } else {
@@ -1203,11 +1333,13 @@ using namespace ROCKSDB_NAMESPACE;
                                                node_id_t entryPoint, int layer)
     {
         node_id_t current = entryPoint;
-        auto getVec = [&](node_id_t id) -> const std::vector<float>& {
-            return nodes_.at(id).point;
-        };
-        float bestDist = computeDistance(Span<const float>(query),
-                                          Span<const float>(getVec(current)));
+        // 20260516_upper_layer_sq8: dequant scratches — one for the current
+        // node, one for each neighbor being scored. Reused across iterations.
+        std::vector<float> greedy_scratch_cur;
+        std::vector<float> greedy_scratch_neighbor;
+        const Node& entryNode = nodes_.at(current);
+        Span<const float> entryPt = nodePointView(entryNode, greedy_scratch_cur);
+        float bestDist = computeDistance(Span<const float>(query), entryPt);
         bool improved = true;
         while (improved) {
             improved = false;
@@ -1218,8 +1350,10 @@ using namespace ROCKSDB_NAMESPACE;
             for (node_id_t neighborId : layerIt->second) {
                 auto nIt = nodes_.find(neighborId);
                 if (nIt == nodes_.end()) continue;
-                float d = computeDistance(Span<const float>(query),
-                                           Span<const float>(nIt->second.point));
+                Span<const float> neighborPt = nodePointView(nIt->second,
+                                                              greedy_scratch_neighbor);
+                if (neighborPt.empty()) continue;
+                float d = computeDistance(Span<const float>(query), neighborPt);
                 if (d < bestDist) {
                     bestDist = d;
                     current = neighborId;
@@ -1265,15 +1399,18 @@ using namespace ROCKSDB_NAMESPACE;
         // W: max-heap by (distance) => farthest among current best is on top
         std::priority_queue<Cand> nearest;
 
+        // 20260516_upper_layer_sq8: dequant scratch for the upper-layer
+        // getDistance path. Reused across calls within this searchLayer.
+        std::vector<float> sl_scratch;
         auto getDistance = [&](node_id_t nodeId) -> float {
             if (layer > 0) {
                 // Upper layers: vectors are in-memory when available.
                 const auto nodeIt = nodes_.find(nodeId);
-                if (nodeIt != nodes_.end() &&
-                    nodeIt->second.point.size() == static_cast<size_t>(vector_dim_)) {
-                    const auto& point = nodeIt->second.point;
-                    return computeDistance(Span<const float>(queryVector),
-                                           Span<const float>(point));
+                if (nodeIt != nodes_.end()) {
+                    Span<const float> pt = nodePointView(nodeIt->second, sl_scratch);
+                    if (pt.size() == static_cast<size_t>(vector_dim_)) {
+                        return computeDistance(Span<const float>(queryVector), pt);
+                    }
                 }
                 // Fallback to disk if the node is not tracked in upper layers.
                 std::vector<float> v;
@@ -1319,16 +1456,22 @@ using namespace ROCKSDB_NAMESPACE;
                 }
 
                 const auto& neighborIds = it->second;
+                std::vector<float> sl2_scratch;
                 for (node_id_t neighborId : neighborIds) {
                     if (visitedInsert(neighborId)) {
                         const auto neighborIt = nodes_.find(neighborId);
                         float d = 0.0f;
-                        if (neighborIt != nodes_.end() &&
-                            neighborIt->second.point.size() == static_cast<size_t>(vector_dim_)) {
-                            const auto& point = neighborIt->second.point;
-                            d = computeDistance(Span<const float>(queryVector),
-                                                Span<const float>(point));
-                        } else {
+                        bool got = false;
+                        if (neighborIt != nodes_.end()) {
+                            // 20260516_upper_layer_sq8: route through nodePointView
+                            // so SQ8-resident neighbors dequant on demand.
+                            Span<const float> pt = nodePointView(neighborIt->second, sl2_scratch);
+                            if (pt.size() == static_cast<size_t>(vector_dim_)) {
+                                d = computeDistance(Span<const float>(queryVector), pt);
+                                got = true;
+                            }
+                        }
+                        if (!got) {
                             std::vector<float> neighborVec;
                             readVectorWithStats(neighborId, neighborVec);
                             d = computeDistance(Span<const float>(queryVector),
