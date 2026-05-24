@@ -20,10 +20,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -42,6 +44,9 @@ struct Args {
     int efc = 32;
     bool reinit = true;
     size_t edge_cache_size = 100000;
+    std::vector<int> build_threads_list = {1};  // sequential build by default
+    bool skip_search = false;
+    bool skip_build = false;
 };
 
 std::vector<int> parseThreadsList(const std::string& s) {
@@ -74,6 +79,9 @@ Args parseArgs(int argc, char* argv[]) {
         else if (k == "--efc")      a.efc = std::atoi(next().c_str());
         else if (k == "--no-reinit") a.reinit = false;
         else if (k == "--edge-cache") a.edge_cache_size = static_cast<size_t>(std::atoll(next().c_str()));
+        else if (k == "--build-threads") a.build_threads_list = parseThreadsList(next());
+        else if (k == "--skip-search") a.skip_search = true;
+        else if (k == "--skip-build")  a.skip_build  = true;
         else { std::cerr << "Unknown flag: " << k << "\n"; std::exit(2); }
     }
     if (a.db_path.empty() || a.input_file.empty() || a.query_file.empty()) {
@@ -125,44 +133,94 @@ int main(int argc, char* argv[]) {
     std::cout << "Loaded " << inputs.size() << " inputs (dim=" << dim << "), "
               << queries.size() << " queries\n";
 
-    // ---- Open DB ----
-    lsm_vec::LSMVecDBOptions opts;
-    opts.dim = dim;
-    opts.metric = lsm_vec::DistanceMetric::kL2;
-    opts.m = args.M;
-    opts.m_max = args.Mmax;
-    opts.ef_construction = static_cast<float>(args.efc);
-    opts.vec_file_capacity = std::max<size_t>(inputs.size() + 1024, 100000);
-    opts.paged_max_cached_pages = 8192;
-    opts.vector_storage_type = 1;
-    opts.k = args.k;
-    opts.ef_search = args.efs;
-    opts.enable_batch_read = true;
-    opts.reinit = args.reinit;
-    opts.edge_cache_size = args.edge_cache_size;
-    opts.vector_file_path = args.db_path + "/vector.log";
-    std::cout << "edge_cache_size=" << opts.edge_cache_size << "\n";
+    std::cout << "edge_cache_size=" << args.edge_cache_size << "\n";
 
+    auto make_opts = [&](const std::string& db_path) {
+        lsm_vec::LSMVecDBOptions o;
+        o.dim = dim;
+        o.metric = lsm_vec::DistanceMetric::kL2;
+        o.m = args.M;
+        o.m_max = args.Mmax;
+        o.ef_construction = static_cast<float>(args.efc);
+        o.vec_file_capacity = std::max<size_t>(inputs.size() + 1024, 100000);
+        o.paged_max_cached_pages = 8192;
+        o.vector_storage_type = 1;
+        o.k = args.k;
+        o.ef_search = args.efs;
+        o.enable_batch_read = true;
+        o.reinit = true;
+        o.edge_cache_size = args.edge_cache_size;
+        o.vector_file_path = db_path + "/vector.log";
+        return o;
+    };
+
+    // ---- Build (one or more thread counts, each on a fresh DB) ----
+    // Last build's DB is kept open for the search benchmark below.
     std::unique_ptr<lsm_vec::LSMVecDB> db;
-    auto st = lsm_vec::LSMVecDB::Open(args.db_path, opts, &db);
-    if (!st.ok()) { std::cerr << "Open: " << st.ToString() << "\n"; return 1; }
+    if (!args.skip_build) {
+        std::cout << "\n--- Build (concurrent insert on fresh DB) ---\n";
+        double first_build_s = -1.0;
+        for (size_t bi = 0; bi < args.build_threads_list.size(); ++bi) {
+            int bt = args.build_threads_list[bi];
+            if (bt < 1) continue;
+            bool is_last = (bi + 1 == args.build_threads_list.size());
 
-    // ---- Build ----
-    auto build_t0 = std::chrono::high_resolution_clock::now();
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        auto s = db->Insert(static_cast<uint64_t>(i), lsm_vec::Span<float>(inputs[i]));
-        if (!s.ok()) {
-            std::cerr << "Insert " << i << " failed: " << s.ToString() << "\n";
-            return 1;
+            std::string subdir = args.db_path + "/build_" + std::to_string(bt);
+            std::error_code ec;
+            std::filesystem::remove_all(subdir, ec);
+            std::filesystem::create_directories(subdir, ec);
+
+            std::unique_ptr<lsm_vec::LSMVecDB> local_db;
+            auto st = lsm_vec::LSMVecDB::Open(subdir, make_opts(subdir), &local_db);
+            if (!st.ok()) { std::cerr << "Open: " << st.ToString() << "\n"; return 1; }
+
+            std::atomic<size_t> failed{0};
+            auto build_worker = [&](int tid) {
+                const size_t total = inputs.size();
+                const size_t chunk = (total + bt - 1) / bt;
+                const size_t lo = std::min(total, static_cast<size_t>(tid) * chunk);
+                const size_t hi = std::min(total, lo + chunk);
+                for (size_t i = lo; i < hi; ++i) {
+                    auto s = local_db->Insert(
+                        static_cast<uint64_t>(i),
+                        lsm_vec::Span<float>(const_cast<std::vector<float>&>(inputs[i])));
+                    if (!s.ok()) failed.fetch_add(1, std::memory_order_relaxed);
+                }
+            };
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            std::vector<std::thread> ts;
+            ts.reserve(bt);
+            for (int t = 0; t < bt; ++t) ts.emplace_back(build_worker, t);
+            for (auto& t : ts) t.join();
+            local_db->flushVectorWrites();
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            double build_s = std::chrono::duration<double>(t1 - t0).count();
+            double qps = static_cast<double>(inputs.size()) / build_s;
+            if (first_build_s < 0.0) first_build_s = build_s;
+            double speedup = first_build_s / build_s;
+            std::cout << "build_threads=" << bt
+                      << "  elapsed=" << build_s << "s"
+                      << "  insert_qps=" << qps
+                      << "  speedup=" << speedup << "x"
+                      << "  failed=" << failed.load() << "\n";
+
+            if (is_last && !args.skip_search) {
+                db = std::move(local_db);
+            } else {
+                local_db->Close();
+            }
         }
-        if ((i + 1) % 100000 == 0) {
-            std::cerr << "  inserted " << (i + 1) << "\n";
-        }
+    } else {
+        // Open existing DB without rebuilding.
+        auto o = make_opts(args.db_path);
+        o.reinit = false;
+        auto st = lsm_vec::LSMVecDB::Open(args.db_path, o, &db);
+        if (!st.ok()) { std::cerr << "Open: " << st.ToString() << "\n"; return 1; }
     }
-    db->flushVectorWrites();
-    auto build_t1 = std::chrono::high_resolution_clock::now();
-    double build_s = std::chrono::duration<double>(build_t1 - build_t0).count();
-    std::cout << "Build: " << build_s << "s for " << inputs.size() << " vectors\n";
+
+    if (args.skip_search || !db) return 0;
 
     // ---- Probe ----
     lsm_vec::SearchOptions sopts;
