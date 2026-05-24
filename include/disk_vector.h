@@ -417,7 +417,16 @@ private:
     // -------------------------------------------------------------
     static constexpr size_t kNumSectionShards = 64;
     mutable std::array<std::mutex, kNumSectionShards> sectionShards_;
-    mutable std::mutex                                pages_alloc_mu_;
+    // Phase 5 (concurrent-writer-refactor-plan §5.3 / §5.4): upgraded
+    // from std::mutex to std::shared_mutex so reads of the dense
+    // location arrays (page_of / slot_of) take shared, while writes
+    // (assign_location / expandCapacity / pages_.push_back) take
+    // exclusive. The Phase 5 publish-visibility protocol is the
+    // ordering: vector bytes are pwritten BEFORE the location is
+    // published into idToPage_/idToSlotInPage_ via assign_location.
+    // Readers that see page_of(id) >= 0 are guaranteed the bytes are
+    // already on disk.
+    mutable std::shared_mutex                         pages_alloc_mu_;
     mutable std::mutex                                section_index_mu_;
     mutable std::mutex                                update_loc_mu_;
 
@@ -432,6 +441,10 @@ private:
 
     int64_t page_of(node_id_t id) const {
         if (is_direct_id(id)) {
+            // Phase 5: shared lock so a concurrent assign_location
+            // / expandCapacity can't realloc the vector beneath us
+            // and so we read a coherent published value.
+            std::shared_lock<std::shared_mutex> g(pages_alloc_mu_);
             if (static_cast<size_t>(id) >= totalVectors_) return -1;
             // 20260516_narrow_idtopage: idToPage_ is int32_t; widen for the API contract.
             return static_cast<int64_t>(idToPage_[static_cast<size_t>(id)]);
@@ -444,6 +457,7 @@ private:
 
     uint16_t slot_of(node_id_t id) const {
         if (is_direct_id(id)) {
+            std::shared_lock<std::shared_mutex> g(pages_alloc_mu_);
             if (static_cast<size_t>(id) >= totalVectors_) return 0;
             return idToSlotInPage_[static_cast<size_t>(id)];
         }
@@ -474,16 +488,20 @@ private:
             // 20260516_narrow_idtopage: 2^31 page ceiling = 8 TB per backing
             // file. Hitting this means a multi-TB single-file workload — bail
             // out loudly rather than silently truncate the high bits.
-            // A1.8 note: the direct (dense) path publish here is currently
-            // protected by the caller's external exclusive lock on the
-            // LSMVecDB per-id mutex (A1.9). The sparse path below uses
-            // the per-storage update_loc_mu_ added by this commit.
+            //
+            // Phase 5 publish protocol (§5.4): vector bytes are already on
+            // disk by the time storeVectorToDisk reaches here; this
+            // unique_lock publish makes the (id → page, slot) mapping
+            // visible atomically to readers that use shared-lock
+            // page_of/slot_of. Readers observing page_of(id) >= 0 are
+            // guaranteed the bytes are durable.
             if (page > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
                 throw std::runtime_error(
                     "PagedVectorStorage: page index exceeds int32_t ceiling "
                     "(8 TB) — rebuild with int64_t idToPage_ or split the "
                     "storage file");
             }
+            std::unique_lock<std::shared_mutex> g(pages_alloc_mu_);
             idToPage_[static_cast<size_t>(id)]       = static_cast<int32_t>(page);
             idToSlotInPage_[static_cast<size_t>(id)] = slot;
         } else {
@@ -661,7 +679,7 @@ private:
     // pages_alloc_mu_ shared via a future shared_mutex; for Phase 1 the
     // lifecycle gate already excludes readers during writes).
     void expandCapacity(size_t minCapacity) {
-        std::lock_guard<std::mutex> g(pages_alloc_mu_);
+        std::unique_lock<std::shared_mutex> g(pages_alloc_mu_);
         expandCapacityLocked(minCapacity);
     }
 
@@ -1050,7 +1068,7 @@ private:
         // global pages allocator mutex.
         size_t newPageId;
         {
-            std::lock_guard<std::mutex> a(pages_alloc_mu_);
+            std::unique_lock<std::shared_mutex> a(pages_alloc_mu_);
             newPageId = pages_.size();
             pages_.push_back(PageMeta{sectionIdx, /*usedSlots=*/1});
             ensurePageAllocated(newPageId);

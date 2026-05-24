@@ -124,7 +124,10 @@ TEST_CASE("Concurrent INSERT torture: N writer threads on one LSMVecDB"
             auto q = RandVec(kDim, rng);
             std::vector<lsm_vec::SearchResult> out;
             auto st = db->SearchKnn(lsm_vec::Span<float>(q), opts, &out);
-            if (!st.ok()) {
+            // NotFound is expected during the brief window before any
+            // insert publishes entry_point_; only count IOError /
+            // InvalidArgument / etc as real failures.
+            if (!st.ok() && !st.IsNotFound()) {
                 search_failures.fetch_add(1, std::memory_order_relaxed);
             }
         }

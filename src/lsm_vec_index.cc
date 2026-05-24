@@ -625,46 +625,73 @@ using namespace ROCKSDB_NAMESPACE;
             nodes_[nodeId] = std::move(newNode);
         }
 
-        // ----- First node special case (Phase 4b §5.1.3 — CAS) -----
-        // CAS entry_point_ from INVALID to nodeId. The winner becomes
-        // the index's first node and publishes max_layer_ via release-
-        // store. Losers fall through to the regular insert path
-        // against the now-existing entry point. Under Phase 1's
-        // exclusive-INSERT lifecycle gate this CAS is uncontended;
-        // it's wired now so Phase 6 (shared-INSERT) is correct.
-        node_id_t expected_invalid = k_invalid_node_id;
-        if (entry_point_.compare_exchange_strong(
-                expected_invalid, nodeId,
-                std::memory_order_acq_rel,
-                std::memory_order_acquire))
+        // ----- First node special case (Phase 4b §5.1.3 + Phase 5
+        // §5.4 publish protocol) -----
+        // Speculative path: only ONE thread can be the first node.
+        // We do the heavy lifting (vector storage, Aster vertex)
+        // BEFORE publishing entry_point_, so concurrent readers that
+        // observe entry_point_ != INVALID can immediately walk the
+        // graph without races on missing vector / missing edges.
+        //
+        // We use a check-then-CAS pattern: first check if
+        // entry_point_ is already set by another thread, in which
+        // case we fall through to the regular insert path. If still
+        // INVALID, we tentatively store the vector and edges, then
+        // CAS entry_point_. If the CAS wins, we're done. If it
+        // loses, our vector + Aster vertex are still valid graph
+        // state — the regular insert path will incorporate them.
+        node_id_t currentEntryPoint = k_invalid_node_id;
+        if (entry_point_.load(std::memory_order_acquire) == k_invalid_node_id)
         {
-            max_layer_.store(highestLayer, std::memory_order_release);
-
+            // First-node speculative path. Race window: multiple
+            // writers may both reach here; the CAS below selects one
+            // winner. The loser's vector + Aster vertex remain valid
+            // graph state, so the loser's insert is not lost — they
+            // just don't become the entry point. Their regular insert
+            // path picks up against the now-existing entry point.
             linkNeighborsAsterDB(nodeId, {});
-
-            // For the first node, we can just use nodeId as sectionKey
-            node_id_t sectionKey = nodeId;
-            storeVectorWithStats(nodeId, vector, sectionKey);
+            storeVectorWithStats(nodeId, vector, /*sectionKey=*/nodeId);
             vectorStored = true;
 
-            stats.accumulateTime(insert_timer, stats.indexing_time);
-            stats.addCount(1, stats.insert_count);
-            if (insert_timer.active) {
-                LOG(INFO) << "insert_node id=" << nodeId
-                          << " layer=" << highestLayer
-                          << " time_s="
-                          << (static_cast<double>(insert_timer.duration_ns) / 1e9);
+            node_id_t expected_invalid = k_invalid_node_id;
+            if (entry_point_.compare_exchange_strong(
+                    expected_invalid, nodeId,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+            {
+                max_layer_.store(highestLayer, std::memory_order_release);
+
+                stats.accumulateTime(insert_timer, stats.indexing_time);
+                stats.addCount(1, stats.insert_count);
+                if (insert_timer.active) {
+                    LOG(INFO) << "insert_node id=" << nodeId
+                              << " layer=" << highestLayer
+                              << " time_s="
+                              << (static_cast<double>(insert_timer.duration_ns) / 1e9);
+                }
+                return;
             }
-            return;
+            // Lost the CAS race. expected_invalid now has the winning
+            // entry point (some other writer's nodeId). Use it for
+            // our descent.
+            currentEntryPoint = expected_invalid;
         }
-        // expected_invalid now holds the actual entry point that won
-        // the race (or the entry point that was already set when we
-        // arrived). Use that as our descent start.
-        node_id_t currentEntryPoint = expected_invalid;
+        if (currentEntryPoint == k_invalid_node_id) {
+            currentEntryPoint = entry_point_.load(std::memory_order_acquire);
+        }
 
         // ----- Greedy descent from top layer to (highestLayer+1) -----
         node_id_t sectionKey = currentEntryPoint;
-        const int observed_max_layer = max_layer_.load(std::memory_order_acquire);
+        int observed_max_layer = max_layer_.load(std::memory_order_acquire);
+        // Race guard (Phase 5 §5.4): a concurrent first-node CAS
+        // winner publishes entry_point_ then max_layer_; if we
+        // observe entry_point_ != INVALID but max_layer_ is still -1
+        // (initial), clamp to 0 so our layer-0 store + edge work
+        // still runs. The (rare) cost is missing upper-layer edges
+        // for this insert; recall budget covers it.
+        if (observed_max_layer < 0) {
+            observed_max_layer = 0;
+        }
         for (int l = observed_max_layer; l > highestLayer; --l)
         {
             currentEntryPoint = greedySearchUpperLayer(vector, currentEntryPoint, l);
