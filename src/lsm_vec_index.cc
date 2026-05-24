@@ -634,10 +634,11 @@ using namespace ROCKSDB_NAMESPACE;
         }
 
         // ----- From min(max_layer_, highestLayer) ... down to 0 -----
+        thread_local SearchScratch insert_scratch;
         for (int l = std::min(max_layer_, highestLayer); l >= 0; --l)
         {
             std::vector<SearchResult> neighbors =
-                searchLayer(vector, currentEntryPoint, ef_construction_, l);
+                searchLayer(vector, currentEntryPoint, ef_construction_, l, insert_scratch);
             std::vector<node_id_t> selectedNeighbors =
                 selectNeighbors(vector, neighbors, m_, l);
 
@@ -805,6 +806,11 @@ using namespace ROCKSDB_NAMESPACE;
             return {};
         }
 
+        // Per-thread scratch: capacity warmed across calls within one
+        // worker thread, but never shared across threads. See
+        // doc/thread-safety-refactor-plan.md (Step 1).
+        thread_local SearchScratch scratch;
+
         auto search_timer = stats.startTimer();
         node_id_t currentEntryPoint = entry_point_;
         for (int l = max_layer_; l >= 1; --l) {
@@ -813,7 +819,7 @@ using namespace ROCKSDB_NAMESPACE;
 
         int ef = std::max(ef_search, k);
         std::vector<SearchResult> neighbors =
-            searchLayer(query, currentEntryPoint, ef, 0);
+            searchLayer(query, currentEntryPoint, ef, 0, scratch);
         if (neighbors.empty()) {
             return neighbors;
         }
@@ -851,6 +857,8 @@ using namespace ROCKSDB_NAMESPACE;
             return {};
         }
 
+        thread_local SearchScratch scratch;
+
         // Greedy descent through upper layers (filter-blind).
         node_id_t currentEntryPoint = entry_point_;
         for (int lvl = max_layer_; lvl > 0; --lvl) {
@@ -859,7 +867,7 @@ using namespace ROCKSDB_NAMESPACE;
 
         // Layer-0 filtered iterative expansion.
         return searchLayer(query, currentEntryPoint, ef_search, /*layer=*/0,
-                           pred, k, max_scan_candidates, meta_store);
+                           pred, k, max_scan_candidates, meta_store, scratch);
     }
 
     // Links neighbors for upper layers stored in memory
@@ -1367,7 +1375,8 @@ using namespace ROCKSDB_NAMESPACE;
     std::vector<SearchResult> LSMVec::searchLayer(const std::vector<float>& queryVector,
                                                   node_id_t entryPointId,
                                                   int efSearch,
-                                                  int layer)
+                                                  int layer,
+                                                  SearchScratch& scratch)
     {
         if (layer < 0) {
             LOG(ERR) << "Invalid layer for search";
@@ -1377,16 +1386,18 @@ using namespace ROCKSDB_NAMESPACE;
             return {};
         }
 
-        // Versioned visited map (reused across calls, zero allocation after warmup)
-        ++visited_version_;
-        if (visited_version_ == 0) {
-            visited_map_.clear();
-            visited_version_ = 1;
+        // Versioned visited map (reused across calls inside one scratch,
+        // zero allocation after warmup). Wraparound at uint32_t::max
+        // forces a one-time clear.
+        ++scratch.visited_version;
+        if (scratch.visited_version == 0) {
+            scratch.visited_map.clear();
+            scratch.visited_version = 1;
         }
         auto visitedInsert = [&](node_id_t id) -> bool {
-            auto [it, inserted] = visited_map_.emplace(id, visited_version_);
-            if (inserted || it->second != visited_version_) {
-                it->second = visited_version_;
+            auto [it, inserted] = scratch.visited_map.emplace(id, scratch.visited_version);
+            if (inserted || it->second != scratch.visited_version) {
+                it->second = scratch.visited_version;
                 return true;  // newly visited
             }
             return false;  // already visited
@@ -1501,15 +1512,15 @@ using namespace ROCKSDB_NAMESPACE;
                     }
 
                     if (!unvisitedIds.empty()) {
-                        batchReadBuf_.resize(unvisitedIds.size() * static_cast<size_t>(vector_dim_));
+                        scratch.batch_read_buf.resize(unvisitedIds.size() * static_cast<size_t>(vector_dim_));
                         vector_storage_->readVectorsBatchFlat(
-                            unvisitedIds, batchReadBuf_.data(),
+                            unvisitedIds, scratch.batch_read_buf.data(),
                             static_cast<size_t>(vector_dim_));
 
                         for (size_t i = 0; i < unvisitedIds.size(); ++i) {
                             float d = computeDistance(
                                 Span<const float>(queryVector),
-                                Span<const float>(batchReadBuf_.data() + i * static_cast<size_t>(vector_dim_),
+                                Span<const float>(scratch.batch_read_buf.data() + i * static_cast<size_t>(vector_dim_),
                                                   static_cast<size_t>(vector_dim_)));
                             if (static_cast<int>(nearest.size()) < efSearch || d < nearest.top().first) {
                                 candidates.emplace(-d, unvisitedIds[i]);
@@ -1568,13 +1579,14 @@ using namespace ROCKSDB_NAMESPACE;
         const metadata::Predicate* pred,
         int k,
         int max_scan_candidates,
-        const MetadataStore* meta_store) {
+        const MetadataStore* meta_store,
+        SearchScratch& scratch) {
 
         (void)efSearch;  // In filter mode, k + max_scan_candidates control termination.
 
         // No predicate → unfiltered path.
         if (pred == nullptr) {
-            return searchLayer(queryVector, entryPointId, efSearch, layer);
+            return searchLayer(queryVector, entryPointId, efSearch, layer, scratch);
         }
         // Filtered searchLayer is only supported on layer 0.
         assert(layer == 0 && "filtered searchLayer only supported on layer 0");
@@ -1587,15 +1599,15 @@ using namespace ROCKSDB_NAMESPACE;
         }
 
         // Bump visited version (same pattern as the unfiltered overload).
-        ++visited_version_;
-        if (visited_version_ == 0) {
-            visited_map_.clear();
-            visited_version_ = 1;
+        ++scratch.visited_version;
+        if (scratch.visited_version == 0) {
+            scratch.visited_map.clear();
+            scratch.visited_version = 1;
         }
         auto visitedInsert = [&](node_id_t id) -> bool {
-            auto [it, inserted] = visited_map_.emplace(id, visited_version_);
-            if (inserted || it->second != visited_version_) {
-                it->second = visited_version_;
+            auto [it, inserted] = scratch.visited_map.emplace(id, scratch.visited_version);
+            if (inserted || it->second != scratch.visited_version) {
+                it->second = scratch.visited_version;
                 return true;  // newly visited
             }
             return false;  // already visited
@@ -1860,6 +1872,7 @@ using namespace ROCKSDB_NAMESPACE;
     // Performs a greedy search to find the closest neighbor at a specific layer
     node_id_t LSMVec::knnSearch(const std::vector<float> &queryVector)
     {
+        thread_local SearchScratch scratch;
         auto search_timer = stats.startTimer();
         // W ← ∅ set for the current nearest elements
         std::vector<SearchResult> nearestNeighbors; // W: dynamic list of found nearest neighbors
@@ -1871,10 +1884,10 @@ using namespace ROCKSDB_NAMESPACE;
         for (int l = max_layer_; l >= 1; --l)
         {
             std::vector<SearchResult> nearestNeighbors =
-                searchLayer(queryVector, currentEntryPoint, 30, l);
+                searchLayer(queryVector, currentEntryPoint, 30, l, scratch);
             currentEntryPoint = nearestNeighbors[0].id;
         }
-        nearestNeighbors = searchLayer(queryVector, currentEntryPoint, 30, 0);
+        nearestNeighbors = searchLayer(queryVector, currentEntryPoint, 30, 0, scratch);
 
         stats.accumulateTime(search_timer, stats.search_time);
         stats.addCount(1, stats.search_count);

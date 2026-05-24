@@ -74,6 +74,22 @@ using namespace ROCKSDB_NAMESPACE;
         size_t hits_ = 0, misses_ = 0, evictions_ = 0, invalidations_ = 0;
     };
 
+    // Per-search scratch state. Previously these were members of LSMVec
+    // and reused across calls; that prevents two concurrent searches on
+    // the same index from running safely. The caller owns one instance
+    // (typically as a thread_local in the worker thread) and passes it
+    // into searchLayer.
+    //
+    // visited_version is uint32_t: at 1k searches/sec/thread, overflow
+    // happens roughly every 50 days; visited_map is cleared and version
+    // resets to 1 when that happens. With uint16_t the same wraparound
+    // would fire every 65 seconds.
+    struct SearchScratch {
+        std::vector<float> batch_read_buf;
+        std::unordered_map<node_id_t, uint32_t> visited_map;
+        uint32_t visited_version = 0;
+    };
+
     class LSMVec
     {
     public:
@@ -257,7 +273,8 @@ using namespace ROCKSDB_NAMESPACE;
         std::vector<SearchResult> searchLayer(const std::vector<float> &queryVector,
                                               node_id_t entryPointId,
                                               int efSearch,
-                                              int layer);
+                                              int layer,
+                                              SearchScratch& scratch);
         std::vector<SearchResult> searchLayer(const std::vector<float> &queryVector,
                                               node_id_t entryPointId,
                                               int efSearch,
@@ -265,7 +282,8 @@ using namespace ROCKSDB_NAMESPACE;
                                               const metadata::Predicate* pred,
                                               int k,
                                               int max_scan_candidates,
-                                              const class MetadataStore* meta_store);
+                                              const class MetadataStore* meta_store,
+                                              SearchScratch& scratch);
         node_id_t greedySearchUpperLayer(const std::vector<float>& query,
                                           node_id_t entryPoint, int layer);
         void linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer);
@@ -350,11 +368,13 @@ using namespace ROCKSDB_NAMESPACE;
 
         int section_layer_ = 1;
         bool enable_batch_read_ = true;
-        std::vector<float> batchReadBuf_;  // reusable flat buffer for batch reads
 
-        // Versioned visited map (reused across searchLayer calls, zero-alloc after warmup)
-        std::unordered_map<node_id_t, uint16_t> visited_map_;
-        uint16_t visited_version_ = 0;
+        // Per-search scratch (visited map, batch read buffer, version
+        // counter) used to live as members of LSMVec and was reused across
+        // calls. That made the search path racy under concurrent callers.
+        // Scratch now lives in SearchScratch (defined above the LSMVec
+        // class) and is passed by reference into searchLayer; callers own
+        // it (worker threads typically declare it as thread_local).
 
         // Edge LRU cache for L0 GetAllEdges
         std::unique_ptr<EdgeLRUCache> edge_cache_;
