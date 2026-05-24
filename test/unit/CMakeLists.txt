@@ -24,6 +24,12 @@ add_executable(lsmvec_unit_tests
     test_delete_persistence.cc
     test_delete_stress.cc
     test_concurrent_search.cc
+    # A1.7 Phase 0 torture tests (test_quiesce_backup.cc intentionally
+    # SKIPPED — pglsmvec-only; see the design docs §4.6).
+    test_recall_baseline.cc
+    test_concurrent_insert_torture.cc
+    test_concurrent_upsert_race.cc
+    test_insert_qps_baseline.cc
 )
 target_include_directories(lsmvec_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/doctest

@@ -13,6 +13,35 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wall -Wextra -O2")
 
+# Sanitizer build target — concurrent-writer-refactor-plan §6 Phase 0.
+# LSMVEC_SANITIZER=OFF | asan | tsan | ubsan
+# Use as: cmake -B build-tsan -DLSMVEC_SANITIZER=tsan
+# Implies -O1 -g and frame pointers; intended for the unit-test target only.
+# Aster (lib/aster) is built separately via its own Makefile and does NOT
+# pick up these flags — that's deliberate (Aster has known bad-free in its
+# write_stall_stats static initializer that ASan/TSan flags as a false
+# positive on the prebuilt static archive; see test_concurrent_search.cc
+# header note).
+set(LSMVEC_SANITIZER "OFF" CACHE STRING "Enable a sanitizer build: OFF|asan|tsan|ubsan")
+set_property(CACHE LSMVEC_SANITIZER PROPERTY STRINGS OFF asan tsan ubsan)
+if(NOT LSMVEC_SANITIZER STREQUAL "OFF")
+    set(_lsmvec_san_flags "-fno-omit-frame-pointer -g -O1")
+    if(LSMVEC_SANITIZER STREQUAL "asan")
+        set(_lsmvec_san_flags "${_lsmvec_san_flags} -fsanitize=address")
+    elseif(LSMVEC_SANITIZER STREQUAL "tsan")
+        set(_lsmvec_san_flags "${_lsmvec_san_flags} -fsanitize=thread")
+    elseif(LSMVEC_SANITIZER STREQUAL "ubsan")
+        set(_lsmvec_san_flags "${_lsmvec_san_flags} -fsanitize=undefined")
+    else()
+        message(FATAL_ERROR "LSMVEC_SANITIZER must be one of OFF|asan|tsan|ubsan, got: ${LSMVEC_SANITIZER}")
+    endif()
+    message(STATUS "Sanitizer enabled: ${LSMVEC_SANITIZER} (${_lsmvec_san_flags})")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${_lsmvec_san_flags}")
+    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} ${_lsmvec_san_flags}")
+    set(CMAKE_EXE_LINKER_FLAGS    "${CMAKE_EXE_LINKER_FLAGS} ${_lsmvec_san_flags}")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${_lsmvec_san_flags}")
+endif()
+
 # SIMD flags: AVX2/FMA on x86_64 only (ARM uses scalar fallback in distance.h)
 include(CheckCXXCompilerFlag)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
