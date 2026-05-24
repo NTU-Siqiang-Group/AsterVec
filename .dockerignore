@@ -1,0 +1,65 @@
+# Keep the build context lean and reproducible.
+#
+# IMPORTANT: .git is excluded by design. The Dockerfile cannot run
+# `git submodule update` (no .git inside the container), so we require
+# lib/aster/ to be pre-populated on the host. See the build helper.
+
+# Local build dirs — never ship build artefacts
+build/
+build_*/
+build-*/
+
+# Aster (RocksDB fork) build artefacts on the host. These contain .d
+# files with absolute paths (e.g. /usr/local/include on macOS) that
+# would mismatch inside the linux container and break `make aster`.
+# The container does its own clean build.
+lib/aster/**/*.o
+lib/aster/**/*.d
+lib/aster/**/*.a
+lib/aster/**/*.so
+lib/aster/**/*.dylib
+
+# Bench / dataset artefacts
+data/sift*
+data/*.fvecs
+data/*.ivecs
+data/*.tar.gz
+data/sift/
+run/
+output.txt
+
+# Editor / OS junk
+.DS_Store
+.cache/
+.claude/
+.vscode/
+.idea/
+
+# Git internals — submodule init must happen on the host
+.git/
+.gitignore
+.gitmodules
+
+# Local notes / scratch
+DEBUG_REPORT.md
+HEAP_CORRUPTION_REPORT.md
+PHASE1_COMPILER_FLAGS.md
+debug_malloc.log
+CLAUDE.md
+
+# Docs are not needed in the runtime image and would bloat context
+docs/
+
+# Python venvs / wheels
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
+
+# Pre-built static libs lying around
+lib/liblsmvec.a
+libmalloc_shim.*
+malloc_shim.*
+
+# Test binary scratch
+test/lsm_vec_test
