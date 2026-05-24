@@ -404,9 +404,17 @@ private:
     std::unordered_map<node_id_t,int> sectionKeyToIdx_;
     std::vector<node_id_t>            sectionIdxToKey_;
 
-    // For each sectionIdx, list of pages that still have free slots
-    std::unordered_map<int,std::vector<size_t>> sectionOpenPages_;
-    std::unordered_map<int,std::vector<std::pair<size_t,uint16_t>>> sectionFreeSlots_;
+    // Per-section bookkeeping (pages with free slots, free slots
+    // within each page) lives INSIDE each shard struct below. An
+    // earlier design had two top-level
+    // std::unordered_map<int, ...> shared across all shards, which
+    // was unsafe: the per-shard mutex only serialises same-sectionIdx
+    // access, but concurrent operator[] for different sectionIdx
+    // races on the underlying bucket structure (rehash, new-key
+    // insertion, chain head pointer update). That race caused engine
+    // crashes and parallel-build deadlocks under high write
+    // concurrency. Per-shard maps make the per-shard mutex sufficient
+    // — no cross-shard structural sharing.
 
     // C6: sparse map for update-allocated internal_ids (bit 63 = 1).
     // Direct ids (bit 63 = 0) continue to use the dense idToPage_ /
@@ -426,7 +434,20 @@ private:
     // See the file-header thread-safety contract above.
     // -------------------------------------------------------------
     static constexpr size_t kNumSectionShards = 64;
-    mutable std::array<std::mutex, kNumSectionShards> sectionShards_;
+
+    /*
+     * Per-shard state: each shard owns its own mutex AND its own
+     * (openPages, freeSlots) maps. Structural fix for the race noted
+     * above — `operator[]` mutations on the maps now happen only
+     * under THIS shard's mutex, never racing with other shards'
+     * threads.
+     */
+    struct SectionShard {
+        mutable std::mutex                                              mu;
+        std::unordered_map<int, std::vector<size_t>>                    openPages;
+        std::unordered_map<int, std::vector<std::pair<size_t,uint16_t>>> freeSlots;
+    };
+    mutable std::array<SectionShard, kNumSectionShards> sectionShards_;
     // Phase 5 (concurrent-writer-refactor-plan §5.3 / §5.4): upgraded
     // from std::mutex to std::shared_mutex so reads of the dense
     // location arrays (page_of / slot_of) take shared, while writes
@@ -440,9 +461,12 @@ private:
     mutable std::mutex                                section_index_mu_;
     mutable std::mutex                                update_loc_mu_;
 
-    std::mutex& section_shard(int sectionIdx) const {
+    SectionShard& section_shard_state(int sectionIdx) const {
         return sectionShards_[
             static_cast<size_t>(sectionIdx) % kNumSectionShards];
+    }
+    std::mutex& section_shard(int sectionIdx) const {
+        return section_shard_state(sectionIdx).mu;
     }
 
     // ----- Location dispatch helpers (V1, see DELETE_DESIGN.md §0.3) -----
@@ -1092,18 +1116,21 @@ private:
         }
 
         // Phase A: try free-slot or open-page reuse under the section
-        // shard mutex.
+        // shard mutex. The shard owns its own maps, so all map
+        // mutations (operator[] inserts a new sectionIdx entry,
+        // potential rehash) happen under this single mutex.
         {
-            std::lock_guard<std::mutex> g(section_shard(sectionIdx));
+            SectionShard& shard = section_shard_state(sectionIdx);
+            std::lock_guard<std::mutex> g(shard.mu);
 
-            auto& freeList = sectionFreeSlots_[sectionIdx];
+            auto& freeList = shard.freeSlots[sectionIdx];
             if (!freeList.empty()) {
                 auto [pageId, slot] = freeList.back();
                 freeList.pop_back();
                 return {pageId, slot};
             }
 
-            auto& openList = sectionOpenPages_[sectionIdx];
+            auto& openList = shard.openPages[sectionIdx];
             if (!openList.empty()) {
                 size_t pageId = openList.back();
                 openList.pop_back();
@@ -1135,11 +1162,13 @@ private:
             ensurePageAllocated(newPageId);
         }
 
-        // Publish the new page into sectionOpenPages_ if it has more
-        // slots; this re-enters the section shard.
+        // Publish the new page into the per-shard openPages map.
+        // The section shard mutex protects the map's structure
+        // (since it lives inside the shard struct).
         if (vectorsPerPage_ > 1) {
-            std::lock_guard<std::mutex> g(section_shard(sectionIdx));
-            sectionOpenPages_[sectionIdx].push_back(newPageId);
+            SectionShard& shard = section_shard_state(sectionIdx);
+            std::lock_guard<std::mutex> g(shard.mu);
+            shard.openPages[sectionIdx].push_back(newPageId);
         }
 
         return {newPageId, /*slot=*/0};
@@ -1648,8 +1677,11 @@ public:
             sectionKeyToIdx_[sectionIdxToKey_[idx]] = static_cast<int>(idx);
         }
 
-        sectionOpenPages_.clear();
-        sectionFreeSlots_.clear();
+        for (auto& s : sectionShards_) {
+            std::lock_guard<std::mutex> g(s.mu);
+            s.openPages.clear();
+            s.freeSlots.clear();
+        }
 
         std::vector<std::vector<uint8_t>> usedSlots;
         usedSlots.resize(pages_.size());
@@ -1680,10 +1712,12 @@ public:
             if (meta.sectionIdx < 0) {
                 continue;
             }
+            SectionShard& shard = section_shard_state(meta.sectionIdx);
+            std::lock_guard<std::mutex> g(shard.mu);
             if (static_cast<size_t>(meta.usedSlots) < vectorsPerPage_) {
-                sectionOpenPages_[meta.sectionIdx].push_back(pageId);
+                shard.openPages[meta.sectionIdx].push_back(pageId);
             }
-            auto& freeList = sectionFreeSlots_[meta.sectionIdx];
+            auto& freeList = shard.freeSlots[meta.sectionIdx];
             for (size_t slot = 0; slot < meta.usedSlots; ++slot) {
                 if (slot < usedSlots[pageId].size() && usedSlots[pageId][slot] == 0) {
                     freeList.emplace_back(pageId, static_cast<uint16_t>(slot));
