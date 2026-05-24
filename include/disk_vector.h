@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -428,10 +431,19 @@ private:
         // update ids: no-op (LSMVec owns the canonical tombstone state)
     }
 
-    // Page cache (FIFO) in units of full pages (4KB each)
+    // Page cache (FIFO) in units of full pages (4KB each).
+    //
+    // Concurrency: pageCache_ + pageOrder_ are protected by page_mu_,
+    // a shared_mutex. Read paths take shared_lock for lookups; insertions
+    // and evictions take unique_lock. Disk I/O (pread) is performed
+    // outside any lock — concurrent readers may pread the same page on
+    // miss, but only one wins the insertion (double-check after taking
+    // unique_lock). Writers from the LSMVec write path are protected by
+    // the external per-index RWLock, so they cannot race with readers
+    // here.
     size_t maxCachedPages_;
-    size_t pageCacheHits_ = 0;
-    size_t pageCacheMisses_ = 0;
+    std::atomic<size_t> pageCacheHits_{0};
+    std::atomic<size_t> pageCacheMisses_{0};
 
     struct PageBuf {
         std::vector<char> data; // always kPageSize bytes
@@ -439,16 +451,20 @@ private:
 
     std::unordered_map<size_t, PageBuf> pageCache_; // pageId -> data
     std::deque<size_t>                  pageOrder_; // FIFO order of pageIds
+    mutable std::shared_mutex           page_mu_;
 
     int readFd_ = -1;  // file descriptor for pread-based I/O
 
-    // Scratch buffers for readVectorsBatchFlat (avoid per-call allocations)
+    // Scratch buffers for readVectorsBatchFlat. These were class-level
+    // fields reused across calls; that prevented concurrent reads on
+    // the same instance from being safe. Now declared as thread_local
+    // inside readVectorsBatchFlat (see implementation), one instance per
+    // worker thread, capacity warmed across calls within a thread.
     struct MissEntry { size_t idx; size_t pageId; uint16_t slot; };
-    std::vector<MissEntry> missScratch_;
-    std::vector<size_t> uniquePageScratch_;
 
-    // Reusable temp buffer for SQ8 record I/O
-    mutable std::vector<char> sq8TempBuf_;
+    // sq8TempBuf_ removed: directReadRecord and writeRecord allocate a
+    // small stack-local buffer per call (recordSize_ ≈ dim+8 bytes, sub-µs
+    // alloc).
 
     // Section write buffer: per-section 4KB buffer for coalesced writes via pwrite
     struct SectionWriteBuf {
@@ -608,12 +624,16 @@ private:
     }
 
     // Flush one section write buffer to disk via pwrite (one 4KB aligned write).
+    // Write-path; called under the external per-index exclusive lock, so
+    // no readers are concurrent. The unique_lock here is defence-in-depth
+    // for the page cache structure itself.
     void flushSectionWriteBuf(SectionWriteBuf& swb) {
         off_t offset = static_cast<off_t>(swb.pageId * kPageSize);
         if (writeFd_ >= 0) {
             ::pwrite(writeFd_, swb.data.data(), kPageSize, offset);
         }
         // Update read cache if page is cached
+        std::unique_lock<std::shared_mutex> lk(page_mu_);
         auto cit = pageCache_.find(swb.pageId);
         if (cit != pageCache_.end()) {
             std::memcpy(cit->second.data.data(), swb.data.data(), kPageSize);
@@ -690,8 +710,11 @@ private:
         return true;
     }
 
-    // Evict pages if cache size exceeds the limit (FIFO).
-    void evictIfNeeded() {
+    // Evict pages if cache size exceeds the limit (FIFO). Caller must
+    // ensure the cache mutex is appropriately held; this is called from
+    // setMaxCachedPages and from inside loadPageToCache (which already
+    // holds the unique lock).
+    void evictIfNeeded_locked() {
         if (maxCachedPages_ == 0) return;
         while (pageCache_.size() > maxCachedPages_) {
             size_t victim = pageOrder_.front();
@@ -701,47 +724,80 @@ private:
     }
 
     // Load a full 4KB page into the cache.
-    // 20260516_page_buf_recycle: on eviction, recycle the victim's 4 KB
-    // PageBuf allocation via unordered_map::extract (C++17 node_handle)
-    // instead of erase + new alloc. Saves the malloc/free round-trip on
-    // every miss past warmup.
+    //
+    // Concurrency (A1.4 — port of f8110f0, merged with our page_buf_recycle):
+    // disk I/O runs WITHOUT page_mu_ held, so concurrent misses on
+    // different pages parallelize. Cache lookup, eviction, and insert
+    // run under unique page_mu_. Double-checked locking handles the
+    // rare race where another thread loaded the same page while we
+    // were preading: we drop our buffer.
+    //
+    // 20260516_page_buf_recycle: when the cache is full, extract the
+    // victim's node_handle (C++17) and reuse its 4 KB PageBuf
+    // allocation instead of erase + new alloc. Saves the malloc/free
+    // round-trip on every miss past warmup.
+    //
+    // Short-read uniformity: pread returning 0, -1, or partial count
+    // is handled the same way — `got` is clamped to [0, kPageSize] and
+    // the tail is memset to zero so callers see well-defined bytes.
+    //
+    // TODO(A1.8/A1.16): once per-section mutexes land, overlayWriteBuf
+    // must take section_mu_[section] in shared mode BEFORE re-acquiring
+    // page_mu_ to avoid the section→cache lock-order deadlock risk
+    // documented in the design docs §0 / internal review. At this
+    // step in the port the section state is still guarded by the
+    // external per-index lock, so the simple ordering is safe.
     void loadPageToCache(size_t pageId) {
         if (maxCachedPages_ == 0) return;             // caching disabled
-        if (pageCache_.find(pageId) != pageCache_.end()) return; // already cached
+
+        // (1) Fast check under shared lock.
+        {
+            std::shared_lock<std::shared_mutex> lk(page_mu_);
+            if (pageCache_.find(pageId) != pageCache_.end()) return;
+        }
+
+        // (2) pread WITHOUT cache lock — multiple thread misses parallelize.
+        PageBuf buf;
+        buf.data.resize(kPageSize, 0);
 
         size_t offset = pageId * kPageSize;
-
-        // Helper: read a full page into `dst`. Zero-fill any short tail
-        // (near EOF, or pread error) so callers (tryReadFromCache,
-        // dequantize, etc.) always see well-defined bytes. Uniform handling
-        // of n < 0, n == 0, and 0 < n < kPageSize.
         auto fill_buf = [&](char* dst) {
             ssize_t n = 0;
             if (readFd_ >= 0) {
                 n = ::pread(readFd_, dst, kPageSize, static_cast<off_t>(offset));
             } else {
+                // Fallback fileStream_ is not thread-safe; in practice
+                // readFd_ is always set. Guard with the cache mutex on
+                // the slow path so we don't crash if it isn't.
+                std::unique_lock<std::shared_mutex> lk(page_mu_);
                 fileStream_.clear();
                 fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
                 fileStream_.read(dst, static_cast<std::streamsize>(kPageSize));
                 n = static_cast<ssize_t>(fileStream_.gcount());
             }
             size_t got = (n > 0) ? static_cast<size_t>(n) : 0;
-            if (got < kPageSize) {
-                std::memset(dst + got, 0, kPageSize - got);
-            }
+            if (got < kPageSize) std::memset(dst + got, 0, kPageSize - got);
         };
+        fill_buf(buf.data.data());
+
+        // overlayWriteBuf reads sectionWriteBufs_. At this step in the
+        // port, writes still hold the external per-index exclusive lock
+        // so the read is safe; A1.8 will introduce section_mu_ and A1.16
+        // will tighten the ordering.
+        overlayWriteBuf(pageId, buf);
+
+        // (3) Re-acquire unique; re-check, then recycle or insert.
+        std::unique_lock<std::shared_mutex> lk(page_mu_);
+        if (pageCache_.find(pageId) != pageCache_.end()) return;   // raced
 
         if (pageCache_.size() >= maxCachedPages_) {
-            // Recycle: extract the victim's node_handle so its 4 KB
-            // allocation survives. Refill, re-key, re-insert.
+            // 20260516_page_buf_recycle: extract victim node_handle to
+            // reuse its 4 KB allocation. Move our fresh buf into it.
             size_t victim = pageOrder_.front();
             pageOrder_.pop_front();
             auto node = pageCache_.extract(victim);
             if (!node.empty()) {
-                PageBuf& buf = node.mapped();
-                if (buf.data.size() != kPageSize) buf.data.resize(kPageSize);
-                fill_buf(buf.data.data());
-                overlayWriteBuf(pageId, buf);
+                node.mapped() = std::move(buf);
                 node.key() = pageId;
                 pageCache_.insert(std::move(node));
                 pageOrder_.push_back(pageId);
@@ -750,18 +806,17 @@ private:
             // Fallthrough if extract failed (shouldn't happen — pageOrder_
             // is the canonical source of victim ids).
         }
-
-        PageBuf buf;
-        buf.data.resize(kPageSize, 0);
-        fill_buf(buf.data.data());
-        overlayWriteBuf(pageId, buf);
         pageCache_.emplace(pageId, std::move(buf));
         pageOrder_.push_back(pageId);
     }
 
     // Try to read a vector from cache by pageId & slot. Dequantizes SQ8 → float32.
+    // Takes shared lock for the cache lookup; copy/dequantize happens
+    // while holding the lock so the cached buffer cannot be evicted from
+    // under us.
     bool tryReadFromCache(size_t pageId, uint16_t slot, std::vector<float>& vec) {
         if (maxCachedPages_ == 0) return false;
+        std::shared_lock<std::shared_mutex> lk(page_mu_);
         auto it = pageCache_.find(pageId);
         if (it == pageCache_.end()) return false;
 
@@ -779,31 +834,30 @@ private:
     void directReadRecord(size_t pageId, uint16_t slot, float* out) {
         // Check write buffer first
         if (tryReadFromWriteBufFlat(pageId, slot, out, dim_)) return;
-        sq8TempBuf_.resize(recordSize_);
+        std::vector<char> tmp(recordSize_);
         size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
         if (readFd_ >= 0) {
-            ::pread(readFd_, sq8TempBuf_.data(), recordSize_, static_cast<off_t>(offset));
+            ::pread(readFd_, tmp.data(), recordSize_, static_cast<off_t>(offset));
         } else {
             fileStream_.clear();
             fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-            fileStream_.read(sq8TempBuf_.data(),
-                             static_cast<std::streamsize>(recordSize_));
+            fileStream_.read(tmp.data(), static_cast<std::streamsize>(recordSize_));
         }
-        dequantize(sq8TempBuf_.data(), out, dim_);
+        dequantize(tmp.data(), out, dim_);
     }
 
     // Write a single record (one vector) at (pageId, slot) to disk. Quantizes to SQ8.
+    // Write-path; called under the external per-index exclusive lock.
     void writeRecord(size_t pageId, uint16_t slot, const std::vector<float>& vec) {
         if (vec.size() != dim_) {
             throw std::runtime_error("Vector size mismatch in writeRecord.");
         }
-        sq8TempBuf_.resize(recordSize_);
-        quantize(vec.data(), dim_, sq8TempBuf_.data());
+        std::vector<char> tmp(recordSize_);
+        quantize(vec.data(), dim_, tmp.data());
         size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
         fileStream_.clear();
         fileStream_.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
-        fileStream_.write(sq8TempBuf_.data(),
-                          static_cast<std::streamsize>(recordSize_));
+        fileStream_.write(tmp.data(), static_cast<std::streamsize>(recordSize_));
         if (!fileStream_.good()) {
             throw std::runtime_error("Failed to write vector to file.");
         }
@@ -811,8 +865,12 @@ private:
     }
 
     // If the page is cached, update the cached copy after a write (stores quantized SQ8).
+    // Write-path; called under the external per-index exclusive lock.
+    // Takes unique_lock as defence-in-depth against future relaxation of
+    // the contract.
     void updateCacheAfterWrite(size_t pageId, uint16_t slot, const std::vector<float>& vec) {
         if (maxCachedPages_ == 0) return;
+        std::unique_lock<std::shared_mutex> lk(page_mu_);
         auto it = pageCache_.find(pageId);
         if (it == pageCache_.end()) return;
 
@@ -909,7 +967,6 @@ public:
 
         idToPage_.assign(totalVectors_, -1);
         idToSlotInPage_.assign(totalVectors_, 0);
-        sq8TempBuf_.resize(recordSize_);
     }
 
     ~PagedVectorStorage() {
@@ -929,8 +986,9 @@ public:
     size_t vectorsPerPage() const { return vectorsPerPage_; }
 
     void setMaxCachedPages(size_t m) {
+        std::unique_lock<std::shared_mutex> lk(page_mu_);
         maxCachedPages_ = m;
-        evictIfNeeded();
+        evictIfNeeded_locked();
     }
 
     // Flush all remaining section write buffers (partially filled pages).
@@ -1005,10 +1063,10 @@ public:
         // 1) Try page cache
         if (maxCachedPages_ > 0) {
             if (tryReadFromCache(pageId, slot, vec)) {
-                ++pageCacheHits_;
+                pageCacheHits_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
-            ++pageCacheMisses_;
+            pageCacheMisses_.fetch_add(1, std::memory_order_relaxed);
         }
 
         // 2) If not cached, optionally cache the page then try again
@@ -1021,16 +1079,15 @@ public:
 
         // 3) Fallback: direct disk read of this record + dequantize
         if (vec.size() != dim_) vec.resize(dim_);
-        sq8TempBuf_.resize(recordSize_);
+        std::vector<char> tmp(recordSize_);
         size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
         fileStream_.clear();
         fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-        fileStream_.read(sq8TempBuf_.data(),
-                         static_cast<std::streamsize>(recordSize_));
+        fileStream_.read(tmp.data(), static_cast<std::streamsize>(recordSize_));
         if (!fileStream_.good()) {
             throw std::runtime_error("Failed to read vector from file.");
         }
-        dequantize(sq8TempBuf_.data(), vec.data(), dim_);
+        dequantize(tmp.data(), vec.data(), dim_);
     }
 
     void deleteVector(node_id_t id) override
@@ -1099,75 +1156,98 @@ public:
     }
 
     // Flat-buffer two-pass batch read: avoids per-call map construction
-    // and per-vector heap allocations.
+    // and per-vector heap allocations. The scratch vectors are
+    // thread_local — capacity stays warm across calls within one worker
+    // thread, but each thread has its own copy so two readers don't
+    // collide on the buffer.
     void readVectorsBatchFlat(const std::vector<node_id_t>& ids,
                               float* out, size_t dim) override {
-        missScratch_.clear();
+        thread_local std::vector<MissEntry> miss_scratch;
+        thread_local std::vector<size_t>    unique_page_scratch;
+        miss_scratch.clear();
 
         // Pass 1: serve cache hits directly, collect misses
-        for (size_t i = 0; i < ids.size(); ++i) {
-            node_id_t id = ids[i];
-            int64_t page = page_of(id);
-            if (page < 0) {
-                throw std::runtime_error("Vector slot not assigned in batch flat read.");
-            }
-            size_t pageId = static_cast<size_t>(page);
-            uint16_t slot = slot_of(id);
+        {
+            std::shared_lock<std::shared_mutex> lk(page_mu_);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                node_id_t id = ids[i];
+                int64_t page = page_of(id);
+                if (page < 0) {
+                    throw std::runtime_error("Vector slot not assigned in batch flat read.");
+                }
+                size_t pageId = static_cast<size_t>(page);
+                uint16_t slot = slot_of(id);
 
-            // Try write buffer first (unflushed data)
-            if (tryReadFromWriteBufFlat(pageId, slot, out + i * dim, dim_)) {
-                continue;
-            }
-            // Try cache hit — dequantize SQ8 → float
-            if (maxCachedPages_ > 0) {
-                auto cit = pageCache_.find(pageId);
-                if (cit != pageCache_.end()) {
-                    size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
-                    dequantize(cit->second.data.data() + offsetInPage, out + i * dim, dim_);
-                    ++pageCacheHits_;
+                // Try write buffer first (unflushed data). This reads
+                // sectionWriteBufs_ which is protected by the external
+                // exclusive lock, so we are safe.
+                if (tryReadFromWriteBufFlat(pageId, slot, out + i * dim, dim_)) {
                     continue;
                 }
+                // Try cache hit — dequantize SQ8 → float, while still
+                // holding the shared lock so the buffer can't be evicted.
+                if (maxCachedPages_ > 0) {
+                    auto cit = pageCache_.find(pageId);
+                    if (cit != pageCache_.end()) {
+                        size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
+                        dequantize(cit->second.data.data() + offsetInPage,
+                                   out + i * dim, dim_);
+                        pageCacheHits_.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                }
+                pageCacheMisses_.fetch_add(1, std::memory_order_relaxed);
+                miss_scratch.push_back({i, pageId, slot});
             }
-            ++pageCacheMisses_;
-            missScratch_.push_back({i, pageId, slot});
         }
 
-        if (missScratch_.empty()) return; // fast path: all cached
+        if (miss_scratch.empty()) return; // fast path: all cached
 
         // Pass 2: sort misses by pageId, load unique pages, then copy
-        std::sort(missScratch_.begin(), missScratch_.end(),
+        std::sort(miss_scratch.begin(), miss_scratch.end(),
                   [](const MissEntry& a, const MissEntry& b) {
                       return a.pageId < b.pageId;
                   });
 
-        // Deduplicate pages and load them
-        uniquePageScratch_.clear();
-        for (size_t j = 0; j < missScratch_.size(); ++j) {
-            if (j == 0 || missScratch_[j].pageId != missScratch_[j - 1].pageId) {
-                uniquePageScratch_.push_back(missScratch_[j].pageId);
+        // Deduplicate pages and load them. loadPageToCache handles its
+        // own locking (double-check + unique_lock for insertion).
+        unique_page_scratch.clear();
+        for (size_t j = 0; j < miss_scratch.size(); ++j) {
+            if (j == 0 || miss_scratch[j].pageId != miss_scratch[j - 1].pageId) {
+                unique_page_scratch.push_back(miss_scratch[j].pageId);
             }
         }
 
-        for (size_t pageId : uniquePageScratch_) {
+        for (size_t pageId : unique_page_scratch) {
             loadPageToCache(pageId);
         }
 
-        // Dequantize from now-cached pages (or direct read as fallback)
-        for (const auto& miss : missScratch_) {
-            auto cit = pageCache_.find(miss.pageId);
-            if (cit != pageCache_.end()) {
-                size_t offsetInPage = static_cast<size_t>(miss.slot) * recordSize_;
-                dequantize(cit->second.data.data() + offsetInPage,
-                           out + miss.idx * dim, dim_);
-            } else {
-                // Cache full, page was evicted — direct read
-                directReadRecord(miss.pageId, miss.slot, out + miss.idx * dim);
+        // Dequantize from now-cached pages (or direct read as fallback).
+        // Take shared lock once for the whole batch.
+        {
+            std::shared_lock<std::shared_mutex> lk(page_mu_);
+            for (const auto& miss : miss_scratch) {
+                auto cit = pageCache_.find(miss.pageId);
+                if (cit != pageCache_.end()) {
+                    size_t offsetInPage = static_cast<size_t>(miss.slot) * recordSize_;
+                    dequantize(cit->second.data.data() + offsetInPage,
+                               out + miss.idx * dim, dim_);
+                } else {
+                    // Cache full, page was evicted — direct read.
+                    // directReadRecord does its own I/O without the page
+                    // cache lock; safe to call while holding shared lock
+                    // (it doesn't touch pageCache_ state).
+                    directReadRecord(miss.pageId, miss.slot,
+                                     out + miss.idx * dim);
+                }
             }
         }
     }
 
     PageCacheStats getPageCacheStats() const override {
-        return PageCacheStats{pageCacheHits_, pageCacheMisses_};
+        return PageCacheStats{
+            pageCacheHits_.load(std::memory_order_relaxed),
+            pageCacheMisses_.load(std::memory_order_relaxed)};
     }
 
     bool serializeMetadata(std::ostream& out) const {
@@ -1397,10 +1477,13 @@ public:
         }
 
         reloadDeleteFlags(totalVectors_);
-        pageCache_.clear();
-        pageOrder_.clear();
-        pageCacheHits_ = 0;
-        pageCacheMisses_ = 0;
+        {
+            std::unique_lock<std::shared_mutex> lk(page_mu_);
+            pageCache_.clear();
+            pageOrder_.clear();
+        }
+        pageCacheHits_.store(0, std::memory_order_relaxed);
+        pageCacheMisses_.store(0, std::memory_order_relaxed);
 
         return static_cast<bool>(in);
     }
