@@ -701,31 +701,60 @@ private:
     }
 
     // Load a full 4KB page into the cache.
+    // 20260516_page_buf_recycle: on eviction, recycle the victim's 4 KB
+    // PageBuf allocation via unordered_map::extract (C++17 node_handle)
+    // instead of erase + new alloc. Saves the malloc/free round-trip on
+    // every miss past warmup.
     void loadPageToCache(size_t pageId) {
         if (maxCachedPages_ == 0) return;             // caching disabled
         if (pageCache_.find(pageId) != pageCache_.end()) return; // already cached
 
-        // FIFO eviction
+        size_t offset = pageId * kPageSize;
+
+        // Helper: read a full page into `dst`. Zero-fill any short tail
+        // (near EOF, or pread error) so callers (tryReadFromCache,
+        // dequantize, etc.) always see well-defined bytes. Uniform handling
+        // of n < 0, n == 0, and 0 < n < kPageSize.
+        auto fill_buf = [&](char* dst) {
+            ssize_t n = 0;
+            if (readFd_ >= 0) {
+                n = ::pread(readFd_, dst, kPageSize, static_cast<off_t>(offset));
+            } else {
+                fileStream_.clear();
+                fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+                fileStream_.read(dst, static_cast<std::streamsize>(kPageSize));
+                n = static_cast<ssize_t>(fileStream_.gcount());
+            }
+            size_t got = (n > 0) ? static_cast<size_t>(n) : 0;
+            if (got < kPageSize) {
+                std::memset(dst + got, 0, kPageSize - got);
+            }
+        };
+
         if (pageCache_.size() >= maxCachedPages_) {
+            // Recycle: extract the victim's node_handle so its 4 KB
+            // allocation survives. Refill, re-key, re-insert.
             size_t victim = pageOrder_.front();
             pageOrder_.pop_front();
-            pageCache_.erase(victim);
+            auto node = pageCache_.extract(victim);
+            if (!node.empty()) {
+                PageBuf& buf = node.mapped();
+                if (buf.data.size() != kPageSize) buf.data.resize(kPageSize);
+                fill_buf(buf.data.data());
+                overlayWriteBuf(pageId, buf);
+                node.key() = pageId;
+                pageCache_.insert(std::move(node));
+                pageOrder_.push_back(pageId);
+                return;
+            }
+            // Fallthrough if extract failed (shouldn't happen — pageOrder_
+            // is the canonical source of victim ids).
         }
 
         PageBuf buf;
         buf.data.resize(kPageSize, 0);
-
-        size_t offset = pageId * kPageSize;
-        if (readFd_ >= 0) {
-            ::pread(readFd_, buf.data.data(), kPageSize, static_cast<off_t>(offset));
-        } else {
-            fileStream_.clear();
-            fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-            fileStream_.read(buf.data.data(), static_cast<std::streamsize>(kPageSize));
-        }
-        // If the read is short (near EOF), remaining bytes stay zero.
+        fill_buf(buf.data.data());
         overlayWriteBuf(pageId, buf);
-
         pageCache_.emplace(pageId, std::move(buf));
         pageOrder_.push_back(pageId);
     }
