@@ -910,8 +910,8 @@ using namespace ROCKSDB_NAMESPACE;
 
     std::vector<node_id_t> LSMVec::getEdgesCached(node_id_t id) {
         if (edge_cache_) {
-            auto* cached = edge_cache_->get(id);
-            if (cached) return *cached;
+            std::vector<node_id_t> cached;
+            if (edge_cache_->get(id, &cached)) return cached;
         }
 
         rocksdb::Edges edges;

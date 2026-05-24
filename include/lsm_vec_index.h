@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -23,19 +25,43 @@ namespace lsm_vec
 {
 using namespace ROCKSDB_NAMESPACE;
 
+    // Thread-safe LRU cache for L0 edge lists.
+    //
+    // The previous implementation returned `const std::vector<node_id_t>*`
+    // from get() and trusted callers to read it before any concurrent
+    // put/erase/eviction could invalidate the underlying storage. Under
+    // multi-threaded search the pointer is unsafe — once the lock is
+    // released, another thread can evict the entry and free its vector,
+    // turning the caller's deref into a use-after-free.
+    //
+    // The new API copies the neighbour list into a caller-owned vector
+    // while still holding the lock. The copy is unavoidable for safety;
+    // the cost (one heap allocation, ~M*8 bytes for an M-degree node) is
+    // dominated by the actual graph traversal work.
+    //
+    // Counters are atomic so the read-only accessors remain lock-free.
     class EdgeLRUCache {
     public:
         explicit EdgeLRUCache(size_t capacity) : capacity_(capacity) {}
 
-        const std::vector<node_id_t>* get(node_id_t id) {
+        // Returns true and writes the cached neighbour list into *out
+        // when present. Returns false on miss; *out is unchanged in
+        // that case. Copy of the cached value happens under the lock.
+        bool get(node_id_t id, std::vector<node_id_t>* out) {
+            std::lock_guard<std::mutex> lock(mu_);
             auto it = map_.find(id);
-            if (it == map_.end()) { ++misses_; return nullptr; }
-            ++hits_;
+            if (it == map_.end()) {
+                misses_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            hits_.fetch_add(1, std::memory_order_relaxed);
             lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
-            return &it->second->second;
+            *out = it->second->second;     // copy under the lock
+            return true;
         }
 
         void put(node_id_t id, std::vector<node_id_t> neighbors) {
+            std::lock_guard<std::mutex> lock(mu_);
             auto it = map_.find(id);
             if (it != map_.end()) {
                 it->second->second = std::move(neighbors);
@@ -46,24 +72,25 @@ using namespace ROCKSDB_NAMESPACE;
                 auto& back = lru_list_.back();
                 map_.erase(back.first);
                 lru_list_.pop_back();
-                ++evictions_;
+                evictions_.fetch_add(1, std::memory_order_relaxed);
             }
             lru_list_.emplace_front(id, std::move(neighbors));
             map_[id] = lru_list_.begin();
         }
 
         void erase(node_id_t id) {
+            std::lock_guard<std::mutex> lock(mu_);
             auto it = map_.find(id);
             if (it == map_.end()) return;
             lru_list_.erase(it->second);
             map_.erase(it);
-            ++invalidations_;
+            invalidations_.fetch_add(1, std::memory_order_relaxed);
         }
 
-        size_t hits() const { return hits_; }
-        size_t misses() const { return misses_; }
-        size_t evictions() const { return evictions_; }
-        size_t invalidations() const { return invalidations_; }
+        size_t hits() const { return hits_.load(std::memory_order_relaxed); }
+        size_t misses() const { return misses_.load(std::memory_order_relaxed); }
+        size_t evictions() const { return evictions_.load(std::memory_order_relaxed); }
+        size_t invalidations() const { return invalidations_.load(std::memory_order_relaxed); }
         size_t capacity() const { return capacity_; }
 
     private:
@@ -71,7 +98,11 @@ using namespace ROCKSDB_NAMESPACE;
         using Entry = std::pair<node_id_t, std::vector<node_id_t>>;
         std::list<Entry> lru_list_;
         std::unordered_map<node_id_t, std::list<Entry>::iterator> map_;
-        size_t hits_ = 0, misses_ = 0, evictions_ = 0, invalidations_ = 0;
+        mutable std::mutex mu_;
+        std::atomic<size_t> hits_{0};
+        std::atomic<size_t> misses_{0};
+        std::atomic<size_t> evictions_{0};
+        std::atomic<size_t> invalidations_{0};
     };
 
     // Per-search scratch state. Previously these were members of LSMVec
