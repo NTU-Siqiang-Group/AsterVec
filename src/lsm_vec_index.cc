@@ -1528,8 +1528,25 @@ using namespace ROCKSDB_NAMESPACE;
                                                   int layer,
                                                   SearchScratch& scratch)
     {
-        // Phase 4d: hold nodes_mu_ shared for the call duration.
-        std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
+        // Layer-0 traversal is the hot path during build (every
+        // insertNode runs ef_construction layer-0 search). It only
+        // touches getEdgesCached (RocksGraph + edge_cache) and disk
+        // reads via readVectorsBatchFlat — never nodes_. Taking
+        // nodes_mu_ shared here was unnecessary and is the dominant
+        // contention point under concurrent INSERT (every worker
+        // hammers the same shared_mutex bookkeeping → fat futex
+        // slow path under contention even though no writer is in
+        // progress).
+        //
+        // Upper layers (layer > 0) DO read nodes_.find() inside the
+        // function body, so the shared lock is still required for
+        // them. nodes_ map structure is mutated only by insertNode's
+        // unique_lock at line 583; readers must hold shared while
+        // dereferencing the iterator.
+        std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_, std::defer_lock);
+        if (layer > 0) {
+            nodes_g.lock();
+        }
         if (layer < 0) {
             LOG(ERR) << "Invalid layer for search";
             return {};
