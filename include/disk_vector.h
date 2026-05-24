@@ -1112,7 +1112,11 @@ private:
     // sections (`pages_.push_back` is the constraint), but new pages
     // are rare relative to slot allocations so this is rarely the
     // bottleneck.
-    std::pair<size_t,uint16_t> allocateSlotForSection(node_id_t sectionKey) {
+    // R3.b / internal review: returns (pageId, slot, sectionIdx). The
+    // sectionIdx is returned to avoid a second unlocked read of
+    // sectionKeyToIdx_ at the caller (storeVectorToDisk) which would be
+    // UB while concurrent writers may rehash the map.
+    std::tuple<size_t,uint16_t,int> allocateSlotForSection(node_id_t sectionKey) {
         // Section-key → section-idx, under a tiny critical section
         // (read-mostly, writes only on first vector of a new section).
         int sectionIdx;
@@ -1140,7 +1144,7 @@ private:
             if (!freeList.empty()) {
                 auto [pageId, slot] = freeList.back();
                 freeList.pop_back();
-                return {pageId, slot};
+                return {pageId, slot, sectionIdx};
             }
 
             auto& openList = shard.openPages[sectionIdx];
@@ -1158,7 +1162,7 @@ private:
                     if (meta.usedSlots < vectorsPerPage_) {
                         openList.push_back(pageId);
                     }
-                    return {pageId, slot};
+                    return {pageId, slot, sectionIdx};
                 }
                 // Defensive fallback (should not happen): page was full,
                 // fall through to fresh-page allocation.
@@ -1184,7 +1188,7 @@ private:
             shard.openPages[sectionIdx].push_back(newPageId);
         }
 
-        return {newPageId, /*slot=*/0};
+        return {newPageId, /*slot=*/0, sectionIdx};
     }
 
 public:
@@ -1281,11 +1285,12 @@ public:
             return;
         }
 
-        auto [pageId, slot] = allocateSlotForSection(sectionKey);
-
-        // Look up the internal sectionIdx for write buffer
-        auto secIt = sectionKeyToIdx_.find(sectionKey);
-        int sectionIdx = (secIt != sectionKeyToIdx_.end()) ? secIt->second : -1;
+        // R3.b / internal review: allocateSlotForSection returns
+        // (pageId, slot, sectionIdx). Avoids a second unlocked read of
+        // sectionKeyToIdx_ that would race against concurrent inserts
+        // (unordered_map concurrent read+write is UB; same map is
+        // mutated inside the function with section_index_mu_ held).
+        auto [pageId, slot, sectionIdx] = allocateSlotForSection(sectionKey);
 
         // Phase 6 publish protocol (§5.4, internal review): write bytes
         // BEFORE publishing the location. Readers that subsequently

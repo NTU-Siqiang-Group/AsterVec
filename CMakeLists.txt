@@ -224,6 +224,14 @@ set_target_properties(lsm_vec PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Concurrent search benchmark tool — for Phase A multi-thread perf testing.
+add_executable(concurrent_search_bench tools/concurrent_search_bench.cc)
+target_include_directories(concurrent_search_bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(concurrent_search_bench PRIVATE lsmvec_shared)
+set_target_properties(concurrent_search_bench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 option(LSMVEC_BUILD_PYTHON "Build Python bindings" OFF)
 option(LSMVEC_PYTHON_STATIC "Link Python module against static lib (for wheel builds)" OFF)
 

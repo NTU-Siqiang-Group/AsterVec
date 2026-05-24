@@ -69,65 +69,81 @@ using namespace ROCKSDB_NAMESPACE;
 // for ANN semantics and avoids long-lived shared locks blocking
 // writers when SQL cursors hold an iterator open.
 
-    // Thread-safe LRU cache for L0 edge lists.
+    // Sharded thread-safe LRU cache for L0 edge lists.
     //
-    // The previous implementation returned `const std::vector<node_id_t>*`
-    // from get() and trusted callers to read it before any concurrent
-    // put/erase/eviction could invalidate the underlying storage. Under
-    // multi-threaded search the pointer is unsafe — once the lock is
-    // released, another thread can evict the entry and free its vector,
-    // turning the caller's deref into a use-after-free.
+    // The previous single-mutex design was the dominant contention
+    // point at c >= 4 concurrent searches because every level-0
+    // searchLayer expansion calls `getEdgesCached` repeatedly.
     //
-    // The new API copies the neighbour list into a caller-owned vector
-    // while still holding the lock. The copy is unavoidable for safety;
-    // the cost (one heap allocation, ~M*8 bytes for an M-degree node) is
-    // dominated by the actual graph traversal work.
+    // R-EdgeShard / port of 6e676c9 Phase 2 (split from the bundled
+    // packed-atomic chunk array commit, which conflicts with our
+    // narrow_idtopage perf commit and is deferred separately):
     //
-    // Counters are atomic so the read-only accessors remain lock-free.
+    //   - kNumShards = 64. shard_id = id % kNumShards; each shard
+    //     owns its own mutex, list, map. Different ids on different
+    //     shards run lock-free against each other.
+    //   - get(): drop-on-hit — does NOT splice. For HNSW search, hot
+    //     entry-point neighbors get re-inserted on every miss anyway,
+    //     so they stay near the front. Avoids cache-line bouncing on
+    //     the list head.
+    //   - put(): existing entry → splice-to-front. New entry, full
+    //     shard → evict tail. Only put() mutates LRU order.
+    //   - Per-shard capacity = total_capacity / 64. Eviction per-shard.
+    //   - Counters (hits / misses / evictions / invalidations) are
+    //     global atomics for observability parity.
     class EdgeLRUCache {
     public:
-        explicit EdgeLRUCache(size_t capacity) : capacity_(capacity) {}
+        static constexpr size_t kNumShards = 64;
+
+        explicit EdgeLRUCache(size_t capacity)
+            : capacity_(capacity),
+              per_shard_capacity_(std::max<size_t>(1, capacity / kNumShards)) {}
 
         // Returns true and writes the cached neighbour list into *out
         // when present. Returns false on miss; *out is unchanged in
-        // that case. Copy of the cached value happens under the lock.
+        // that case. Copy happens under the shard lock.
         bool get(node_id_t id, std::vector<node_id_t>* out) {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = map_.find(id);
-            if (it == map_.end()) {
+            Shard& s = shard_for(id);
+            std::lock_guard<std::mutex> lock(s.mu);
+            auto it = s.map.find(id);
+            if (it == s.map.end()) {
                 misses_.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
             hits_.fetch_add(1, std::memory_order_relaxed);
-            lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
-            *out = it->second->second;     // copy under the lock
+            // Drop-on-hit: no splice. Just copy and return.
+            *out = it->second->second;
             return true;
         }
 
         void put(node_id_t id, std::vector<node_id_t> neighbors) {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = map_.find(id);
-            if (it != map_.end()) {
+            Shard& s = shard_for(id);
+            std::lock_guard<std::mutex> lock(s.mu);
+            auto it = s.map.find(id);
+            if (it != s.map.end()) {
                 it->second->second = std::move(neighbors);
-                lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
+                // Splice to front so this entry is treated as freshly
+                // inserted (only place we mutate LRU order).
+                s.list.splice(s.list.begin(), s.list, it->second);
                 return;
             }
-            if (map_.size() >= capacity_) {
-                auto& back = lru_list_.back();
-                map_.erase(back.first);
-                lru_list_.pop_back();
+            if (s.map.size() >= per_shard_capacity_) {
+                auto& back = s.list.back();
+                s.map.erase(back.first);
+                s.list.pop_back();
                 evictions_.fetch_add(1, std::memory_order_relaxed);
             }
-            lru_list_.emplace_front(id, std::move(neighbors));
-            map_[id] = lru_list_.begin();
+            s.list.emplace_front(id, std::move(neighbors));
+            s.map[id] = s.list.begin();
         }
 
         void erase(node_id_t id) {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = map_.find(id);
-            if (it == map_.end()) return;
-            lru_list_.erase(it->second);
-            map_.erase(it);
+            Shard& s = shard_for(id);
+            std::lock_guard<std::mutex> lock(s.mu);
+            auto it = s.map.find(id);
+            if (it == s.map.end()) return;
+            s.list.erase(it->second);
+            s.map.erase(it);
             invalidations_.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -138,11 +154,27 @@ using namespace ROCKSDB_NAMESPACE;
         size_t capacity() const { return capacity_; }
 
     private:
-        size_t capacity_;
         using Entry = std::pair<node_id_t, std::vector<node_id_t>>;
-        std::list<Entry> lru_list_;
-        std::unordered_map<node_id_t, std::list<Entry>::iterator> map_;
-        mutable std::mutex mu_;
+        struct Shard {
+            mutable std::mutex                                  mu;
+            std::list<Entry>                                    list;
+            std::unordered_map<node_id_t,
+                               std::list<Entry>::iterator>      map;
+        };
+
+        Shard& shard_for(node_id_t id) {
+            // Hash-mix the id so consecutive monotonic ids spread
+            // across shards instead of all landing in shard 0.
+            std::uint64_t h = static_cast<std::uint64_t>(id);
+            h ^= h >> 33;
+            h *= 0xff51afd7ed558ccdULL;
+            h ^= h >> 33;
+            return shards_[h % kNumShards];
+        }
+
+        size_t capacity_;
+        size_t per_shard_capacity_;
+        std::array<Shard, kNumShards> shards_;
         std::atomic<size_t> hits_{0};
         std::atomic<size_t> misses_{0};
         std::atomic<size_t> evictions_{0};
@@ -343,15 +375,21 @@ using namespace ROCKSDB_NAMESPACE;
         // C8 observability counters. `total_inserts_ever_` is in-memory-only
         // (resets on Open — a long-running service's ratio becomes accurate
         // only after the first Insert post-restart). Acceptable for V1.
-        std::size_t   total_inserts_ever() const { return total_inserts_ever_; }
+        // R3.a / internal review: atomic relaxed because every concurrent
+        // Insert increments it; plain std::size_t would be a TSan-flaggable
+        // data race even though the counter is just observability.
+        std::size_t   total_inserts_ever() const {
+            return total_inserts_ever_.load(std::memory_order_relaxed);
+        }
         std::size_t   bloom_rebuild_count() const { return bloom_rebuild_count_; }
         // tombstones / total_inserts_ever; returns 0.0 if no inserts seen yet.
         double        tombstone_ratio() const {
             std::shared_lock<std::shared_mutex> g(tombstone_mu_);
-            return total_inserts_ever_ == 0
+            std::size_t n = total_inserts_ever_.load(std::memory_order_relaxed);
+            return n == 0
                  ? 0.0
                  : static_cast<double>(tombstoned_internal_ids_.size()) /
-                   static_cast<double>(total_inserts_ever_);
+                   static_cast<double>(n);
         }
 
     private:
@@ -523,7 +561,7 @@ using namespace ROCKSDB_NAMESPACE;
         mutable std::shared_mutex                     tombstone_mu_;
 
         // C8 transient observability counters (reset on Open).
-        std::size_t                                   total_inserts_ever_ = 0;
+        std::atomic<std::size_t>                      total_inserts_ever_{0};
         std::size_t                                   bloom_rebuild_count_ = 0;
 
         void rebuild_bloom_to(std::size_t new_capacity);

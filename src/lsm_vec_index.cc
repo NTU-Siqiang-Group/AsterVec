@@ -620,7 +620,7 @@ using namespace ROCKSDB_NAMESPACE;
         //      level-0 descent through us is safe.
         //   6. Layer-0 Aster shrink (existing logic).
         //   7. Promotion CAS for entry_point_ / max_layer_.
-        ++total_inserts_ever_;       // C8: stats
+        total_inserts_ever_.fetch_add(1, std::memory_order_relaxed);  // C8: stats (R3.a)
         bool vectorStored = false;
 
         auto insert_timer = stats.startTimer();
@@ -1445,9 +1445,15 @@ using namespace ROCKSDB_NAMESPACE;
         // 3) Read all candidate vectors into a contiguous buffer
         std::vector<float> candVecs(N * dim);
         if (layer > 0) {
+            // R3.c / internal review: take nodes_mu_ shared for the
+            // brief lookup loop. The Node body is immutable post-publish
+            // (I2), so materializing into candVecs under the lock is
+            // safe. We release before the diversity-pruning loop below
+            // which operates only on the local candVecs buffer.
             // 20260516_upper_layer_sq8: route through nodePointView; reuse one
             // scratch buffer across all candidates within this select call.
             std::vector<float> sn2_scratch;
+            std::shared_lock<std::shared_mutex> g(nodes_mu_);
             for (size_t i = 0; i < N; ++i) {
                 auto nodeIt = nodes_.find(candInfos[i].id);
                 if (nodeIt != nodes_.end()) {
@@ -1458,6 +1464,7 @@ using namespace ROCKSDB_NAMESPACE;
                     }
                 }
             }
+            // lock released; candVecs is local from here on.
         } else {
             std::vector<node_id_t> ids(N);
             for (size_t i = 0; i < N; ++i) ids[i] = candInfos[i].id;
@@ -1498,38 +1505,60 @@ using namespace ROCKSDB_NAMESPACE;
     node_id_t LSMVec::greedySearchUpperLayer(const std::vector<float>& query,
                                                node_id_t entryPoint, int layer)
     {
-        // Phase 4d: hold nodes_mu_ shared for the function lifetime so
-        // a concurrent insertNode (under Phase 6 shared INSERT) can't
-        // realloc the unordered_map's bucket array beneath us.
-        std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
+        // R2.b / internal review: locks held only briefly to fetch a Node*
+        // and copy the neighbor list. Distance computation runs lock-free
+        // on the snapshot. Relies on:
+        //   I2: upper-layer Node body (point/q8_data/q_min/q_max) is
+        //       immutable post-publish — reads are race-free w/o locks.
+        //   I3: nodes_ is append-only (no erase outside Close) so a
+        //       Node* once observed remains valid for the function lifetime
+        //       under nominal workload (insertNode is concurrent but
+        //       does not invalidate prior entries).
+        // Stale neighbor snapshot is acceptable per Graph-loose §0.
         node_id_t current = entryPoint;
-        // 20260516_upper_layer_sq8: dequant scratches — one for the current
-        // node, one for each neighbor being scored. Reused across iterations.
-        std::vector<float> greedy_scratch_cur;
-        std::vector<float> greedy_scratch_neighbor;
-        const Node& entryNode = nodes_.at(current);
-        Span<const float> entryPt = nodePointView(entryNode, greedy_scratch_cur);
+        std::vector<float> scratch_cur;
+        std::vector<float> scratch_neighbor;
+
+        const Node* entryNode = nullptr;
+        {
+            std::shared_lock<std::shared_mutex> g(nodes_mu_);
+            auto it = nodes_.find(current);
+            if (it == nodes_.end()) return current;
+            entryNode = &it->second;
+        }
+        // Body read is lock-free per I2.
+        Span<const float> entryPt = nodePointView(*entryNode, scratch_cur);
         float bestDist = computeDistance(Span<const float>(query), entryPt);
+
         bool improved = true;
         while (improved) {
             improved = false;
-            auto nodeIt = nodes_.find(current);
-            if (nodeIt == nodes_.end()) break;
-            // Phase 4c read-side: hold the shard mutex during the
-            // neighbour iteration so a concurrent linkNeighbors /
-            // shrink writer on the same node serialises with us.
-            // computeDistance dominates the held-time so this is
-            // cheap relative to the surrounding work.
-            std::lock_guard<std::mutex> g(node_shard(current));
-            auto layerIt = nodeIt->second.neighbors.find(layer);
-            if (layerIt == nodeIt->second.neighbors.end()) break;
-            for (node_id_t neighborId : layerIt->second) {
-                auto nIt = nodes_.find(neighborId);
-                if (nIt == nodes_.end()) continue;
-                Span<const float> neighborPt = nodePointView(nIt->second,
-                                                              greedy_scratch_neighbor);
-                if (neighborPt.empty()) continue;
-                float d = computeDistance(Span<const float>(query), neighborPt);
+
+            // Step 1: brief-copy the neighbor list for `current`.
+            std::vector<node_id_t> neighbors_snapshot;
+            {
+                std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
+                auto nodeIt = nodes_.find(current);
+                if (nodeIt == nodes_.end()) break;
+                std::lock_guard<std::mutex> shard_g(node_shard(current));
+                auto layerIt = nodeIt->second.neighbors.find(layer);
+                if (layerIt == nodeIt->second.neighbors.end()) break;
+                neighbors_snapshot = layerIt->second;   // COPY
+            }
+            // Locks released. Walk snapshot lock-free.
+
+            for (node_id_t neighborId : neighbors_snapshot) {
+                const Node* nbrNode = nullptr;
+                {
+                    std::shared_lock<std::shared_mutex> g(nodes_mu_);
+                    auto it = nodes_.find(neighborId);
+                    if (it == nodes_.end()) continue;
+                    nbrNode = &it->second;
+                }
+                // Body read is lock-free per I2.
+                Span<const float> nbrPt = nodePointView(*nbrNode, scratch_neighbor);
+                if (nbrPt.empty()) continue;
+                float d = computeDistance(Span<const float>(query), nbrPt);
                 if (d < bestDist) {
                     bestDist = d;
                     current = neighborId;
@@ -1642,30 +1671,38 @@ using namespace ROCKSDB_NAMESPACE;
 
             if (layer > 0) {
                 // Upper layers: adjacency is in memory.
-                const auto nodeIt = nodes_.find(currentId);
-                if (nodeIt == nodes_.end()) {
-                    continue; // Defensive: should not happen
+                // R2.b / internal review: brief lock-and-copy of the
+                // neighbor list, then iterate lock-free. Distance
+                // computation runs without any lock held; Node body
+                // reads are race-free per invariant I2.
+                std::vector<node_id_t> neighbor_snapshot;
+                {
+                    const auto nodeIt = nodes_.find(currentId);
+                    if (nodeIt == nodes_.end()) continue;
+                    std::lock_guard<std::mutex> shard_g(node_shard(currentId));
+                    const auto& neighborMap = nodeIt->second.neighbors;
+                    auto it = neighborMap.find(layer);
+                    if (it == neighborMap.end()) continue;
+                    neighbor_snapshot = it->second;   // COPY
                 }
+                // Locks released; walk snapshot lock-free.
 
-                // Phase 4c read-side: see greedy descent above.
-                std::lock_guard<std::mutex> g(node_shard(currentId));
-                const auto& neighborMap = nodeIt->second.neighbors;
-                auto it = neighborMap.find(layer);
-                if (it == neighborMap.end()) {
-                    continue; // No adjacency list at this layer
-                }
-
-                const auto& neighborIds = it->second;
                 std::vector<float> sl2_scratch;
-                for (node_id_t neighborId : neighborIds) {
+                for (node_id_t neighborId : neighbor_snapshot) {
                     if (visitedInsert(neighborId)) {
-                        const auto neighborIt = nodes_.find(neighborId);
+                        const Node* nbrNode = nullptr;
+                        {
+                            // nodes_mu_ shared (from outer .find() caller
+                            // in this code path) is already held by us; we
+                            // just need to look up the neighbor's slot.
+                            auto neighborIt = nodes_.find(neighborId);
+                            if (neighborIt != nodes_.end()) nbrNode = &neighborIt->second;
+                        }
                         float d = 0.0f;
                         bool got = false;
-                        if (neighborIt != nodes_.end()) {
-                            // 20260516_upper_layer_sq8: route through nodePointView
-                            // so SQ8-resident neighbors dequant on demand.
-                            Span<const float> pt = nodePointView(neighborIt->second, sl2_scratch);
+                        if (nbrNode != nullptr) {
+                            // Body lock-free per I2.
+                            Span<const float> pt = nodePointView(*nbrNode, sl2_scratch);
                             if (pt.size() == static_cast<size_t>(vector_dim_)) {
                                 d = computeDistance(Span<const float>(queryVector), pt);
                                 got = true;
@@ -1778,10 +1815,10 @@ using namespace ROCKSDB_NAMESPACE;
         if (pred == nullptr) {
             return searchLayer(queryVector, entryPointId, efSearch, layer, scratch);
         }
-        // Phase 4d: filtered path may touch nodes_ for upper-layer
-        // descent in some code paths; hold nodes_mu_ shared.
-        std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
-        // Filtered searchLayer is only supported on layer 0.
+        // Filtered searchLayer is only supported on layer 0 — and
+        // layer 0 does not read nodes_ (upper-layer-only map), so
+        // we do NOT take nodes_mu_ here. (internal review: dropping
+        // a dead shared-lock acquire on the read hot path.)
         assert(layer == 0 && "filtered searchLayer only supported on layer 0");
 
         if (k <= 0) {
