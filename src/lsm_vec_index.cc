@@ -713,6 +713,12 @@ using namespace ROCKSDB_NAMESPACE;
                         continue;
                     }
 
+                    // Phase 4c: write-side lock on neighbor shard so
+                    // concurrent shrink writers (rare; hub nodes only)
+                    // serialise on the same node. Read-side under
+                    // Phase 1's lifecycle exclusive gate; Phase 6
+                    // will add a reader-side lock or switch to the
+                    // atomic-slot fixed-array primitive (§5.1.4).
                     std::vector<node_id_t> eConn = neighborIt->second.neighbors[l];
                     if (eConn.size() > static_cast<size_t>(m_max_))
                     {
@@ -729,6 +735,10 @@ using namespace ROCKSDB_NAMESPACE;
                         if (basis == nullptr) continue;
                         std::vector<node_id_t> eNewConn =
                             selectNeighbors(*basis, eConn, m_max_, l);
+                        // Phase 4c write: serialise this neighbor's
+                        // edge-list mutation against concurrent reads
+                        // and writes on the same shard.
+                        std::lock_guard<std::mutex> g(node_shard(neighbor));
                         neighborIt->second.neighbors[l] = std::move(eNewConn);
                     }
                 }
@@ -941,6 +951,13 @@ using namespace ROCKSDB_NAMESPACE;
             return;
         }
 
+        // Phase 4c: each iteration writes both the new node's layer
+        // list and an existing neighbour's layer list. Lock both
+        // shards (deadlock-free via scoped_lock when they differ);
+        // single lock when same shard. The new node's shard may also
+        // be uncontended (no other thread has reached the new id
+        // yet), but locking it defensively makes the contract
+        // independent of how the new id was allocated.
         for (node_id_t neighborId : neighborIds)
         {
             auto neighborIt = nodes_.find(neighborId);
@@ -949,8 +966,17 @@ using namespace ROCKSDB_NAMESPACE;
                           << " at layer " << layer;
                 continue;
             }
-            neighborIt->second.neighbors[layer].push_back(nodeId);
-            nodeIt->second.neighbors[layer].push_back(neighborId);
+            auto& sNode = node_shard(nodeId);
+            auto& sNbr  = node_shard(neighborId);
+            if (&sNode == &sNbr) {
+                std::lock_guard<std::mutex> g(sNode);
+                neighborIt->second.neighbors[layer].push_back(nodeId);
+                nodeIt->second.neighbors[layer].push_back(neighborId);
+            } else {
+                std::scoped_lock<std::mutex, std::mutex> g(sNode, sNbr);
+                neighborIt->second.neighbors[layer].push_back(nodeId);
+                nodeIt->second.neighbors[layer].push_back(neighborId);
+            }
         }
     }
 

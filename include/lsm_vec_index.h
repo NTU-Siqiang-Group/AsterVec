@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
@@ -451,6 +452,32 @@ using namespace ROCKSDB_NAMESPACE;
         std::ostream &out_file_;     // Output stream for logging
 
         std::unordered_map<node_id_t, Node> nodes_; // In-memory nodes for layers > 0
+
+        // Phase 4c (concurrent-writer-refactor-plan §5.1.4 — relaxed
+        // primitive). 256-shard mutex protecting Node.neighbors[layer]
+        // mutations and reads. std::mutex (not shared_mutex) because
+        // shared_mutex acquire on macOS / glibc is 5-10× more expensive;
+        // same-node read serialisation is rare given the visited-set
+        // dedup in search scratch. Both reads (greedy descent,
+        // searchLayer) and writes (linkNeighbors, shrink) take the
+        // shard mutex briefly. Write paths also take their own shard
+        // when modifying their target node.
+        //
+        // The plan's full §5.1.4 design (atomic-slot fixed-array +
+        // lock-free CAS-bounded append + prune-only spinlock) is
+        // deferred until profiling on a stable benchmark host (not
+        // the dev macOS where single-thread variance is too high to
+        // measure ~10% overheads reliably). The current design has
+        // the same 256-way scaling shape and is correctness-equivalent.
+        static constexpr size_t kNumNeighborShards = 256;
+        mutable std::array<std::mutex, kNumNeighborShards> neighbor_shards_;
+        std::mutex& node_shard(node_id_t id) const {
+            std::uint64_t h = static_cast<std::uint64_t>(id);
+            h ^= h >> 33;
+            h *= 0xff51afd7ed558ccdULL;
+            h ^= h >> 33;
+            return neighbor_shards_[h % kNumNeighborShards];
+        }
 
         // RNG removed — Phase 4a (§5.1.5) replaced shared mt19937 with
         // thread_local in LSMVec::randomLevel().
