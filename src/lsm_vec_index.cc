@@ -1993,7 +1993,17 @@ using namespace ROCKSDB_NAMESPACE;
     // C3 can exercise them in isolation.
     // ----------------------------------------------------------------------
 
+    // Phase 3 of concurrent-writer-refactor-plan §5.2: resolve_internal /
+    // resolve_real / is_alive read mapping_mu_ shared; record_update_mapping
+    // and forget_update_mapping write mapping_mu_ exclusive. is_alive also
+    // takes tombstone_mu_ shared (via the inline is_tombstoned helper) and
+    // sequences the two reads — a stale (post-mapping, pre-tombstone)
+    // observation can return "alive" briefly for a transactionally-deleted
+    // key; the per-real-id transaction lock at LSMVecDB serialises the
+    // whole upsert/update/delete flow so that brief inconsistency is bounded.
+
     internal_id_t LSMVec::resolve_internal(real_id_t r) const {
+        std::shared_lock<std::shared_mutex> g(mapping_mu_);
         if (!update_bloom_.might_contain(r)) {
             return static_cast<internal_id_t>(r);                  // 99% case
         }
@@ -2005,6 +2015,7 @@ using namespace ROCKSDB_NAMESPACE;
 
     real_id_t LSMVec::resolve_real(internal_id_t i) const {
         if (is_direct_id(i)) return static_cast<real_id_t>(i);     // bit-test fast path
+        std::shared_lock<std::shared_mutex> g(mapping_mu_);
         auto it = updated_internal_to_real_.find(i);
         return (it == updated_internal_to_real_.end())
              ? static_cast<real_id_t>(i)                           // defensive; should not happen
@@ -2012,12 +2023,13 @@ using namespace ROCKSDB_NAMESPACE;
     }
 
     bool LSMVec::is_alive(real_id_t r) const {
-        internal_id_t i = resolve_internal(r);
-        if (tombstoned_internal_ids_.count(i) > 0) return false;
+        internal_id_t i = resolve_internal(r);  // takes mapping_mu_ shared
+        if (is_tombstoned(i)) return false;     // takes tombstone_mu_ shared
         return vector_storage_ && vector_storage_->exists(i);
     }
 
     void LSMVec::record_update_mapping(real_id_t r, internal_id_t new_i) {
+        std::unique_lock<std::shared_mutex> g(mapping_mu_);
         // A4: if r already has an update mapping, drop the stale reverse entry.
         auto prev = updated_real_to_internal_.find(r);
         if (prev != updated_real_to_internal_.end()) {
@@ -2027,11 +2039,17 @@ using namespace ROCKSDB_NAMESPACE;
         updated_internal_to_real_[new_i] = r;
         update_bloom_.add(r);
         if (update_bloom_.fill_ratio() >= 0.7) {
-            rebuild_bloom_to(update_bloom_.capacity() * 2);
+            rebuild_bloom_to_locked(update_bloom_.capacity() * 2);
         }
     }
 
     void LSMVec::rebuild_bloom_to(std::size_t new_capacity) {
+        std::unique_lock<std::shared_mutex> g(mapping_mu_);
+        rebuild_bloom_to_locked(new_capacity);
+    }
+
+    void LSMVec::rebuild_bloom_to_locked(std::size_t new_capacity) {
+        // Caller holds mapping_mu_ exclusive.
         update_bloom_.reset(new_capacity, 0.01);
         for (const auto& kv : updated_real_to_internal_) {
             update_bloom_.add(kv.first);
@@ -2040,6 +2058,7 @@ using namespace ROCKSDB_NAMESPACE;
     }
 
     void LSMVec::forget_update_mapping(real_id_t r) {
+        std::unique_lock<std::shared_mutex> g(mapping_mu_);
         auto it = updated_real_to_internal_.find(r);
         if (it != updated_real_to_internal_.end()) {
             updated_internal_to_real_.erase(it->second);

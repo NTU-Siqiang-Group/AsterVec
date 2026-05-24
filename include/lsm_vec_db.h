@@ -1,8 +1,10 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -170,5 +172,28 @@ private:
     std::unique_ptr<ROCKSDB_NAMESPACE::DB>  metadata_db_;
     ROCKSDB_NAMESPACE::ColumnFamilyHandle*  metadata_cf_ = nullptr;
     std::unique_ptr<MetadataStore>          metadata_store_;
+
+    // Phase 3 (concurrent-writer-refactor-plan §5.2): per-real-id
+    // transaction lock. 256 sharded mutexes covering Insert / Update /
+    // Upsert / Delete from start to finish of one transaction. Same
+    // real_id is naturally serialised; different real_ids hash into
+    // different shards (collision rate ~ N²/512 — at N=32 concurrent
+    // writers, roughly 12.5% incidental cross-key serialisation; still
+    // acceptable for v1, see §5.2 deferred-split optimisation).
+    //
+    // Recursive because Update → UpdateInternal → Insert when the key
+    // is not alive (re-insert path); same thread re-enters the same
+    // shard. The recursion is always on the same real_id, so the
+    // recursive guarantee maps cleanly.
+    static constexpr size_t kRealIdLockShards = 256;
+    mutable std::array<std::recursive_mutex, kRealIdLockShards> real_id_locks_;
+    std::recursive_mutex& real_id_lock(node_id_t r) const {
+        // Mix bits so close-numbered ids don't all land on the same shard.
+        std::uint64_t h = static_cast<std::uint64_t>(r);
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        return real_id_locks_[h % kRealIdLockShards];
+    }
 };
 } // namespace lsm_vec

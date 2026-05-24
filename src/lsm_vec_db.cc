@@ -236,6 +236,14 @@ Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata
         return Status::InvalidArgument("real_id must fit in 63 bits");
     }
 
+    // Phase 3 (concurrent-writer-refactor-plan §5.2): acquire the
+    // per-real-id transaction lock for the entire Insert/Upsert flow.
+    // Two concurrent Insert(R, ...) calls now serialise on R's shard;
+    // different real_ids hash into different shards and proceed in
+    // parallel. recursive_mutex because UpdateInternal → Insert can
+    // re-enter the same shard (re-insert path).
+    std::lock_guard<std::recursive_mutex> txn_lk(real_id_lock(r));
+
     if (auto s = EnsureMetricSupported(); !s.ok()) return s;
     if (auto s = ValidateVector(vec); !s.ok()) return s;
 
@@ -338,6 +346,12 @@ Status LSMVecDB::UpdateInternal(node_id_t id, Span<float> vec,
         return Status::InvalidArgument("real_id must fit in 63 bits");
     }
 
+    // Phase 3 (§5.2): per-real-id transaction lock. Recursive — public
+    // Update → UpdateInternal already holds it; Insert (when called
+    // from this function via the re-insert path) re-enters the same
+    // shard, harmless under recursive_mutex.
+    std::lock_guard<std::recursive_mutex> txn_lk(real_id_lock(r));
+
     if (auto s = ValidateVector(vec); !s.ok()) return s;
 
     const bool has_metadata = !metadata_json.empty() && metadata_json != "{}";
@@ -396,6 +410,10 @@ Status LSMVecDB::Delete(node_id_t id)
 {
     if (!index_) return Status::InvalidArgument("db not opened");
     const real_id_t r = static_cast<real_id_t>(id);
+
+    // Phase 3 (§5.2): per-real-id transaction lock around the full
+    // delete (resolve → tombstone → metadata delete → forget mapping).
+    std::lock_guard<std::recursive_mutex> txn_lk(real_id_lock(r));
 
     const internal_id_t i = index_->resolve_internal(r);
     // Idempotent: if r never had a live vector, nothing to do (per design §5.3).

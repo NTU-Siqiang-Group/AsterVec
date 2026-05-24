@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -247,8 +248,18 @@ using namespace ROCKSDB_NAMESPACE;
         // Backward-compatible accessors: now backed by tombstoned_internal_ids_.
         // node_id_t and internal_id_t are both aliases for uint64_t, so callers
         // (LSMVecDB, persistence) compile unchanged.
-        const std::unordered_set<node_id_t>& deletedIds() const { return tombstoned_internal_ids_; }
-        void setDeletedIds(const std::unordered_set<node_id_t>& ids) { tombstoned_internal_ids_ = ids; }
+        // Phase 3: returning a reference to a mutex-protected set is unsafe
+        // for concurrent callers; persistence layer (the only caller) runs
+        // under the engine's lifecycle exclusive gate so the reference is
+        // stable for the call's duration.
+        const std::unordered_set<node_id_t>& deletedIds() const {
+            std::shared_lock<std::shared_mutex> g(tombstone_mu_);
+            return tombstoned_internal_ids_;
+        }
+        void setDeletedIds(const std::unordered_set<node_id_t>& ids) {
+            std::unique_lock<std::shared_mutex> g(tombstone_mu_);
+            tombstoned_internal_ids_ = ids;
+        }
 
         void insertNode(node_id_t nodeId, const std::vector<float> &vector);
         node_id_t knnSearch(const std::vector<float> &queryVector);
@@ -284,11 +295,18 @@ using namespace ROCKSDB_NAMESPACE;
         bool          is_alive(real_id_t r) const;
 
         bool          is_tombstoned(internal_id_t i) const {
+            std::shared_lock<std::shared_mutex> g(tombstone_mu_);
             return tombstoned_internal_ids_.count(i) > 0;
         }
-        void          tombstone(internal_id_t i) { tombstoned_internal_ids_.insert(i); }
+        void          tombstone(internal_id_t i) {
+            std::unique_lock<std::shared_mutex> g(tombstone_mu_);
+            tombstoned_internal_ids_.insert(i);
+        }
 
-        internal_id_t allocate_update_id() { return next_update_internal_id_++; }
+        // Atomic counter (concurrent-writer-refactor-plan §5.2).
+        internal_id_t allocate_update_id() {
+            return next_update_internal_id_.fetch_add(1, std::memory_order_relaxed);
+        }
         void          record_update_mapping(real_id_t r, internal_id_t i);
 
         // A4: Drop both forward and reverse sparse-map entries for real_id.
@@ -297,14 +315,29 @@ using namespace ROCKSDB_NAMESPACE;
         void          forget_update_mapping(real_id_t r);
 
         // Read-only accessors for stats / tests.
-        std::size_t   tombstone_count()    const { return tombstoned_internal_ids_.size(); }
-        std::size_t   updated_real_id_count() const { return updated_real_to_internal_.size(); }
+        std::size_t   tombstone_count()    const {
+            std::shared_lock<std::shared_mutex> g(tombstone_mu_);
+            return tombstoned_internal_ids_.size();
+        }
+        std::size_t   updated_real_id_count() const {
+            std::shared_lock<std::shared_mutex> g(mapping_mu_);
+            return updated_real_to_internal_.size();
+        }
         std::size_t   updated_internal_to_real_size() const {
+            std::shared_lock<std::shared_mutex> g(mapping_mu_);
             return updated_internal_to_real_.size();
         }
-        std::size_t   bloom_capacity()     const { return update_bloom_.capacity(); }
-        double        bloom_fill_ratio()   const { return update_bloom_.fill_ratio(); }
-        internal_id_t next_update_internal_id() const { return next_update_internal_id_; }
+        std::size_t   bloom_capacity()     const {
+            std::shared_lock<std::shared_mutex> g(mapping_mu_);
+            return update_bloom_.capacity();
+        }
+        double        bloom_fill_ratio()   const {
+            std::shared_lock<std::shared_mutex> g(mapping_mu_);
+            return update_bloom_.fill_ratio();
+        }
+        internal_id_t next_update_internal_id() const {
+            return next_update_internal_id_.load(std::memory_order_relaxed);
+        }
 
         // C8 observability counters. `total_inserts_ever_` is in-memory-only
         // (resets on Open — a long-running service's ratio becomes accurate
@@ -313,6 +346,7 @@ using namespace ROCKSDB_NAMESPACE;
         std::size_t   bloom_rebuild_count() const { return bloom_rebuild_count_; }
         // tombstones / total_inserts_ever; returns 0.0 if no inserts seen yet.
         double        tombstone_ratio() const {
+            std::shared_lock<std::shared_mutex> g(tombstone_mu_);
             return total_inserts_ever_ == 0
                  ? 0.0
                  : static_cast<double>(tombstoned_internal_ids_.size()) /
@@ -427,17 +461,31 @@ using namespace ROCKSDB_NAMESPACE;
         // V1 delete/update infrastructure — sparse maps over the divergent
         // subset of (real_id, internal_id) plus a Bloom shortcut for forward
         // resolve. Wiring into the operation layer happens in C5b.
+        //
+        // Phase 3 of concurrent-writer-refactor-plan §5.2: these are now
+        // protected by mapping_mu_ (the maps + bloom) and tombstone_mu_
+        // (the tombstone set). next_update_internal_id_ is atomic. Reads
+        // (resolve_internal, resolve_real, is_alive, is_tombstoned) take
+        // shared; writes (record_update_mapping, forget_update_mapping,
+        // tombstone, setDeletedIds) take exclusive. The full sharded
+        // version specced in §5.2 is deferred until profiling shows the
+        // single mutex contended.
         std::unordered_map<real_id_t, internal_id_t> updated_real_to_internal_;
         std::unordered_map<internal_id_t, real_id_t> updated_internal_to_real_;
         std::unordered_set<internal_id_t>            tombstoned_internal_ids_;
         BloomFilter                                   update_bloom_{512, 0.01};
-        internal_id_t                                 next_update_internal_id_ = kFirstUpdateId;
+        std::atomic<internal_id_t>                    next_update_internal_id_{kFirstUpdateId};
+        mutable std::shared_mutex                     mapping_mu_;
+        mutable std::shared_mutex                     tombstone_mu_;
 
         // C8 transient observability counters (reset on Open).
         std::size_t                                   total_inserts_ever_ = 0;
         std::size_t                                   bloom_rebuild_count_ = 0;
 
         void rebuild_bloom_to(std::size_t new_capacity);
+        // Variant for callers already holding mapping_mu_ exclusive
+        // (e.g. record_update_mapping). Phase 3.
+        void rebuild_bloom_to_locked(std::size_t new_capacity);
 
         int section_layer_ = 1;
         bool enable_batch_read_ = true;
