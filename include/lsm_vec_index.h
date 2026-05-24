@@ -25,6 +25,48 @@ namespace lsm_vec
 {
 using namespace ROCKSDB_NAMESPACE;
 
+// Thread-safety contract for LSMVec
+// =================================
+//
+// LSMVec assumes the caller serializes read-vs-write coordination
+// through an external reader-writer lock (e.g. a per-index
+// std::shared_mutex held by the embedding application). State that
+// must remain consistent between concurrent SHARED-lock holders
+// (page cache, edge cache, stats counters, search scratch) IS
+// synchronized internally. State that the external lock already
+// protects (graph maps, tombstone set, update maps, entry_point_,
+// max_layer_) is NOT internally synchronized.
+//
+// Lock holding requirements per public method:
+//
+//   SHARED:
+//     - knnSearchK
+//     - knnSearchKFiltered
+//     - getNodeVector
+//     - resolve_internal, resolve_real, is_alive, is_tombstoned
+//     - tombstone_count, updated_real_id_count, ...
+//     - printStatistics, printState, printIndexStatus
+//
+//   EXCLUSIVE:
+//     - insertNode
+//     - deleteNode
+//     - tombstone, record_update_mapping, forget_update_mapping
+//     - allocate_update_id
+//     - setDeletedIds
+//     - SerializeMetadata, DeserializeMetadata
+//     - close
+//
+// LSMSearchIterator is special: its constructor (called via
+// LSMVecDB::NewSearchIterator) and Next() method each acquire the
+// SHARED lock for the duration of one call. The lock is NOT held
+// across calls, so iterator-private state (visited_, candidates_,
+// yield_queue_) may observe a graph that has changed between calls.
+// is_tombstoned() is re-checked at yield time so deleted nodes are
+// suppressed; concurrent inserts may or may not be visible depending
+// on whether the iterator's frontier reaches them. This is acceptable
+// for ANN semantics and avoids long-lived shared locks blocking
+// writers when SQL cursors hold an iterator open.
+
     // Thread-safe LRU cache for L0 edge lists.
     //
     // The previous implementation returned `const std::vector<node_id_t>*`

@@ -22,6 +22,25 @@
 
 #include "id_types.h"
 
+// Thread-safety contract for PagedVectorStorage
+// =============================================
+//
+// Read-side methods (readVectorFromDisk, readVectorsBatch,
+// readVectorsBatchFlat, exists) are safe to call concurrently from
+// multiple threads. Internally, the page cache (pageCache_ /
+// pageOrder_) is protected by a std::shared_mutex; cache lookups take
+// shared locks, insertions and evictions take unique locks. Disk I/O
+// happens outside the cache mutex.
+//
+// Write-side methods (storeVectorToDisk, deleteVector, flushWrites,
+// expandCapacity, deserializeMetadata) assume the caller holds an
+// external EXCLUSIVE lock. Mutations to write-only structures
+// (sectionWriteBufs_, idToPage_, idToSlotInPage_, pages_,
+// update_locations_, deletedFlags_, sectionKeyToIdx_,
+// sectionIdxToKey_, sectionOpenPages_, sectionFreeSlots_) are
+// therefore not internally synchronized — concurrency between
+// readers and a single writer is the caller's responsibility.
+
 namespace lsm_vec
 {
 using node_id_t = std::uint64_t;
