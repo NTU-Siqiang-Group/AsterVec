@@ -1035,16 +1035,34 @@ using namespace ROCKSDB_NAMESPACE;
 
     void LSMVec::linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds)
     {
-        // Create vertex with all forward (out) edges in a single Put.
-        // in_neighbors left empty — reverse edges are added individually below.
-        std::vector<ROCKSDB_NAMESPACE::node_id_t> out_neighbors(neighborIds.begin(), neighborIds.end());
-        std::vector<ROCKSDB_NAMESPACE::node_id_t> in_neighbors;
-        db_->AddVertexWithEdges(nodeId, out_neighbors, in_neighbors);
+        // All forward + reverse edges go through a single AddEdgeBatch:
+        // ONE db_->Write, ONE WAL flush, ONE RocksDB WriteThread acquisition
+        // per insert (vs. N+1 in the previous AddVertexWithEdges + per-edge
+        // AddEdge loop). RocksDB serialises every db_->Write through the
+        // WriteThread, so this is the dominant build-time scaling fix.
+        //
+        // AddEdgeBatch handles vertex creation implicitly: for each affected
+        // vertex it does GetAllEdges (NotFound is fine — new vertex starts
+        // empty) and writes the merged adj list. The HNSW path doesn't read
+        // edge_prop_cf_ / vertex_prop_cf_ that AddVertexWithEdges initialises,
+        // so dropping that initialisation is correctness-equivalent here.
+        if (neighborIds.empty()) return;
 
-        // Add reverse edges: each neighbor → new node
+        std::vector<std::pair<rocksdb::node_id_t, rocksdb::node_id_t>> all_edges;
+        all_edges.reserve(neighborIds.size() * 2);
         for (node_id_t neighborId : neighborIds) {
-            db_->AddEdge(neighborId, nodeId);
-            if (edge_cache_) edge_cache_->erase(neighborId);
+            all_edges.emplace_back(
+                static_cast<rocksdb::node_id_t>(nodeId),
+                static_cast<rocksdb::node_id_t>(neighborId));
+            all_edges.emplace_back(
+                static_cast<rocksdb::node_id_t>(neighborId),
+                static_cast<rocksdb::node_id_t>(nodeId));
+        }
+        db_->AddEdgeBatch(all_edges);
+        if (edge_cache_) {
+            for (node_id_t neighborId : neighborIds) {
+                edge_cache_->erase(neighborId);
+            }
         }
     }
 
