@@ -615,6 +615,13 @@ using namespace ROCKSDB_NAMESPACE;
             // 20260516_upper_layer_sq8: quantize destructively at construction.
             // Frees the float buffer; q8_data carries the dim-byte representation.
             quantizeNodePoint(newNode);
+            // Phase 4d: publish into nodes_ under exclusive nodes_mu_.
+            // The quantize above runs lock-free because newNode is still
+            // function-local. Once we insert into nodes_, the Node body
+            // is immutable (invariant I2 from PHASE_A_IMPLEMENTATION.md
+            // §0) — readers do not need to hold nodes_mu_ to read
+            // q8_data / q_min / q_max.
+            std::unique_lock<std::shared_mutex> g(nodes_mu_);
             nodes_[nodeId] = std::move(newNode);
         }
 
@@ -704,6 +711,10 @@ using namespace ROCKSDB_NAMESPACE;
             // ---- Shrink connections ----
             if (l > 0)
             {
+                // Phase 4d: hold nodes_mu_ shared while iterators
+                // into nodes_ are live; node insertions can't reorder
+                // the bucket array beneath us during this loop.
+                std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
                 for (node_id_t neighbor : selectedNeighbors)
                 {
                     auto neighborIt = nodes_.find(neighbor);
@@ -944,6 +955,10 @@ using namespace ROCKSDB_NAMESPACE;
     // Links neighbors for upper layers stored in memory
     void LSMVec::linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer)
     {
+        // Phase 4d: hold nodes_mu_ shared while we hold iterators
+        // into nodes_; the iterators are stable as long as no writer
+        // (insertNode line 559) is active.
+        std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
         auto nodeIt = nodes_.find(nodeId);
         if (nodeIt == nodes_.end()) {
             LOG(WARN) << "Skipping upper-layer link for missing node " << nodeId
@@ -1427,6 +1442,10 @@ using namespace ROCKSDB_NAMESPACE;
     node_id_t LSMVec::greedySearchUpperLayer(const std::vector<float>& query,
                                                node_id_t entryPoint, int layer)
     {
+        // Phase 4d: hold nodes_mu_ shared for the function lifetime so
+        // a concurrent insertNode (under Phase 6 shared INSERT) can't
+        // realloc the unordered_map's bucket array beneath us.
+        std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
         node_id_t current = entryPoint;
         // 20260516_upper_layer_sq8: dequant scratches — one for the current
         // node, one for each neighbor being scored. Reused across iterations.
@@ -1471,6 +1490,8 @@ using namespace ROCKSDB_NAMESPACE;
                                                   int layer,
                                                   SearchScratch& scratch)
     {
+        // Phase 4d: hold nodes_mu_ shared for the call duration.
+        std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
         if (layer < 0) {
             LOG(ERR) << "Invalid layer for search";
             return {};
@@ -1679,10 +1700,14 @@ using namespace ROCKSDB_NAMESPACE;
 
         (void)efSearch;  // In filter mode, k + max_scan_candidates control termination.
 
-        // No predicate → unfiltered path.
+        // No predicate → unfiltered path. Don't take nodes_mu_ here;
+        // the unfiltered searchLayer takes its own.
         if (pred == nullptr) {
             return searchLayer(queryVector, entryPointId, efSearch, layer, scratch);
         }
+        // Phase 4d: filtered path may touch nodes_ for upper-layer
+        // descent in some code paths; hold nodes_mu_ shared.
+        std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
         // Filtered searchLayer is only supported on layer 0.
         assert(layer == 0 && "filtered searchLayer only supported on layer 0");
 

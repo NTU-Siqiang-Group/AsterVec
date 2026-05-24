@@ -453,6 +453,17 @@ using namespace ROCKSDB_NAMESPACE;
 
         std::unordered_map<node_id_t, Node> nodes_; // In-memory nodes for layers > 0
 
+        // Phase 4d (§5.1.1 — relaxed primitive). std::shared_mutex
+        // protecting nodes_ map mutations. Reads (find / at) take
+        // shared; the single insert site (nodes_[id] = newNode) takes
+        // exclusive. The plan's full §5.1.1 chunk-array primitive
+        // doesn't fit naturally over the sparse direct-id +
+        // high-bit-update-id namespace; the simpler shared_mutex is
+        // correct, with the option to swap in a concurrent hash map
+        // (TBB / folly::ConcurrentHashMap) if profiling on the eval
+        // server shows contention.
+        mutable std::shared_mutex nodes_mu_;
+
         // Phase 4c (concurrent-writer-refactor-plan §5.1.4 — relaxed
         // primitive). 256-shard mutex protecting Node.neighbors[layer]
         // mutations and reads. std::mutex (not shared_mutex) because
