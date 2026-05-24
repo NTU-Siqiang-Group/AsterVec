@@ -435,7 +435,8 @@ Status LSMVecDB::Get(node_id_t id, std::vector<float>* vec)
         index_->stats.accumulateTime(timer, index_->stats.vec_read_time);
         index_->stats.addCount(1, index_->stats.vec_read_count);
         if (timer.active) {
-            DLOG(DEBUG) << "vector_read id=" << id << " time_s=" << timer.duration;
+            DLOG(DEBUG) << "vector_read id=" << id << " time_s="
+                        << (static_cast<double>(timer.duration_ns) / 1e9);
         }
     } catch (const std::exception& ex) {
         return Status::IOError(ex.what());

@@ -94,7 +94,7 @@ using namespace ROCKSDB_NAMESPACE;
           max_layer_(-1),
           entry_point_(-1)
     {
-        stats.setEnabled(db_options_.enable_stats);
+        stats.setEnabledOnConstruction(db_options_.enable_stats);
         enable_batch_read_ = db_options_.enable_batch_read;
         if (db_options_.edge_cache_size > 0) {
             edge_cache_ = std::make_unique<EdgeLRUCache>(db_options_.edge_cache_size);
@@ -616,7 +616,8 @@ using namespace ROCKSDB_NAMESPACE;
             if (insert_timer.active) {
                 LOG(INFO) << "insert_node id=" << nodeId
                           << " layer=" << highestLayer
-                          << " time_s=" << insert_timer.duration;
+                          << " time_s="
+                          << (static_cast<double>(insert_timer.duration_ns) / 1e9);
             }
             return;
         }
@@ -840,7 +841,8 @@ using namespace ROCKSDB_NAMESPACE;
         stats.addCount(1, stats.search_count);
         if (search_timer.active) {
             DLOG(DEBUG) << "knn_search_k k=" << k
-                        << " time_s=" << search_timer.duration;
+                        << " time_s="
+                        << (static_cast<double>(search_timer.duration_ns) / 1e9);
         }
         return filtered;
     }
@@ -1951,8 +1953,10 @@ using namespace ROCKSDB_NAMESPACE;
     void LSMVec::printStatistics() const
     {
         auto cache_stats = vector_storage_->getPageCacheStats();
-        stats.page_cache_hits = cache_stats.hits;
-        stats.page_cache_misses = cache_stats.misses;
+        stats.page_cache_hits.store(cache_stats.hits,
+                                     std::memory_order_relaxed);
+        stats.page_cache_misses.store(cache_stats.misses,
+                                       std::memory_order_relaxed);
 
         std::ostringstream oss;
         stats.print(oss);
