@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
@@ -32,14 +33,34 @@
 // shared locks, insertions and evictions take unique locks. Disk I/O
 // happens outside the cache mutex.
 //
-// Write-side methods (storeVectorToDisk, deleteVector, flushWrites,
-// expandCapacity, deserializeMetadata) assume the caller holds an
-// external EXCLUSIVE lock. Mutations to write-only structures
-// (sectionWriteBufs_, idToPage_, idToSlotInPage_, pages_,
-// update_locations_, deletedFlags_, sectionKeyToIdx_,
-// sectionIdxToKey_, sectionOpenPages_, sectionFreeSlots_) are
-// therefore not internally synchronized — concurrency between
-// readers and a single writer is the caller's responsibility.
+// Write-side concurrency
+// ----------------------
+// Concurrent-writer-refactor-plan §5.3 (r3.2): the "external EXCLUSIVE
+// lock" contract is replaced with internal sharded synchronisation so
+// concurrent inserts on different sections can proceed in parallel.
+//
+//   * storeVectorToDisk acquires:
+//       - sectionShards_[sectionIdx % 64] for section bookkeeping
+//         (sectionFreeSlots_, sectionOpenPages_, sectionWriteBufs_)
+//       - pages_alloc_mu_ briefly when allocating a fresh page
+//         (pages_.push_back + ensurePageAllocated + the dense-array
+//         capacity grow path expandCapacity)
+//       - section_index_mu_ briefly when resolving a sectionKey to a
+//         sectionIdx for the first time
+//       - update_loc_mu_ briefly when assigning an update-id location
+//       - the actual record pwrite is performed UNLOCKED (different
+//         (pageId, slot) tuples are non-overlapping byte ranges)
+//   * expandCapacity / deserializeMetadata take pages_alloc_mu_
+//     because they grow the dense location arrays.
+//   * flushWrites runs under the engine's exclusive lifecycle gate
+//     (FLUSH op in pglsmvec/csrc/lsmvec_worker_pool.cpp) and therefore
+//     does not need to coordinate with concurrent storeVectorToDisk
+//     callers.
+//
+// At Phase 1 (the engine's INSERT op still takes the lifecycle gate
+// EXCLUSIVE), these internal locks are uncontended in practice — they
+// are added now so that Phase 6 of the plan can drop the engine's
+// exclusive without breaking storage thread-safety.
 
 namespace lsm_vec
 {
@@ -360,7 +381,14 @@ private:
         uint16_t usedSlots;  // number of occupied slots in this page
     };
 
-    std::vector<PageMeta> pages_; // pageId -> meta
+    // Concurrent-writer-refactor-plan §5.3: std::deque (not vector) so
+    // push_back on a different thread never invalidates `pages_[i]`
+    // references held by other threads. Only the push_back itself
+    // needs pages_alloc_mu_; mutations of pages_[pageId] in the open-
+    // page path proceed under just the section-shard mutex (different
+    // sections own disjoint page sets, so different shards never touch
+    // the same pages_[pageId]).
+    std::deque<PageMeta> pages_; // pageId -> meta
 
     // Section mappings: external sectionKey -> internal sectionIdx
     std::unordered_map<node_id_t,int> sectionKeyToIdx_;
@@ -383,6 +411,21 @@ private:
     };
     std::unordered_map<node_id_t, UpdateLoc> update_locations_;
 
+    // -------------------------------------------------------------
+    // Phase 2 internal synchronisation (concurrent-writer-refactor-plan §5.3).
+    // See the file-header thread-safety contract above.
+    // -------------------------------------------------------------
+    static constexpr size_t kNumSectionShards = 64;
+    mutable std::array<std::mutex, kNumSectionShards> sectionShards_;
+    mutable std::mutex                                pages_alloc_mu_;
+    mutable std::mutex                                section_index_mu_;
+    mutable std::mutex                                update_loc_mu_;
+
+    std::mutex& section_shard(int sectionIdx) const {
+        return sectionShards_[
+            static_cast<size_t>(sectionIdx) % kNumSectionShards];
+    }
+
     // ----- Location dispatch helpers (V1, see DELETE_DESIGN.md §0.3) -----
     // These transparently route direct ids to dense arrays and update ids to
     // the sparse hashmap, so the public methods don't have to branch.
@@ -393,6 +436,8 @@ private:
             // 20260516_narrow_idtopage: idToPage_ is int32_t; widen for the API contract.
             return static_cast<int64_t>(idToPage_[static_cast<size_t>(id)]);
         }
+        // update-id branch: sparse map under update_loc_mu_.
+        std::lock_guard<std::mutex> g(update_loc_mu_);
         auto it = update_locations_.find(id);
         return (it == update_locations_.end()) ? -1 : it->second.page;
     }
@@ -402,6 +447,8 @@ private:
             if (static_cast<size_t>(id) >= totalVectors_) return 0;
             return idToSlotInPage_[static_cast<size_t>(id)];
         }
+        // update-id branch: sparse map under update_loc_mu_.
+        std::lock_guard<std::mutex> g(update_loc_mu_);
         auto it = update_locations_.find(id);
         return (it == update_locations_.end()) ? 0 : it->second.slot;
     }
@@ -427,6 +474,10 @@ private:
             // 20260516_narrow_idtopage: 2^31 page ceiling = 8 TB per backing
             // file. Hitting this means a multi-TB single-file workload — bail
             // out loudly rather than silently truncate the high bits.
+            // A1.8 note: the direct (dense) path publish here is currently
+            // protected by the caller's external exclusive lock on the
+            // LSMVecDB per-id mutex (A1.9). The sparse path below uses
+            // the per-storage update_loc_mu_ added by this commit.
             if (page > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
                 throw std::runtime_error(
                     "PagedVectorStorage: page index exceeds int32_t ceiling "
@@ -436,6 +487,7 @@ private:
             idToPage_[static_cast<size_t>(id)]       = static_cast<int32_t>(page);
             idToSlotInPage_[static_cast<size_t>(id)] = slot;
         } else {
+            std::lock_guard<std::mutex> g(update_loc_mu_);
             UpdateLoc& loc = update_locations_[id];
             loc.page = static_cast<int64_t>(page);
             loc.slot = slot;
@@ -600,7 +652,23 @@ private:
         }
     }
 
+    // Grow the dense direct-id arrays + the on-disk delete-marker file.
+    // Concurrent-writer-refactor-plan §5.3: takes pages_alloc_mu_ so that
+    // a writer growing `pages_` and another writer growing the dense
+    // location arrays don't both call non-thread-safe std::vector::resize
+    // simultaneously, and so that a racing reader that briefly observes
+    // a vector mid-grow is impossible (Phase 6 readers will acquire
+    // pages_alloc_mu_ shared via a future shared_mutex; for Phase 1 the
+    // lifecycle gate already excludes readers during writes).
     void expandCapacity(size_t minCapacity) {
+        std::lock_guard<std::mutex> g(pages_alloc_mu_);
+        expandCapacityLocked(minCapacity);
+    }
+
+    // Pre-locked variant for callers that already hold pages_alloc_mu_
+    // (e.g., allocateSlotForSection's "new page" path which grows
+    // `pages_` and may also need to grow direct-id arrays).
+    void expandCapacityLocked(size_t minCapacity) {
         if (minCapacity <= totalVectors_) {
             return;
         }
@@ -661,8 +729,19 @@ private:
 
     // Write a vector into the section's write buffer.
     // When the page is full, flush the 4KB buffer to disk in one write.
+    //
+    // Concurrent-writer-refactor-plan §5.3: takes the section shard
+    // mutex so concurrent writers in the same section serialise on
+    // the buffer mutation, but writers in different sections proceed
+    // in parallel. Read-side helpers (overlayWriteBuf,
+    // tryReadFromWriteBuf) remain protected by the engine's lifecycle
+    // gate (Phase 1 takes EXCLUSIVE on INSERT, so concurrent reads
+    // during write are excluded externally); Phase 6 will need to
+    // upgrade those helpers to take the section shard shared.
     void writeToSectionBuffer(int sectionIdx, size_t pageId, uint16_t slot,
                               const std::vector<float>& vec) {
+        std::lock_guard<std::mutex> g(section_shard(sectionIdx));
+
         auto it = sectionWriteBufs_.find(sectionIdx);
         if (it == sectionWriteBufs_.end()) {
             SectionWriteBuf swb;
@@ -902,57 +981,89 @@ private:
     }
 
     // Allocate a free slot for a given sectionKey (creates section/pages on demand).
+    // Two-phase allocation per concurrent-writer-refactor-plan §5.3:
+    //   Phase A: section-local — under section_shard(sectionIdx).
+    //            If a free slot or an open page is available, allocate
+    //            from there.
+    //   Phase B: page allocator — under pages_alloc_mu_. Grow `pages_`
+    //            and the on-disk file. Then re-enter the section shard
+    //            to publish the new page into sectionOpenPages_.
+    //
+    // Different sections (different shards) can run Phase A in parallel.
+    // Same-section concurrent allocations serialise on the section shard
+    // for ~µs of bookkeeping; the actual record write happens later,
+    // unlocked. Phase B serialises ALL fresh-page allocations across
+    // sections (`pages_.push_back` is the constraint), but new pages
+    // are rare relative to slot allocations so this is rarely the
+    // bottleneck.
     std::pair<size_t,uint16_t> allocateSlotForSection(node_id_t sectionKey) {
-        // Map external sectionKey to internal sectionIdx
+        // Section-key → section-idx, under a tiny critical section
+        // (read-mostly, writes only on first vector of a new section).
         int sectionIdx;
-        auto it = sectionKeyToIdx_.find(sectionKey);
-        if (it == sectionKeyToIdx_.end()) {
-            sectionIdx = static_cast<int>(sectionIdxToKey_.size());
-            sectionKeyToIdx_[sectionKey] = sectionIdx;
-            sectionIdxToKey_.push_back(sectionKey);
-        } else {
-            sectionIdx = it->second;
-        }
-
-        auto& freeList = sectionFreeSlots_[sectionIdx];
-        if (!freeList.empty()) {
-            auto [pageId, slot] = freeList.back();
-            freeList.pop_back();
-            return {pageId, slot};
-        }
-
-        auto& openList = sectionOpenPages_[sectionIdx];
-
-        // If there is a not-full page in this section, use it
-        if (!openList.empty()) {
-            size_t pageId = openList.back();
-            openList.pop_back();
-            PageMeta& meta = pages_[pageId];
-            if (meta.usedSlots >= vectorsPerPage_) {
-                // Should not happen, but guard anyway
-                return allocateSlotForSection(sectionKey);
+        {
+            std::lock_guard<std::mutex> g(section_index_mu_);
+            auto it = sectionKeyToIdx_.find(sectionKey);
+            if (it == sectionKeyToIdx_.end()) {
+                sectionIdx = static_cast<int>(sectionIdxToKey_.size());
+                sectionKeyToIdx_[sectionKey] = sectionIdx;
+                sectionIdxToKey_.push_back(sectionKey);
+            } else {
+                sectionIdx = it->second;
             }
-            uint16_t slot = meta.usedSlots++;
-            if (meta.usedSlots < vectorsPerPage_) {
-                openList.push_back(pageId);
+        }
+
+        // Phase A: try free-slot or open-page reuse under the section
+        // shard mutex.
+        {
+            std::lock_guard<std::mutex> g(section_shard(sectionIdx));
+
+            auto& freeList = sectionFreeSlots_[sectionIdx];
+            if (!freeList.empty()) {
+                auto [pageId, slot] = freeList.back();
+                freeList.pop_back();
+                return {pageId, slot};
             }
-            return {pageId, slot};
+
+            auto& openList = sectionOpenPages_[sectionIdx];
+            if (!openList.empty()) {
+                size_t pageId = openList.back();
+                openList.pop_back();
+                // pages_ is a std::deque so reads/mutations of
+                // pages_[pageId] are stable while another shard's
+                // writer push_backs a new page. The section shard
+                // mutex serialises any access to pages_[pageId]
+                // belonging to THIS section.
+                PageMeta& meta = pages_[pageId];
+                if (meta.usedSlots < vectorsPerPage_) {
+                    uint16_t slot = meta.usedSlots++;
+                    if (meta.usedSlots < vectorsPerPage_) {
+                        openList.push_back(pageId);
+                    }
+                    return {pageId, slot};
+                }
+                // Defensive fallback (should not happen): page was full,
+                // fall through to fresh-page allocation.
+            }
         }
 
-        // Otherwise, allocate a new page for this section
-        size_t pageId = pages_.size();
-        pages_.push_back(PageMeta{sectionIdx, 0});
-        ensurePageAllocated(pageId);
-
-        PageMeta& meta = pages_.back();
-        meta.usedSlots = 1;
-        uint16_t slot = 0;
-
-        if (meta.usedSlots < vectorsPerPage_) {
-            openList.push_back(pageId);
+        // Phase B: allocate a fresh page for this section under the
+        // global pages allocator mutex.
+        size_t newPageId;
+        {
+            std::lock_guard<std::mutex> a(pages_alloc_mu_);
+            newPageId = pages_.size();
+            pages_.push_back(PageMeta{sectionIdx, /*usedSlots=*/1});
+            ensurePageAllocated(newPageId);
         }
 
-        return {pageId, slot};
+        // Publish the new page into sectionOpenPages_ if it has more
+        // slots; this re-enters the section shard.
+        if (vectorsPerPage_ > 1) {
+            std::lock_guard<std::mutex> g(section_shard(sectionIdx));
+            sectionOpenPages_[sectionIdx].push_back(newPageId);
+        }
+
+        return {newPageId, /*slot=*/0};
     }
 
 public:
@@ -1373,7 +1484,7 @@ public:
         }
 
         pages_.clear();
-        pages_.reserve(static_cast<size_t>(pagesSize));
+        // (deque doesn't take reserve(); growth is per-block, no relocation)
         for (uint64_t i = 0; i < pagesSize; ++i) {
             int32_t sectionIdx = 0;
             uint16_t usedSlots = 0;
