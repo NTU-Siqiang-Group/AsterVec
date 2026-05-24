@@ -205,7 +205,10 @@ void startShutdownWatcher() {
 
 bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err) {
     cfg->port = env_int("LSMVEC_PORT", 8000);
-    cfg->http_threads = env_int("LSMVEC_HTTP_THREADS", 0);
+    // Default: 1 thread per container. Per-user-container model
+    // handles isolation; no contention within a single container.
+    // Override with LSMVEC_HTTP_THREADS=N on dedicated hardware.
+    cfg->http_threads = env_int("LSMVEC_HTTP_THREADS", 1);
     cfg->data_dir = env_or("LSMVEC_DATA_DIR", "/data");
     cfg->dim = env_int("LSMVEC_DIM", 0);
 
@@ -658,11 +661,10 @@ private:
             try { bopts.num_threads = std::stoi(h_threads); }
             catch (...) {}
         }
-        if (bopts.num_threads <= 0) {
-            int hw = static_cast<int>(std::thread::hardware_concurrency());
-            if (hw <= 0) hw = 1;
-            bopts.num_threads = std::min(4, hw);
-        }
+        // Default to single-threaded build to match the server's
+        // single-thread-per-container philosophy. Caller can opt in
+        // to multi-threaded by setting X-LSMVec-Threads.
+        if (bopts.num_threads <= 0) bopts.num_threads = 1;
 
         const float* vectors =
             reinterpret_cast<const float*>(req.body.data());
@@ -777,11 +779,12 @@ int RunHttpServer(const HttpServerConfig& cfg) {
     g_server_ptr.store(&srv);
     startShutdownWatcher();
 
+    const int effective_threads =
+        cfg.http_threads > 0
+            ? cfg.http_threads
+            : 1;  // matches the default in LoadHttpConfigFromEnv
     std::cerr << "{\"event\":\"listening\",\"port\":" << cfg.port
-              << ",\"threads\":"
-              << (cfg.http_threads > 0
-                      ? cfg.http_threads
-                      : static_cast<int>(std::thread::hardware_concurrency() * 2))
+              << ",\"threads\":" << effective_threads
               << "}\n";
 
     bool ok = srv.listen("0.0.0.0", cfg.port);

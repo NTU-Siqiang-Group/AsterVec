@@ -24,7 +24,10 @@ namespace lsm_vec {
 struct HttpServerConfig {
     // ---- HTTP listener ----
     int port = 8000;
-    int http_threads = 0;            // 0 = auto (hardware_concurrency() * 2)
+    // Server defaults to single-threaded request handling: one user
+    // per container, no internal contention. Set LSMVEC_HTTP_THREADS=N
+    // to enable parallel request handling on dedicated hardware.
+    int http_threads = 1;
     int read_timeout_sec = 30;
     int write_timeout_sec = 30;
     std::size_t payload_max_length = 16 * 1024 * 1024;   // 16 MB (normal endpoints)
