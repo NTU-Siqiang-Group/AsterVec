@@ -1440,6 +1440,12 @@ using namespace ROCKSDB_NAMESPACE;
             improved = false;
             auto nodeIt = nodes_.find(current);
             if (nodeIt == nodes_.end()) break;
+            // Phase 4c read-side: hold the shard mutex during the
+            // neighbour iteration so a concurrent linkNeighbors /
+            // shrink writer on the same node serialises with us.
+            // computeDistance dominates the held-time so this is
+            // cheap relative to the surrounding work.
+            std::lock_guard<std::mutex> g(node_shard(current));
             auto layerIt = nodeIt->second.neighbors.find(layer);
             if (layerIt == nodeIt->second.neighbors.end()) break;
             for (node_id_t neighborId : layerIt->second) {
@@ -1547,10 +1553,12 @@ using namespace ROCKSDB_NAMESPACE;
                     continue; // Defensive: should not happen
                 }
 
+                // Phase 4c read-side: see greedy descent above.
+                std::lock_guard<std::mutex> g(node_shard(currentId));
                 const auto& neighborMap = nodeIt->second.neighbors;
                 auto it = neighborMap.find(layer);
                 if (it == neighborMap.end()) {
-                    continue; // No adjacency list at this layer (do not create it)
+                    continue; // No adjacency list at this layer
                 }
 
                 const auto& neighborIds = it->second;
