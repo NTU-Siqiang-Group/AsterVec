@@ -232,6 +232,28 @@ set_target_properties(concurrent_search_bench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+option(LSMVEC_BUILD_HTTP "Build the HTTP/REST server (lsm_vec_http)" ON)
+
+if(LSMVEC_BUILD_HTTP)
+    # cpp-httplib is header-only, vendored at third_party/httplib/.
+    add_executable(lsm_vec_http
+        src/lsm_vec_http_main.cc
+        src/lsm_vec_http.cc
+    )
+    target_include_directories(lsm_vec_http PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/third_party/httplib
+        ${CMAKE_SOURCE_DIR}/third_party/json
+    )
+    target_link_libraries(lsm_vec_http PRIVATE lsmvec_shared)
+    # httplib requires threads.
+    find_package(Threads REQUIRED)
+    target_link_libraries(lsm_vec_http PRIVATE Threads::Threads)
+    set_target_properties(lsm_vec_http PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+endif()
+
 option(LSMVEC_BUILD_PYTHON "Build Python bindings" OFF)
 option(LSMVEC_PYTHON_STATIC "Link Python module against static lib (for wheel builds)" OFF)
 
