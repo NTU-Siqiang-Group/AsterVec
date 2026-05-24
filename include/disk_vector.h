@@ -435,17 +435,35 @@ private:
     // -------------------------------------------------------------
     static constexpr size_t kNumSectionShards = 64;
 
+    // Section coalescing write buffer (one 4KB page per active section).
+    // Moved up here so SectionShard can hold a map of these.
+    struct SectionWriteBuf {
+        std::vector<char> data;  // kPageSize bytes
+        size_t pageId;
+        uint16_t filledSlots;
+    };
+
     /*
      * Per-shard state: each shard owns its own mutex AND its own
-     * (openPages, freeSlots) maps. Structural fix for the race noted
-     * above — `operator[]` mutations on the maps now happen only
-     * under THIS shard's mutex, never racing with other shards'
-     * threads.
+     * (openPages, freeSlots, writeBufs) maps. This is the structural
+     * fix for the race noted above — `operator[]` mutations on the
+     * maps now happen only under THIS shard's mutex, never racing
+     * with other shards' threads.
+     *
+     * writeBufs holds the per-section 4KB coalescing write buffer
+     * (formerly a single global map under sectionWriteBufsMu_). Move
+     * follows commit 4a1e216 (openPages/freeSlots) — internal review
+     * for build-time scaling: same-shard accesses still serialise
+     * (and now share the lock with allocateSlotForSection, which is
+     * already called sequentially with writeToSectionBuffer for the
+     * same section), but cross-section writes for different shards
+     * run in parallel.
      */
     struct SectionShard {
         mutable std::mutex                                              mu;
         std::unordered_map<int, std::vector<size_t>>                    openPages;
         std::unordered_map<int, std::vector<std::pair<size_t,uint16_t>>> freeSlots;
+        std::unordered_map<int, SectionWriteBuf>                        writeBufs;  // sectionIdx -> buf
     };
     mutable std::array<SectionShard, kNumSectionShards> sectionShards_;
     // Phase 5 (concurrent-writer-refactor-plan §5.3 / §5.4): upgraded
@@ -601,22 +619,12 @@ private:
     // alloc).
 
     // Section write buffer: per-section 4KB buffer for coalesced writes via pwrite
-    struct SectionWriteBuf {
-        std::vector<char> data;  // kPageSize bytes
-        size_t pageId;
-        uint16_t filledSlots;
-    };
-    // Phase 6 (internal review): a single std::mutex guards both the
-    // map structure (find/emplace/erase) and the per-entry content
-    // (data/pageId mutations). The map is small (one entry per active
-    // section, typically <= 64) and writes are short, so a single
-    // mutex avoids the complexity of sharded structural ops while
-    // making readers (overlayWriteBuf / tryReadFromWriteBuf /
-    // tryReadFromWriteBufFlat) safe under concurrent writers.
-    // sectionWriteBufsCount_ is a fast-path empty hint; readers skip
-    // the mutex acquire when no writer has buffered anything.
-    std::unordered_map<int, SectionWriteBuf> sectionWriteBufs_; // sectionIdx -> buf
-    mutable std::mutex                       sectionWriteBufsMu_;
+    // SectionWriteBuf is defined above (next to SectionShard) so the
+    // shard struct can own its writeBufs map. The buffers themselves
+    // live in sectionShards_[*].writeBufs; this counter is a global
+    // fast-path "is anything buffered anywhere?" hint that lets
+    // readers (overlayWriteBuf / tryReadFromWriteBuf{,Flat}) skip the
+    // shard mutex when no writer has buffered anything yet.
     std::atomic<size_t>                      sectionWriteBufsCount_{0};
     int writeFd_ = -1;  // file descriptor for pwrite-based writes
 
@@ -808,29 +816,31 @@ private:
     // Write a vector into the section's write buffer.
     // When the page is full, flush the 4KB buffer to disk in one write.
     //
-    // Concurrent-writer-refactor-plan §5.3 + Phase 6 (internal review):
-    // a single sectionWriteBufsMu_ serialises all sectionWriteBufs_
-    // structural and content access. Per-section parallelism would
-    // require sharding the map; the per-write critical section here is
-    // short (memcpy 128B into a 4KB buffer) so contention is bounded.
+    // internal review (build scaling): writeBufs is per-shard, so
+    // different sections (different shards) write in parallel. Same-
+    // shard accesses still serialise on shard.mu, which also covers
+    // openPages/freeSlots — but allocateSlotForSection and
+    // writeToSectionBuffer are called sequentially for the same section
+    // (in storeVectorToDisk), so combining the lock doesn't worsen
+    // serialisation for same-section traffic.
     void writeToSectionBuffer(int sectionIdx, size_t pageId, uint16_t slot,
                               const std::vector<float>& vec) {
-        // Lock-order rule (Phase 6, internal review follow-up):
-        //   sectionWriteBufsMu_ is acquired BELOW; page_mu_ (via
+        // Lock-order rule:
+        //   shard.mu is acquired BELOW; page_mu_ (via
         //   updateCacheAfterWrite) is acquired AFTER releasing
-        //   sectionWriteBufsMu_. Readers (readVectorsBatchFlat pass 1
-        //   below) take page_mu_ shared FIRST and never re-enter
-        //   sectionWriteBufsMu_ under that lock, so the two paths
-        //   cannot deadlock.
+        //   shard.mu. Readers (readVectorsBatchFlat pass 1) take
+        //   page_mu_ shared FIRST and never re-enter any shard.mu
+        //   under that lock, so the two paths cannot deadlock.
+        SectionShard& shard = section_shard_state(sectionIdx);
         {
-            std::lock_guard<std::mutex> g(sectionWriteBufsMu_);
+            std::lock_guard<std::mutex> g(shard.mu);
 
-            auto it = sectionWriteBufs_.find(sectionIdx);
-            if (it == sectionWriteBufs_.end()) {
+            auto it = shard.writeBufs.find(sectionIdx);
+            if (it == shard.writeBufs.end()) {
                 SectionWriteBuf swb;
                 swb.pageId = pageId;
                 swb.data.resize(kPageSize, 0);
-                it = sectionWriteBufs_.emplace(sectionIdx, std::move(swb)).first;
+                it = shard.writeBufs.emplace(sectionIdx, std::move(swb)).first;
                 sectionWriteBufsCount_.fetch_add(1, std::memory_order_relaxed);
             }
 
@@ -849,14 +859,14 @@ private:
             // If page is full, flush to disk and free the buffer
             if (slot + 1 >= vectorsPerPage_) {
                 flushSectionWriteBuf(swb);
-                sectionWriteBufs_.erase(it);
+                shard.writeBufs.erase(it);
                 sectionWriteBufsCount_.fetch_sub(1, std::memory_order_relaxed);
             }
         }
 
-        // Page-cache update OUTSIDE sectionWriteBufsMu_ to avoid the
-        // lock-order inversion noted above. updateCacheAfterWrite takes
-        // page_mu_ exclusive on its own.
+        // Page-cache update OUTSIDE shard.mu to avoid the lock-order
+        // inversion noted above. updateCacheAfterWrite takes page_mu_
+        // exclusive on its own.
         updateCacheAfterWrite(pageId, slot, vec);
     }
 
@@ -876,9 +886,10 @@ private:
         if (sectionWriteBufsCount_.load(std::memory_order_relaxed) == 0) return;
         int sectionIdx = section_idx_of_page_locked(pageId);
         if (sectionIdx < 0) return;
-        std::lock_guard<std::mutex> g(sectionWriteBufsMu_);
-        auto it = sectionWriteBufs_.find(sectionIdx);
-        if (it != sectionWriteBufs_.end() && it->second.pageId == pageId) {
+        const SectionShard& shard = section_shard_state(sectionIdx);
+        std::lock_guard<std::mutex> g(shard.mu);
+        auto it = shard.writeBufs.find(sectionIdx);
+        if (it != shard.writeBufs.end() && it->second.pageId == pageId) {
             std::memcpy(buf.data.data(), it->second.data.data(), kPageSize);
         }
     }
@@ -888,9 +899,10 @@ private:
         if (sectionWriteBufsCount_.load(std::memory_order_relaxed) == 0) return false;
         int sectionIdx = section_idx_of_page_locked(pageId);
         if (sectionIdx < 0) return false;
-        std::lock_guard<std::mutex> g(sectionWriteBufsMu_);
-        auto it = sectionWriteBufs_.find(sectionIdx);
-        if (it == sectionWriteBufs_.end() || it->second.pageId != pageId) return false;
+        const SectionShard& shard = section_shard_state(sectionIdx);
+        std::lock_guard<std::mutex> g(shard.mu);
+        auto it = shard.writeBufs.find(sectionIdx);
+        if (it == shard.writeBufs.end() || it->second.pageId != pageId) return false;
         size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
         if (vec.size() != dim_) vec.resize(dim_);
         dequantize(it->second.data.data() + offsetInPage, vec.data(), dim_);
@@ -902,9 +914,10 @@ private:
         if (sectionWriteBufsCount_.load(std::memory_order_relaxed) == 0) return false;
         int sectionIdx = section_idx_of_page_locked(pageId);
         if (sectionIdx < 0) return false;
-        std::lock_guard<std::mutex> g(sectionWriteBufsMu_);
-        auto it = sectionWriteBufs_.find(sectionIdx);
-        if (it == sectionWriteBufs_.end() || it->second.pageId != pageId) return false;
+        const SectionShard& shard = section_shard_state(sectionIdx);
+        std::lock_guard<std::mutex> g(shard.mu);
+        auto it = shard.writeBufs.find(sectionIdx);
+        if (it == shard.writeBufs.end() || it->second.pageId != pageId) return false;
         size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
         dequantize(it->second.data.data() + offsetInPage, out, dim);
         return true;
@@ -1232,14 +1245,16 @@ public:
 
     // Flush all remaining section write buffers (partially filled pages).
     // Runs under the engine's exclusive lifecycle gate, but also takes
-    // sectionWriteBufsMu_ for explicit serialisation against any in-
-    // flight writeToSectionBuffer (defence-in-depth).
+    // each shard.mu for explicit serialisation against any in-flight
+    // writeToSectionBuffer (defence-in-depth).
     void flushWrites() override {
-        std::lock_guard<std::mutex> g(sectionWriteBufsMu_);
-        for (auto& [sectionIdx, swb] : sectionWriteBufs_) {
-            flushSectionWriteBuf(swb);
+        for (auto& shard : sectionShards_) {
+            std::lock_guard<std::mutex> g(shard.mu);
+            for (auto& [sectionIdx, swb] : shard.writeBufs) {
+                flushSectionWriteBuf(swb);
+            }
+            shard.writeBufs.clear();
         }
-        sectionWriteBufs_.clear();
         sectionWriteBufsCount_.store(0, std::memory_order_relaxed);
     }
 
