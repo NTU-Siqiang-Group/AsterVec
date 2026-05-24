@@ -143,6 +143,57 @@ inline float L2Norm(const float* __restrict a, std::size_t size)
     return std::sqrt(sum);
 }
 
+// Sum-of-squared-differences. Preserves ordering of L2Distance but
+// skips the final sqrt — ~10 ns/call cheaper. Use when callers compare
+// distances (sort, k-NN, RNG-prune, etc.) and don't need the actual
+// metric value. Saves significant time in tight loops like RNN-Descent.
+inline float L2SquaredDistance(const float* __restrict a,
+                               const float* __restrict b,
+                               std::size_t size)
+{
+    std::size_t i = 0;
+    float sum = 0.0f;
+
+#if defined(__AVX2__)
+    if (size >= 8) {
+        __m256 acc = _mm256_setzero_ps();
+        const std::size_t bound = size - (size % 8);
+        const bool aligned = detail::is_aligned(a, 32) && detail::is_aligned(b, 32);
+        const float* aligned_a = aligned ? static_cast<const float*>(__builtin_assume_aligned(a, 32)) : a;
+        const float* aligned_b = aligned ? static_cast<const float*>(__builtin_assume_aligned(b, 32)) : b;
+        for (; i < bound; i += 8) {
+            const __m256 va = aligned ? _mm256_load_ps(aligned_a + i)
+                                      : _mm256_loadu_ps(a + i);
+            const __m256 vb = aligned ? _mm256_load_ps(aligned_b + i)
+                                      : _mm256_loadu_ps(b + i);
+            const __m256 diff = _mm256_sub_ps(va, vb);
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+        }
+        sum += detail::horizontal_add(acc);
+    }
+#endif
+
+#if defined(__SSE2__)
+    if (size - i >= 4) {
+        __m128 acc = _mm_setzero_ps();
+        const std::size_t bound = i + ((size - i) / 4) * 4;
+        for (; i < bound; i += 4) {
+            const __m128 va = _mm_loadu_ps(a + i);
+            const __m128 vb = _mm_loadu_ps(b + i);
+            const __m128 diff = _mm_sub_ps(va, vb);
+            acc = _mm_add_ps(acc, _mm_mul_ps(diff, diff));
+        }
+        sum += detail::horizontal_add(acc);
+    }
+#endif
+
+    for (; i < size; ++i) {
+        float diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return sum;
+}
+
 inline float L2Distance(const float* __restrict a,
                         const float* __restrict b,
                         std::size_t size)

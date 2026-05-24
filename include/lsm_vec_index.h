@@ -298,6 +298,26 @@ using namespace ROCKSDB_NAMESPACE;
         node_id_t knnSearch(const std::vector<float> &queryVector);
         Status deleteNode(node_id_t id);
         Status getNodeVector(node_id_t id, std::vector<float>* out);
+
+        // ----- Bulk build (in-memory) -----
+        // Build the full index from `n` contiguous vectors using
+        // RNN-Descent for the layer-0 KNN graph and MIRAGE-style
+        // top-down upper-layer insertion. Initial-load only:
+        // caller must invoke on an empty index (entry_point_ ==
+        // k_invalid_node_id). Throws std::runtime_error on failure.
+        //
+        // See docs/IN_MEMORY_BUILD_PLAN.md for the algorithm and
+        // pipeline details.
+        void bulkBuild(const float* vectors, int n,
+                       const BulkBuildOptions& opts);
+
+        // True iff the index has never had a node published (no
+        // Insert / BulkBuild has succeeded). Used by LSMVecDB::BulkBuild
+        // to enforce the initial-load-only precondition.
+        bool isEmpty() const {
+            return entry_point_.load(std::memory_order_acquire)
+                   == k_invalid_node_id;
+        }
         std::vector<SearchResult> knnSearchK(const std::vector<float>& query, int k, int ef_search);
         std::vector<SearchResult> knnSearchKFiltered(
             const std::vector<float>& query,
@@ -393,6 +413,23 @@ using namespace ROCKSDB_NAMESPACE;
         }
 
     private:
+        // ----- Bulk build internals (see bulkBuild() above + plan) -----
+        // Phase D: write all vectors + layer-0 edges to disk in parallel.
+        // csr_offsets/csr_neighbors come from RNN-Descent in phase B;
+        // levels[u] is the pre-assigned HNSW level of node u.
+        void bulkLoadLayer0(const float* vectors, int n,
+                            const int* csr_offsets,
+                            const int* csr_neighbors,
+                            const int* levels,
+                            int num_threads);
+        // Phase E: upper-layer-only insert. Factored from insertNode
+        // with layer-0 work removed. Expects the node to be pre-published
+        // into nodes_ with `point` set, and entry_point_/max_layer_
+        // already pointing at the bulk-build's final entry node.
+        void addPointUpperLayersOnly(node_id_t nodeId,
+                                     const float* vec_ptr,
+                                     int presetLevel);
+
         // 20260516_upper_layer_sq8 helpers.
         // quantizeNodePoint: destructive — writes n.q8_data/q_min/q_max from
         // n.point, then swaps n.point to empty.

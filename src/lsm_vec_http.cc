@@ -365,6 +365,14 @@ public:
             int status = handleSearch(req, res);
             logReq(req, status, t.ms());
         });
+
+        // Bulk build (initial-load only; binary octet-stream body).
+        s.Post("/v1/build/bulk",
+               [this](const httplib::Request& req, httplib::Response& res) {
+            ReqTimer t;
+            int status = handleBulkBuild(req, res);
+            logReq(req, status, t.ms());
+        });
     }
 
 private:
@@ -600,6 +608,92 @@ private:
         return 200;
     }
 
+    int handleBulkBuild(const httplib::Request& req, httplib::Response& res) {
+        // Header-driven shape (avoids JSON parsing of a 50+ MB blob).
+        auto get_hdr = [&](const char* k) -> std::string {
+            auto it = req.headers.find(k);
+            return it == req.headers.end() ? "" : it->second;
+        };
+        std::string h_n   = get_hdr("X-LSMVec-N");
+        std::string h_dim = get_hdr("X-LSMVec-Dim");
+        if (h_n.empty() || h_dim.empty()) {
+            sendError(res, 400, "missing_header",
+                      "X-LSMVec-N and X-LSMVec-Dim required");
+            return 400;
+        }
+        long long n_ll = 0, dim_ll = 0;
+        try {
+            n_ll = std::stoll(h_n);
+            dim_ll = std::stoll(h_dim);
+        } catch (...) {
+            sendError(res, 400, "bad_header",
+                      "X-LSMVec-N / X-LSMVec-Dim must be integers");
+            return 400;
+        }
+        if (n_ll <= 0 || dim_ll <= 0) {
+            sendError(res, 400, "bad_header",
+                      "n and dim must be positive");
+            return 400;
+        }
+        if (dim_ll != cfg_.dim) {
+            sendError(res, 400, "wrong_dim",
+                      "X-LSMVec-Dim (" + std::to_string(dim_ll) +
+                      ") does not match DB dim (" +
+                      std::to_string(cfg_.dim) + ")");
+            return 400;
+        }
+        const std::size_t expected_bytes =
+            static_cast<std::size_t>(n_ll) *
+            static_cast<std::size_t>(dim_ll) * sizeof(float);
+        if (req.body.size() != expected_bytes) {
+            sendError(res, 400, "bad_payload",
+                      "body size " + std::to_string(req.body.size()) +
+                      " != n*dim*4 = " + std::to_string(expected_bytes));
+            return 400;
+        }
+
+        BulkBuildOptions bopts;
+        std::string h_threads = get_hdr("X-LSMVec-Threads");
+        if (!h_threads.empty()) {
+            try { bopts.num_threads = std::stoi(h_threads); }
+            catch (...) {}
+        }
+        if (bopts.num_threads <= 0) {
+            int hw = static_cast<int>(std::thread::hardware_concurrency());
+            if (hw <= 0) hw = 1;
+            bopts.num_threads = std::min(4, hw);
+        }
+
+        const float* vectors =
+            reinterpret_cast<const float*>(req.body.data());
+        const int n = static_cast<int>(n_ll);
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        Status s = db_->BulkBuild(
+            Span<const float>(vectors,
+                              static_cast<std::size_t>(n) *
+                                  static_cast<std::size_t>(dim_ll)),
+            n, bopts);
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        if (!s.ok()) {
+            int status = statusFromDb(s);
+            // Map "DB already has data" InvalidArgument to a clearer code.
+            std::string code = (status == 400) ? "db_not_empty" : "db_error";
+            sendError(res, status, code, s.ToString());
+            return status;
+        }
+
+        double elapsed_ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        double vps = static_cast<double>(n) / (elapsed_ms / 1000.0);
+        sendJson(res, 200, {{"n", n},
+                            {"elapsed_ms", elapsed_ms},
+                            {"vectors_per_sec", vps},
+                            {"threads", bopts.num_threads}});
+        return 200;
+    }
+
     LSMVecDB*               db_;
     const HttpServerConfig& cfg_;
 };
@@ -652,7 +746,11 @@ int RunHttpServer(const HttpServerConfig& cfg) {
 
     // 2. Build server, register routes.
     httplib::Server srv;
-    srv.set_payload_max_length(cfg.payload_max_length);
+    // We need a single global payload cap on httplib (no per-route knob
+    // in v0.18). Use the bulk-build ceiling so /v1/build/bulk can accept
+    // datasets up to ~4 GB. The normal endpoints still enforce their
+    // smaller cap inside the handler via Content-Length checks.
+    srv.set_payload_max_length(cfg.bulk_build_max_length);
     srv.set_read_timeout(cfg.read_timeout_sec, 0);
     srv.set_write_timeout(cfg.write_timeout_sec, 0);
 

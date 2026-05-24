@@ -591,6 +591,45 @@ void LSMVecDB::printStatistics() const
     index_->printStatistics();
 }
 
+Status LSMVecDB::BulkBuild(Span<const float> vectors, int n,
+                           const BulkBuildOptions& opts)
+{
+    if (!index_) return Status::InvalidArgument("db not opened");
+    if (n <= 0) return Status::InvalidArgument("n must be > 0");
+    if (options_.dim <= 0) {
+        return Status::InvalidArgument("dim not set on db options");
+    }
+    if (vectors.size() !=
+        static_cast<size_t>(n) * static_cast<size_t>(options_.dim)) {
+        return Status::InvalidArgument(
+            "vectors.size() must equal n * dim");
+    }
+    // Empty-DB precondition. BulkBuild is permanently initial-load
+    // only — see docs/IN_MEMORY_BUILD_PLAN.md §0. We approximate
+    // "empty" with: no entry point published, no in-memory upper-layer
+    // nodes, no persisted dense slot. Caller that wants to rebuild
+    // should Close() the DB, remove the data dir, and re-Open with
+    // reinit=true (or pass an empty/new path).
+    if (!index_->isEmpty()) {
+        return Status::InvalidArgument(
+            "BulkBuild requires an empty DB (entry_point already set). "
+            "BulkBuild is initial-load-only; use Insert() for incremental "
+            "updates on a non-empty DB.");
+    }
+
+    try {
+        index_->bulkBuild(vectors.data(), n, opts);
+    } catch (const std::exception& e) {
+        return Status::IOError(std::string("BulkBuild failed: ") + e.what());
+    } catch (...) {
+        return Status::IOError("BulkBuild failed (unknown exception)");
+    }
+
+    // Match Insert's post-write side effects.
+    flushVectorWrites();
+    return Status::OK();
+}
+
 void LSMVecDB::flushVectorWrites()
 {
     if (index_) {

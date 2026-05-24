@@ -27,7 +27,8 @@ struct HttpServerConfig {
     int http_threads = 0;            // 0 = auto (hardware_concurrency() * 2)
     int read_timeout_sec = 30;
     int write_timeout_sec = 30;
-    std::size_t payload_max_length = 16 * 1024 * 1024;   // 16 MB
+    std::size_t payload_max_length = 16 * 1024 * 1024;   // 16 MB (normal endpoints)
+    std::size_t bulk_build_max_length = 4ULL * 1024 * 1024 * 1024;  // 4 GB ceiling for /v1/build/bulk
 
     // ---- LSM-Vec engine ----
     std::string data_dir = "/data";

@@ -30,6 +30,18 @@ enum class DistanceMetric {
     kCosine,
 };
 
+// Tuning knobs for the in-memory bulk-build path. Defaults match the
+// RNN-Descent paper's recommended sweet spot. Bulk build is
+// initial-load only; see docs/IN_MEMORY_BUILD_PLAN.md.
+struct BulkBuildOptions {
+    int num_threads = 0;   // 0 → auto = min(4, hw_concurrency)
+    int rnnd_S       = 16; // initial random neighbour count
+    int rnnd_T1      = 4;  // outer iterations
+    int rnnd_T2      = 15; // inner iterations per outer
+    int rnnd_R       = 64; // pool cap = max output degree
+                           // (truncated to m_max_ on disk write)
+};
+
 template <typename T>
 class Span {
 public:
@@ -114,6 +126,23 @@ public:
 
     Status SearchKnn(Span<float> query,
                      std::vector<SearchResult>* out);
+
+    // ----- In-memory bulk build (initial load only) -----
+    // Build the entire index in memory from `n` contiguous vectors,
+    // then write to disk in one pass. IDs are assigned 0..n-1 in
+    // order; vector i occupies vectors[i*dim..(i+1)*dim).
+    //
+    // REQUIRES: DB is empty (no Insert calls have happened, no
+    // persisted data). Returns Status::InvalidArgument otherwise.
+    //
+    // This is the recommended way to populate an empty DB. For
+    // incremental updates on a non-empty DB, use Insert() (one at a
+    // time, or many concurrent calls from a thread pool — Phase A
+    // makes the underlying engine thread-safe).
+    //
+    // See docs/IN_MEMORY_BUILD_PLAN.md.
+    Status BulkBuild(Span<const float> vectors, int n,
+                     const BulkBuildOptions& opts);
 
     void printStatistics() const;
     void flushVectorWrites();

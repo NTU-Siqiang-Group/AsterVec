@@ -128,6 +128,8 @@ set(LIB_SOURCES
     src/metadata.cc
     src/metadata_store.cc
     src/bloom_filter.cc
+    src/lsm_vec_rnn_descent.cc
+    src/lsm_vec_bulk_build.cc
 )
 
 find_library(ZSTD_LIB zstd

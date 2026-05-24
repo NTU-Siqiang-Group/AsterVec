@@ -24,6 +24,7 @@ add_executable(lsmvec_unit_tests
     test_delete_persistence.cc
     test_delete_stress.cc
     test_concurrent_search.cc
+    test_bulk_build.cc
     # A1.7 Phase 0 torture tests (test_quiesce_backup.cc intentionally
     # SKIPPED — pglsmvec-only; see the design docs §4.6).
     test_recall_baseline.cc

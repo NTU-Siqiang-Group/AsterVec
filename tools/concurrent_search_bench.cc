@@ -47,6 +47,7 @@ struct Args {
     std::vector<int> build_threads_list = {1};  // sequential build by default
     bool skip_search = false;
     bool skip_build = false;
+    bool use_bulk_build = false;  // when true, use LSMVecDB::BulkBuild instead of per-Insert loop
 };
 
 std::vector<int> parseThreadsList(const std::string& s) {
@@ -82,6 +83,7 @@ Args parseArgs(int argc, char* argv[]) {
         else if (k == "--build-threads") a.build_threads_list = parseThreadsList(next());
         else if (k == "--skip-search") a.skip_search = true;
         else if (k == "--skip-build")  a.skip_build  = true;
+        else if (k == "--bulk-build")  a.use_bulk_build = true;
         else { std::cerr << "Unknown flag: " << k << "\n"; std::exit(2); }
     }
     if (a.db_path.empty() || a.input_file.empty() || a.query_file.empty()) {
@@ -175,25 +177,47 @@ int main(int argc, char* argv[]) {
             if (!st.ok()) { std::cerr << "Open: " << st.ToString() << "\n"; return 1; }
 
             std::atomic<size_t> failed{0};
-            auto build_worker = [&](int tid) {
-                const size_t total = inputs.size();
-                const size_t chunk = (total + bt - 1) / bt;
-                const size_t lo = std::min(total, static_cast<size_t>(tid) * chunk);
-                const size_t hi = std::min(total, lo + chunk);
-                for (size_t i = lo; i < hi; ++i) {
-                    auto s = local_db->Insert(
-                        static_cast<uint64_t>(i),
-                        lsm_vec::Span<float>(const_cast<std::vector<float>&>(inputs[i])));
-                    if (!s.ok()) failed.fetch_add(1, std::memory_order_relaxed);
-                }
-            };
-
             auto t0 = std::chrono::high_resolution_clock::now();
-            std::vector<std::thread> ts;
-            ts.reserve(bt);
-            for (int t = 0; t < bt; ++t) ts.emplace_back(build_worker, t);
-            for (auto& t : ts) t.join();
-            local_db->flushVectorWrites();
+
+            if (args.use_bulk_build) {
+                // Single BulkBuild call. opts.num_threads = bt.
+                // Flatten inputs into a contiguous float buffer once.
+                static std::vector<float> flat;  // reused across bt values
+                if (flat.size() != inputs.size() * static_cast<size_t>(dim)) {
+                    flat.resize(inputs.size() * static_cast<size_t>(dim));
+                    for (size_t i = 0; i < inputs.size(); ++i) {
+                        std::memcpy(flat.data() + i * dim, inputs[i].data(),
+                                    dim * sizeof(float));
+                    }
+                }
+                lsm_vec::BulkBuildOptions bopts;
+                bopts.num_threads = bt;
+                auto s = local_db->BulkBuild(
+                    lsm_vec::Span<const float>(flat.data(), flat.size()),
+                    static_cast<int>(inputs.size()), bopts);
+                if (!s.ok()) {
+                    std::cerr << "BulkBuild failed: " << s.ToString() << "\n";
+                    return 1;
+                }
+            } else {
+                auto build_worker = [&](int tid) {
+                    const size_t total = inputs.size();
+                    const size_t chunk = (total + bt - 1) / bt;
+                    const size_t lo = std::min(total, static_cast<size_t>(tid) * chunk);
+                    const size_t hi = std::min(total, lo + chunk);
+                    for (size_t i = lo; i < hi; ++i) {
+                        auto s = local_db->Insert(
+                            static_cast<uint64_t>(i),
+                            lsm_vec::Span<float>(const_cast<std::vector<float>&>(inputs[i])));
+                        if (!s.ok()) failed.fetch_add(1, std::memory_order_relaxed);
+                    }
+                };
+                std::vector<std::thread> ts;
+                ts.reserve(bt);
+                for (int t = 0; t < bt; ++t) ts.emplace_back(build_worker, t);
+                for (auto& t : ts) t.join();
+                local_db->flushVectorWrites();
+            }
             auto t1 = std::chrono::high_resolution_clock::now();
 
             double build_s = std::chrono::duration<double>(t1 - t0).count();
