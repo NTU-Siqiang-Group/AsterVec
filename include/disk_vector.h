@@ -41,7 +41,12 @@
 //
 //   * storeVectorToDisk acquires:
 //       - sectionShards_[sectionIdx % 64] for section bookkeeping
-//         (sectionFreeSlots_, sectionOpenPages_, sectionWriteBufs_)
+//         (sectionFreeSlots_, sectionOpenPages_)
+//       - sectionWriteBufsMu_ for the section write-buffer map
+//         (Phase 6 / internal review: a single mutex covers map
+//         structure + per-entry content; readers
+//         overlayWriteBuf / tryReadFromWriteBuf{,Flat} take the same
+//         mutex, with an atomic-counter fast-path for the empty case)
 //       - pages_alloc_mu_ briefly when allocating a fresh page
 //         (pages_.push_back + ensurePageAllocated + the dense-array
 //         capacity grow path expandCapacity)
@@ -362,6 +367,11 @@ private:
     size_t dim_;            // vector dimension
     size_t recordSize_;     // SQ8: dim_ + 2 * sizeof(float)
     size_t totalVectors_;   // logical ID capacity
+    // Phase 6 (internal review): the lock-free page_of/slot_of hot
+    // path was reverted (it was UB under the C++ memory model). This
+    // atomic is no longer load-bearing for correctness; it remains
+    // only for the future packed-atomic chunk-array primitive (§5.4).
+    mutable std::atomic<size_t> totalVectors_atomic_{0};
     size_t vectorsPerPage_; // how many vectors fit into one page (floor division)
 
     std::fstream fileStream_;
@@ -439,14 +449,25 @@ private:
     // These transparently route direct ids to dense arrays and update ids to
     // the sparse hashmap, so the public methods don't have to branch.
 
+    // Phase 6 (internal review): the previous "lock-free hot read path"
+    // optimisation was incorrect under the C++ memory model — a plain
+    // std::vector<int64_t>::operator[] read concurrent with a plain
+    // operator[] write is a data race regardless of natural-aligned
+    // hardware atomicity. Reverted to a shared_lock(pages_alloc_mu_)
+    // for the dense-id branch. The proper long-term fix is the §5.4
+    // packed-atomic chunk array primitive (deferred). The macOS
+    // measurement showed the lock-free path was within noise anyway
+    // (~4164 QPS in both modes).
     int64_t page_of(node_id_t id) const {
         if (is_direct_id(id)) {
-            // Phase 5: shared lock so a concurrent assign_location
-            // / expandCapacity can't realloc the vector beneath us
-            // and so we read a coherent published value.
+            // A1.15 introduced a lock-free read via totalVectors_atomic_;
+            // A1.16 (Codex review) reverted it because concurrent
+            // assign_location overflow into the sparse path makes the
+            // lock-free read unsafe in edge cases. totalVectors_atomic_
+            // remains for storeVectorToDisk publish ordering elsewhere.
+            // 20260516_narrow_idtopage: idToPage_ is int32_t; widen for API.
             std::shared_lock<std::shared_mutex> g(pages_alloc_mu_);
-            if (static_cast<size_t>(id) >= totalVectors_) return -1;
-            // 20260516_narrow_idtopage: idToPage_ is int32_t; widen for the API contract.
+            if (static_cast<size_t>(id) >= idToPage_.size()) return -1;
             return static_cast<int64_t>(idToPage_[static_cast<size_t>(id)]);
         }
         // update-id branch: sparse map under update_loc_mu_.
@@ -458,7 +479,7 @@ private:
     uint16_t slot_of(node_id_t id) const {
         if (is_direct_id(id)) {
             std::shared_lock<std::shared_mutex> g(pages_alloc_mu_);
-            if (static_cast<size_t>(id) >= totalVectors_) return 0;
+            if (static_cast<size_t>(id) >= idToSlotInPage_.size()) return 0;
             return idToSlotInPage_[static_cast<size_t>(id)];
         }
         // update-id branch: sparse map under update_loc_mu_.
@@ -561,7 +582,18 @@ private:
         size_t pageId;
         uint16_t filledSlots;
     };
+    // Phase 6 (internal review): a single std::mutex guards both the
+    // map structure (find/emplace/erase) and the per-entry content
+    // (data/pageId mutations). The map is small (one entry per active
+    // section, typically <= 64) and writes are short, so a single
+    // mutex avoids the complexity of sharded structural ops while
+    // making readers (overlayWriteBuf / tryReadFromWriteBuf /
+    // tryReadFromWriteBufFlat) safe under concurrent writers.
+    // sectionWriteBufsCount_ is a fast-path empty hint; readers skip
+    // the mutex acquire when no writer has buffered anything.
     std::unordered_map<int, SectionWriteBuf> sectionWriteBufs_; // sectionIdx -> buf
+    mutable std::mutex                       sectionWriteBufsMu_;
+    std::atomic<size_t>                      sectionWriteBufsCount_{0};
     int writeFd_ = -1;  // file descriptor for pwrite-based writes
 
     // SQ8 quantize: float32[dim] → [min(4B), max(4B), uint8[dim]]
@@ -713,6 +745,10 @@ private:
         idToSlotInPage_.resize(target, 0);
         deletedFlags_.resize(target, 0);
         totalVectors_ = target;
+        // Mirror to the atomic field for the future packed-atomic chunk
+        // array; no longer load-bearing for correctness now that
+        // page_of / slot_of take pages_alloc_mu_ shared again.
+        totalVectors_atomic_.store(target, std::memory_order_release);
     }
 
     // Ensure that the file is large enough to contain pageId (0-based)
@@ -748,53 +784,75 @@ private:
     // Write a vector into the section's write buffer.
     // When the page is full, flush the 4KB buffer to disk in one write.
     //
-    // Concurrent-writer-refactor-plan §5.3: takes the section shard
-    // mutex so concurrent writers in the same section serialise on
-    // the buffer mutation, but writers in different sections proceed
-    // in parallel. Read-side helpers (overlayWriteBuf,
-    // tryReadFromWriteBuf) remain protected by the engine's lifecycle
-    // gate (Phase 1 takes EXCLUSIVE on INSERT, so concurrent reads
-    // during write are excluded externally); Phase 6 will need to
-    // upgrade those helpers to take the section shard shared.
+    // Concurrent-writer-refactor-plan §5.3 + Phase 6 (internal review):
+    // a single sectionWriteBufsMu_ serialises all sectionWriteBufs_
+    // structural and content access. Per-section parallelism would
+    // require sharding the map; the per-write critical section here is
+    // short (memcpy 128B into a 4KB buffer) so contention is bounded.
     void writeToSectionBuffer(int sectionIdx, size_t pageId, uint16_t slot,
                               const std::vector<float>& vec) {
-        std::lock_guard<std::mutex> g(section_shard(sectionIdx));
+        // Lock-order rule (Phase 6, internal review follow-up):
+        //   sectionWriteBufsMu_ is acquired BELOW; page_mu_ (via
+        //   updateCacheAfterWrite) is acquired AFTER releasing
+        //   sectionWriteBufsMu_. Readers (readVectorsBatchFlat pass 1
+        //   below) take page_mu_ shared FIRST and never re-enter
+        //   sectionWriteBufsMu_ under that lock, so the two paths
+        //   cannot deadlock.
+        {
+            std::lock_guard<std::mutex> g(sectionWriteBufsMu_);
 
-        auto it = sectionWriteBufs_.find(sectionIdx);
-        if (it == sectionWriteBufs_.end()) {
-            SectionWriteBuf swb;
-            swb.pageId = pageId;
-            swb.data.resize(kPageSize, 0);
-            it = sectionWriteBufs_.emplace(sectionIdx, std::move(swb)).first;
+            auto it = sectionWriteBufs_.find(sectionIdx);
+            if (it == sectionWriteBufs_.end()) {
+                SectionWriteBuf swb;
+                swb.pageId = pageId;
+                swb.data.resize(kPageSize, 0);
+                it = sectionWriteBufs_.emplace(sectionIdx, std::move(swb)).first;
+                sectionWriteBufsCount_.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            auto& swb = it->second;
+            // If the section moved to a new page, flush the old page first
+            if (swb.pageId != pageId) {
+                flushSectionWriteBuf(swb);
+                swb.pageId = pageId;
+                std::fill(swb.data.begin(), swb.data.end(), 0);
+            }
+
+            // Quantize vector into the buffer
+            size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
+            quantize(vec.data(), dim_, swb.data.data() + offsetInPage);
+
+            // If page is full, flush to disk and free the buffer
+            if (slot + 1 >= vectorsPerPage_) {
+                flushSectionWriteBuf(swb);
+                sectionWriteBufs_.erase(it);
+                sectionWriteBufsCount_.fetch_sub(1, std::memory_order_relaxed);
+            }
         }
 
-        auto& swb = it->second;
-        // If the section moved to a new page, flush the old page first
-        if (swb.pageId != pageId) {
-            flushSectionWriteBuf(swb);
-            swb.pageId = pageId;
-            std::fill(swb.data.begin(), swb.data.end(), 0);
-        }
-
-        // Quantize vector into the buffer
-        size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
-        quantize(vec.data(), dim_, swb.data.data() + offsetInPage);
-
-        // Also update read cache if the page is cached (read consistency)
+        // Page-cache update OUTSIDE sectionWriteBufsMu_ to avoid the
+        // lock-order inversion noted above. updateCacheAfterWrite takes
+        // page_mu_ exclusive on its own.
         updateCacheAfterWrite(pageId, slot, vec);
+    }
 
-        // If page is full, flush to disk and free the buffer
-        if (slot + 1 >= vectorsPerPage_) {
-            flushSectionWriteBuf(swb);
-            sectionWriteBufs_.erase(it);
-        }
+    // Look up pages_[pageId].sectionIdx safely under pages_alloc_mu_.
+    // Returns -1 if pageId is out of range (concurrent allocator may
+    // have grown pages_ between caller and us, but we conservatively
+    // miss in that case — the entry can't be in sectionWriteBufs_ yet).
+    int section_idx_of_page_locked(size_t pageId) const {
+        std::shared_lock<std::shared_mutex> g(pages_alloc_mu_);
+        if (pageId >= pages_.size()) return -1;
+        return pages_[pageId].sectionIdx;
     }
 
     // Overlay write buffer content onto a page buffer loaded from disk.
     // Uses pages_[pageId].sectionIdx for O(1) lookup instead of scanning all buffers.
     void overlayWriteBuf(size_t pageId, PageBuf& buf) const {
-        if (sectionWriteBufs_.empty() || pageId >= pages_.size()) return;
-        int sectionIdx = pages_[pageId].sectionIdx;
+        if (sectionWriteBufsCount_.load(std::memory_order_relaxed) == 0) return;
+        int sectionIdx = section_idx_of_page_locked(pageId);
+        if (sectionIdx < 0) return;
+        std::lock_guard<std::mutex> g(sectionWriteBufsMu_);
         auto it = sectionWriteBufs_.find(sectionIdx);
         if (it != sectionWriteBufs_.end() && it->second.pageId == pageId) {
             std::memcpy(buf.data.data(), it->second.data.data(), kPageSize);
@@ -803,9 +861,10 @@ private:
 
     // Try to read a vector from the section write buffer (for unflushed pages).
     bool tryReadFromWriteBuf(size_t pageId, uint16_t slot, std::vector<float>& vec) const {
-        if (sectionWriteBufs_.empty()) return false;
-        if (pageId >= pages_.size()) return false;
-        int sectionIdx = pages_[pageId].sectionIdx;
+        if (sectionWriteBufsCount_.load(std::memory_order_relaxed) == 0) return false;
+        int sectionIdx = section_idx_of_page_locked(pageId);
+        if (sectionIdx < 0) return false;
+        std::lock_guard<std::mutex> g(sectionWriteBufsMu_);
         auto it = sectionWriteBufs_.find(sectionIdx);
         if (it == sectionWriteBufs_.end() || it->second.pageId != pageId) return false;
         size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
@@ -816,9 +875,10 @@ private:
 
     // Flat version for batch reads: dequantize into a float* buffer.
     bool tryReadFromWriteBufFlat(size_t pageId, uint16_t slot, float* out, size_t dim) const {
-        if (sectionWriteBufs_.empty()) return false;
-        if (pageId >= pages_.size()) return false;
-        int sectionIdx = pages_[pageId].sectionIdx;
+        if (sectionWriteBufsCount_.load(std::memory_order_relaxed) == 0) return false;
+        int sectionIdx = section_idx_of_page_locked(pageId);
+        if (sectionIdx < 0) return false;
+        std::lock_guard<std::mutex> g(sectionWriteBufsMu_);
         auto it = sectionWriteBufs_.find(sectionIdx);
         if (it == sectionWriteBufs_.end() || it->second.pageId != pageId) return false;
         size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
@@ -883,8 +943,8 @@ private:
                 n = ::pread(readFd_, dst, kPageSize, static_cast<off_t>(offset));
             } else {
                 // Fallback fileStream_ is not thread-safe; in practice
-                // readFd_ is always set. Guard with the cache mutex on
-                // the slow path so we don't crash if it isn't.
+                // readFd_ is always set. Guard with the page cache mutex
+                // on the slow path so we don't crash if it isn't.
                 std::unique_lock<std::shared_mutex> lk(page_mu_);
                 fileStream_.clear();
                 fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
@@ -896,10 +956,11 @@ private:
         };
         fill_buf(buf.data.data());
 
-        // overlayWriteBuf reads sectionWriteBufs_. At this step in the
-        // port, writes still hold the external per-index exclusive lock
-        // so the read is safe; A1.8 will introduce section_mu_ and A1.16
-        // will tighten the ordering.
+        // A1.16: overlayWriteBuf now takes sectionWriteBufsMu_
+        // internally, so it is safe under concurrent
+        // writeToSectionBuffer (internal review). The earlier TODO
+        // about lock-order between section_mu_ and page_mu_ is
+        // resolved by pushing the section lock inside overlayWriteBuf.
         overlayWriteBuf(pageId, buf);
 
         // (3) Re-acquire unique; re-check, then recycle or insert.
@@ -1095,6 +1156,7 @@ public:
           dim_(dim),
           recordSize_(dim + 2 * sizeof(float)),  // SQ8: dim bytes quantized + 8 bytes min/max
           totalVectors_(capacity),
+          totalVectors_atomic_(capacity),
           vectorsPerPage_(0),
           maxCachedPages_(maxCachedPages)
     {
@@ -1140,11 +1202,16 @@ public:
     }
 
     // Flush all remaining section write buffers (partially filled pages).
+    // Runs under the engine's exclusive lifecycle gate, but also takes
+    // sectionWriteBufsMu_ for explicit serialisation against any in-
+    // flight writeToSectionBuffer (defence-in-depth).
     void flushWrites() override {
+        std::lock_guard<std::mutex> g(sectionWriteBufsMu_);
         for (auto& [sectionIdx, swb] : sectionWriteBufs_) {
             flushSectionWriteBuf(swb);
         }
         sectionWriteBufs_.clear();
+        sectionWriteBufsCount_.store(0, std::memory_order_relaxed);
     }
 
     // Store vector with a section hint: 'sectionKey' is derived from HNSW Level-1 entry.
@@ -1171,12 +1238,15 @@ public:
         }
 
         auto [pageId, slot] = allocateSlotForSection(sectionKey);
-        assign_location(id, pageId, slot);
 
         // Look up the internal sectionIdx for write buffer
         auto secIt = sectionKeyToIdx_.find(sectionKey);
         int sectionIdx = (secIt != sectionKeyToIdx_.end()) ? secIt->second : -1;
 
+        // Phase 6 publish protocol (§5.4, internal review): write bytes
+        // BEFORE publishing the location. Readers that subsequently
+        // observe page_of(id) >= 0 are guaranteed to find durable bytes
+        // (either in the section write buffer or on disk).
         if (sectionIdx >= 0 && writeFd_ >= 0) {
             writeToSectionBuffer(sectionIdx, pageId, slot, vec);
         } else {
@@ -1184,6 +1254,9 @@ public:
             updateCacheAfterWrite(pageId, slot, vec);
         }
         mark_deleted_at(id, false);
+
+        // Publish LAST. Acts as a release fence for the writes above.
+        assign_location(id, pageId, slot);
     }
 
     // Backward-compatible version: if you don't care about sections,
@@ -1314,40 +1387,51 @@ public:
         thread_local std::vector<size_t>    unique_page_scratch;
         miss_scratch.clear();
 
-        // Pass 1: serve cache hits directly, collect misses
+        // Pass 1a: try write buffer first WITHOUT page_mu_, collect
+        // remaining for the cache-hit pass below. Phase 6 lock order
+        // (internal review follow-up): tryReadFromWriteBufFlat takes
+        // sectionWriteBufsMu_; writeToSectionBuffer also takes
+        // sectionWriteBufsMu_ then page_mu_. To avoid AB/BA, readers
+        // never enter sectionWriteBufsMu_ while holding page_mu_.
+        for (size_t i = 0; i < ids.size(); ++i) {
+            node_id_t id = ids[i];
+            int64_t page = page_of(id);
+            if (page < 0) {
+                throw std::runtime_error("Vector slot not assigned in batch flat read.");
+            }
+            size_t pageId = static_cast<size_t>(page);
+            uint16_t slot = slot_of(id);
+
+            if (tryReadFromWriteBufFlat(pageId, slot, out + i * dim, dim_)) {
+                continue;
+            }
+            miss_scratch.push_back({i, pageId, slot});
+        }
+
+        if (miss_scratch.empty()) return;
+
+        // Pass 1b: cache-hit pass under page_mu_ shared. Move misses
+        // requiring disk read into still_missing.
+        thread_local std::vector<MissEntry> still_missing;
+        still_missing.clear();
         {
             std::shared_lock<std::shared_mutex> lk(page_mu_);
-            for (size_t i = 0; i < ids.size(); ++i) {
-                node_id_t id = ids[i];
-                int64_t page = page_of(id);
-                if (page < 0) {
-                    throw std::runtime_error("Vector slot not assigned in batch flat read.");
-                }
-                size_t pageId = static_cast<size_t>(page);
-                uint16_t slot = slot_of(id);
-
-                // Try write buffer first (unflushed data). This reads
-                // sectionWriteBufs_ which is protected by the external
-                // exclusive lock, so we are safe.
-                if (tryReadFromWriteBufFlat(pageId, slot, out + i * dim, dim_)) {
-                    continue;
-                }
-                // Try cache hit — dequantize SQ8 → float, while still
-                // holding the shared lock so the buffer can't be evicted.
+            for (const auto& miss : miss_scratch) {
                 if (maxCachedPages_ > 0) {
-                    auto cit = pageCache_.find(pageId);
+                    auto cit = pageCache_.find(miss.pageId);
                     if (cit != pageCache_.end()) {
-                        size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
+                        size_t offsetInPage = static_cast<size_t>(miss.slot) * recordSize_;
                         dequantize(cit->second.data.data() + offsetInPage,
-                                   out + i * dim, dim_);
+                                   out + miss.idx * dim, dim_);
                         pageCacheHits_.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                 }
                 pageCacheMisses_.fetch_add(1, std::memory_order_relaxed);
-                miss_scratch.push_back({i, pageId, slot});
+                still_missing.push_back(miss);
             }
         }
+        miss_scratch.swap(still_missing);
 
         if (miss_scratch.empty()) return; // fast path: all cached
 

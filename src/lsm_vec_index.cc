@@ -601,26 +601,50 @@ using namespace ROCKSDB_NAMESPACE;
         // is now routed by LSMVecDB::Insert (C5b) to allocate a fresh
         // internal_id via Update semantics; this function never sees a
         // tombstoned nodeId in the new design.
+        //
+        // Phase 6 (internal review) publish protocol:
+        //   1. Optionally publish nodes_[nodeId] EARLY with EMPTY neighbors
+        //      (only if highestLayer > 0; level-0-only nodes never enter
+        //      nodes_). Until backward edges are added, no existing node
+        //      points at us, so we are unreachable via in-memory traversal.
+        //   2. Compute selected neighbors at every layer locally — no
+        //      mutations to existing nodes' neighbor lists or to Aster.
+        //   3. storeVectorWithStats publishes the vector to disk. After
+        //      this point, layer-0 readers reaching us via Aster edges
+        //      can compute distance.
+        //   4. linkNeighborsAsterDB publishes our level-0 forward + reverse
+        //      Aster edges. Now layer-0 readers can reach us.
+        //   5. Set our outgoing upper-layer neighbors and add backward
+        //      edges from each existing neighbor to us. Now upper-layer
+        //      readers can reach us; the vector is already on disk so
+        //      level-0 descent through us is safe.
+        //   6. Layer-0 Aster shrink (existing logic).
+        //   7. Promotion CAS for entry_point_ / max_layer_.
         ++total_inserts_ever_;       // C8: stats
-        bool vectorStored = false;  // Track whether we've stored this vector
+        bool vectorStored = false;
 
         auto insert_timer = stats.startTimer();
         int highestLayer = randomLevel();
 
+        // Step 1: early-publish nodes_[nodeId] with empty neighbors so
+        // (a) readers that pick us as upper-layer entry can read our
+        // point, (b) the Phase-5 backward-edge writes below can use a
+        // stable iterator. NB: the new node is unreachable from any
+        // existing node until step 5 adds the backward edges.
         if (highestLayer > 0)
         {
             Node newNode;
             newNode.id = nodeId;
             newNode.point = vector;
-            // 20260516_upper_layer_sq8: quantize destructively at construction.
-            // Frees the float buffer; q8_data carries the dim-byte representation.
+            // 20260516_upper_layer_sq8: quantize destructively. Function-
+            // local at this point; quantize is lock-free. Once published
+            // in nodes_ below, the Node body is immutable (invariant I2)
+            // — readers do not need any lock to read q8_data / q_min /
+            // q_max.
             quantizeNodePoint(newNode);
-            // Phase 4d: publish into nodes_ under exclusive nodes_mu_.
-            // The quantize above runs lock-free because newNode is still
-            // function-local. Once we insert into nodes_, the Node body
-            // is immutable (invariant I2 from PHASE_A_IMPLEMENTATION.md
-            // §0) — readers do not need to hold nodes_mu_ to read
-            // q8_data / q_min / q_max.
+            // Phase 5 publish protocol (§5.4) + Phase 4d nodes_mu_:
+            // unique-lock publish so concurrent shared-lock readers see
+            // the entry atomically.
             std::unique_lock<std::shared_mutex> g(nodes_mu_);
             nodes_[nodeId] = std::move(newNode);
         }
@@ -632,23 +656,9 @@ using namespace ROCKSDB_NAMESPACE;
         // BEFORE publishing entry_point_, so concurrent readers that
         // observe entry_point_ != INVALID can immediately walk the
         // graph without races on missing vector / missing edges.
-        //
-        // We use a check-then-CAS pattern: first check if
-        // entry_point_ is already set by another thread, in which
-        // case we fall through to the regular insert path. If still
-        // INVALID, we tentatively store the vector and edges, then
-        // CAS entry_point_. If the CAS wins, we're done. If it
-        // loses, our vector + Aster vertex are still valid graph
-        // state — the regular insert path will incorporate them.
         node_id_t currentEntryPoint = k_invalid_node_id;
         if (entry_point_.load(std::memory_order_acquire) == k_invalid_node_id)
         {
-            // First-node speculative path. Race window: multiple
-            // writers may both reach here; the CAS below selects one
-            // winner. The loser's vector + Aster vertex remain valid
-            // graph state, so the loser's insert is not lost — they
-            // just don't become the entry point. Their regular insert
-            // path picks up against the now-existing entry point.
             linkNeighborsAsterDB(nodeId, {});
             storeVectorWithStats(nodeId, vector, /*sectionKey=*/nodeId);
             vectorStored = true;
@@ -700,16 +710,18 @@ using namespace ROCKSDB_NAMESPACE;
             }
         }
 
-        // ----- From min(observed_max_layer, highestLayer) ... down to 0 -----
+        // ----- Step 2: compute selected neighbors at each layer -----
+        // Pure read of existing graph state; no mutations yet.
         thread_local SearchScratch insert_scratch;
-        for (int l = std::min(observed_max_layer, highestLayer); l >= 0; --l)
+        const int min_layer = std::min(observed_max_layer, highestLayer);
+        std::unordered_map<int, std::vector<node_id_t>> selectedPerLayer;
+        for (int l = min_layer; l >= 0; --l)
         {
             std::vector<SearchResult> neighbors =
                 searchLayer(vector, currentEntryPoint, ef_construction_, l, insert_scratch);
             std::vector<node_id_t> selectedNeighbors =
                 selectNeighbors(vector, neighbors, m_, l);
 
-            // Refine sectionKey at the adaptive section layer.
             if (l == section_layer_)
             {
                 if (!neighbors.empty())
@@ -718,125 +730,132 @@ using namespace ROCKSDB_NAMESPACE;
                     sectionKey = currentEntryPoint;
             }
 
-            // When we first reach level 0, store the vector using sectionKey
-            if (l == 0 && !vectorStored)
-            {
-                storeVectorWithStats(nodeId, vector, sectionKey);
-                vectorStored = true;
-            }
-
-            // Link neighbors
-            if (l > 0)
-            {
-                linkNeighbors(nodeId, selectedNeighbors, l);
-            }
-            else // l == 0
-            {
-                linkNeighborsAsterDB(nodeId, selectedNeighbors);
-            }
-
-            // ---- Shrink connections ----
-            if (l > 0)
-            {
-                // Phase 4d: hold nodes_mu_ shared while iterators
-                // into nodes_ are live; node insertions can't reorder
-                // the bucket array beneath us during this loop.
-                std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
-                for (node_id_t neighbor : selectedNeighbors)
-                {
-                    auto neighborIt = nodes_.find(neighbor);
-                    if (neighborIt == nodes_.end()) {
-                        LOG(WARN) << "Skipping shrink connections for missing node " << neighbor
-                                  << " at layer " << l;
-                        continue;
-                    }
-
-                    // Phase 4c: write-side lock on neighbor shard so
-                    // concurrent shrink writers (rare; hub nodes only)
-                    // serialise on the same node. Read-side under
-                    // Phase 1's lifecycle exclusive gate; Phase 6
-                    // will add a reader-side lock or switch to the
-                    // atomic-slot fixed-array primitive (§5.1.4).
-                    std::vector<node_id_t> eConn = neighborIt->second.neighbors[l];
-                    if (eConn.size() > static_cast<size_t>(m_max_))
-                    {
-                        // 20260516_upper_layer_sq8: selectNeighbors takes
-                        // const vector<float>&; if this neighbor is SQ8 we
-                        // have to materialize.
-                        std::vector<float> neighborPt;
-                        const std::vector<float>* basis = nullptr;
-                        if (!neighborIt->second.point.empty()) {
-                            basis = &neighborIt->second.point;
-                        } else if (dequantizeNodePoint(neighborIt->second, neighborPt)) {
-                            basis = &neighborPt;
-                        }
-                        if (basis == nullptr) continue;
-                        std::vector<node_id_t> eNewConn =
-                            selectNeighbors(*basis, eConn, m_max_, l);
-                        // Phase 4c write: serialise this neighbor's
-                        // edge-list mutation against concurrent reads
-                        // and writes on the same shard.
-                        std::lock_guard<std::mutex> g(node_shard(neighbor));
-                        neighborIt->second.neighbors[l] = std::move(eNewConn);
-                    }
-                }
-            }
-            else // l == 0
-            {
-                std::vector<std::pair<rocksdb::node_id_t, rocksdb::node_id_t>> edgesToDelete;
-
-                for (node_id_t neighbor : selectedNeighbors)
-                {
-                    auto eConns = getEdgesCached(neighbor);
-
-                    if (eConns.size() > static_cast<size_t>(m_max_))
-                    {
-                        std::vector<float> neighborVector;
-                        readVectorWithStats(neighbor, neighborVector);
-
-                        std::vector<node_id_t> eNewConn =
-                            selectNeighbors(neighborVector, eConns, m_max_, l);
-
-                        for (auto node : eConns)
-                        {
-                            if (std::find(eNewConn.begin(), eNewConn.end(), node) == eNewConn.end())
-                            {
-                                edgesToDelete.emplace_back(
-                                    static_cast<rocksdb::node_id_t>(neighbor),
-                                    static_cast<rocksdb::node_id_t>(node));
-                            }
-                        }
-                    }
-                }
-
-                if (!edgesToDelete.empty()) {
-                    db_->DeleteEdgeBatch(edgesToDelete);
-                    // Invalidate cache for affected nodes
-                    if (edge_cache_) {
-                        for (const auto& [from, to] : edgesToDelete) {
-                            edge_cache_->erase(from);
-                            edge_cache_->erase(to);
-                        }
-                    }
-                }
-            }
-
             if (!neighbors.empty())
             {
                 currentEntryPoint = neighbors[0].id;
             }
+
+            selectedPerLayer[l] = std::move(selectedNeighbors);
         }
 
-        // ----- Promotion (§5.1.3) -----
+        // ----- Step 3: store vector to disk (publish bytes) -----
+        if (!vectorStored)
+        {
+            storeVectorWithStats(nodeId, vector, sectionKey);
+            vectorStored = true;
+        }
+
+        // ----- Step 4: publish Aster level-0 edges -----
+        // Forward + reverse edges go in via linkNeighborsAsterDB. After
+        // this, layer-0 readers (using Aster) may reach us; the vector
+        // is on disk so distance computation succeeds.
+        linkNeighborsAsterDB(nodeId, selectedPerLayer[0]);
+
+        // ----- Step 5: upper-layer link + shrink (publish in-memory edges) -----
+        // Set our outgoing neighbors at each upper layer, then push the
+        // backward edge to each existing neighbor's list (with optional
+        // shrink). After this, upper-layer readers may reach us; the
+        // vector is durable and we have level-0 Aster edges so descent
+        // through us at any layer is safe.
+        if (min_layer >= 1)
+        {
+            std::shared_lock<std::shared_mutex> nodes_g(nodes_mu_);
+            auto nodeIt = nodes_.find(nodeId);
+            if (nodeIt == nodes_.end()) {
+                LOG(ERR) << "nodes_[nodeId=" << nodeId << "] missing after early publish";
+            } else {
+                for (int l = min_layer; l >= 1; --l)
+                {
+                    const std::vector<node_id_t>& selectedNeighbors = selectedPerLayer[l];
+
+                    // Forward edges: us -> selectedNeighbors at layer l.
+                    {
+                        std::lock_guard<std::mutex> g(node_shard(nodeId));
+                        nodeIt->second.neighbors[l] = selectedNeighbors;
+                    }
+
+                    // Backward edges + shrink per neighbor.
+                    for (node_id_t neighbor : selectedNeighbors)
+                    {
+                        auto neighborIt = nodes_.find(neighbor);
+                        if (neighborIt == nodes_.end()) {
+                            LOG(WARN) << "Skipping backward link to missing neighbor " << neighbor
+                                      << " at layer " << l;
+                            continue;
+                        }
+                        // Hold node_shard(neighbor) across push_back +
+                        // shrink so concurrent shrinks/links on the same
+                        // neighbor serialise (internal review).
+                        std::lock_guard<std::mutex> g(node_shard(neighbor));
+                        neighborIt->second.neighbors[l].push_back(nodeId);
+                        auto& eConnRef = neighborIt->second.neighbors[l];
+                        if (eConnRef.size() > static_cast<size_t>(m_max_))
+                        {
+                            // 20260516_upper_layer_sq8: selectNeighbors
+                            // takes const vector<float>&; if this neighbor
+                            // is SQ8 we have to materialize.
+                            std::vector<float> neighborPt;
+                            const std::vector<float>* basis = nullptr;
+                            if (!neighborIt->second.point.empty()) {
+                                basis = &neighborIt->second.point;
+                            } else if (dequantizeNodePoint(neighborIt->second, neighborPt)) {
+                                basis = &neighborPt;
+                            }
+                            if (basis == nullptr) continue;
+                            std::vector<node_id_t> eConn = eConnRef;
+                            std::vector<node_id_t> eNewConn =
+                                selectNeighbors(*basis, eConn, m_max_, l);
+                            eConnRef = std::move(eNewConn);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----- Step 6: layer-0 Aster shrink (existing logic) -----
+        {
+            const std::vector<node_id_t>& selectedLevel0 = selectedPerLayer[0];
+            std::vector<std::pair<rocksdb::node_id_t, rocksdb::node_id_t>> edgesToDelete;
+            for (node_id_t neighbor : selectedLevel0)
+            {
+                auto eConns = getEdgesCached(neighbor);
+                if (eConns.size() > static_cast<size_t>(m_max_))
+                {
+                    std::vector<float> neighborVector;
+                    readVectorWithStats(neighbor, neighborVector);
+
+                    std::vector<node_id_t> eNewConn =
+                        selectNeighbors(neighborVector, eConns, m_max_, 0);
+
+                    for (auto node : eConns)
+                    {
+                        if (std::find(eNewConn.begin(), eNewConn.end(), node) == eNewConn.end())
+                        {
+                            edgesToDelete.emplace_back(
+                                static_cast<rocksdb::node_id_t>(neighbor),
+                                static_cast<rocksdb::node_id_t>(node));
+                        }
+                    }
+                }
+            }
+            if (!edgesToDelete.empty()) {
+                db_->DeleteEdgeBatch(edgesToDelete);
+                if (edge_cache_) {
+                    for (const auto& [from, to] : edgesToDelete) {
+                        edge_cache_->erase(from);
+                        edge_cache_->erase(to);
+                    }
+                }
+            }
+        }
+
+        // ----- Step 7: promotion CAS (§5.1.3) -----
         // CAS-loop max_layer_ upward; if our highestLayer is no longer
         // the new max (another writer promoted higher concurrently),
         // skip the promotion. Independent atomics: max_layer_ is bumped
         // first, then entry_point_ — readers that see (NEW max, OLD ep)
         // are absorbed by the graceful descent (greedySearchUpperLayer
-        // breaks on missing layer at the OLD ep). Note: under Phase 1
-        // INSERT-exclusive on the lifecycle gate, this CAS is
-        // uncontended; the loop and the publish ordering matter only
-        // once Phase 6 enables concurrent writers.
+        // breaks on missing layer at the OLD ep).
         int cur = max_layer_.load(std::memory_order_acquire);
         bool we_promoted = false;
         while (highestLayer > cur) {
@@ -847,19 +866,11 @@ using namespace ROCKSDB_NAMESPACE;
                 we_promoted = true;
                 break;
             }
-            // CAS lost; cur was updated to the latest value. Re-check
-            // whether we still need to promote.
         }
         if (we_promoted) {
             entry_point_.store(nodeId, std::memory_order_release);
             LOG(INFO) << "Updated entry point to node " << nodeId
                       << " at layer " << highestLayer;
-        }
-
-        // Safety: in principle vectorStored must be true if we reached here.
-        if (!vectorStored)
-        {
-            storeVectorWithStats(nodeId, vector, sectionKey);
         }
 
         stats.accumulateTime(insert_timer, stats.indexing_time);
@@ -873,7 +884,7 @@ using namespace ROCKSDB_NAMESPACE;
     // at the result-emission step (see knnSearchK below).
     Status LSMVec::deleteNode(node_id_t id)
     {
-        tombstoned_internal_ids_.insert(id);
+        tombstone(id);
         return Status::OK();
     }
 
@@ -886,7 +897,7 @@ using namespace ROCKSDB_NAMESPACE;
         if (!out) {
             return Status::InvalidArgument("output vector must not be null");
         }
-        if (tombstoned_internal_ids_.count(id) > 0) {
+        if (is_tombstoned(id)) {
             return Status::NotFound("vector deleted");
         }
         if (!vector_storage_->exists(id)) {
@@ -933,7 +944,7 @@ using namespace ROCKSDB_NAMESPACE;
         std::vector<SearchResult> filtered;
         filtered.reserve(static_cast<size_t>(k));
         for (const auto& result : neighbors) {
-            if (tombstoned_internal_ids_.count(result.id) > 0) {
+            if (is_tombstoned(result.id)) {
                 continue;
             }
             filtered.push_back(result);
