@@ -2,10 +2,25 @@
 
 #include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <exception>
 #include <fstream>
 #include <limits>
 #include <vector>
+
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
+namespace {
+// 20260516_malloc_trim: file-local helper. Lives in the .cc so <malloc.h>
+// doesn't leak into headers. No-op on non-glibc allocators (macOS / musl).
+void trim_allocator_now() {
+#ifdef __GLIBC__
+    (void)::malloc_trim(0);
+#endif
+}
+} // anonymous namespace
 
 #include "distance.h"
 #include "json.hpp"
@@ -562,6 +577,15 @@ void LSMVecDB::flushVectorWrites()
     if (index_) {
         index_->vector_storage_->flushWrites();
     }
+    // 20260516_malloc_trim: a bulk insert leaves the glibc heap fragmented
+    // (RocksDB / Aster churn temporary buffers; our edge + page caches grow
+    // and shrink). Trim now while we know we're at a write-batch boundary.
+    trim_allocator_now();
+}
+
+void LSMVecDB::trimMemory()
+{
+    trim_allocator_now();
 }
 
 LSMVecDB::DeleteStats LSMVecDB::GetDeleteStats() const

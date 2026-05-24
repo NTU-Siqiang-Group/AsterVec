@@ -116,6 +116,13 @@ public:
     void printStatistics() const;
     void flushVectorWrites();
 
+    // 20260516_malloc_trim: ask the allocator to return idle heap memory to
+    // the OS. On glibc this calls malloc_trim(0) (a few ms on a fragmented
+    // heap; no-op on other allocators). flushVectorWrites() calls this
+    // automatically; explicit calls are available for callers that want a
+    // fresh-budget snapshot mid-session.
+    void trimMemory();
+
     // C8: snapshot of delete-related observability counters.
     // tombstone_ratio thresholds (advisory):
     //   < 0.10  → healthy
