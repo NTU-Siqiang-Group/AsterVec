@@ -500,17 +500,43 @@ private:
     // packed-atomic chunk array primitive (deferred). The macOS
     // measurement showed the lock-free path was within noise anyway
     // (~4164 QPS in both modes).
+    // Profiling on macOS 8-thread build showed shared_lock<shared_mutex>
+    // here as the dominant hot lock (1500+ samples in mutex::lock from
+    // page_of alone during a 20s sample window). libc++'s shared_mutex
+    // implementation takes an internal std::mutex even for shared
+    // acquires, so "shared" gives zero parallelism under contention.
+    //
+    // Fast path: atomic-snapshot the published capacity. If id < snapshot,
+    // the slot is already published (per Phase 5 publish protocol:
+    // idToPage_[id] write happens-before totalVectors_atomic_ increment).
+    // Read the slot lock-free.
+    //
+    // Slow path: shared_lock fallback for ids beyond the published
+    // capacity, or for the rare expandCapacity-in-progress window.
+    //
+    // SAFETY: this is correct ONLY when idToPage_ never shrinks AND its
+    // backing buffer is stable (no resize during reads). expandCapacity
+    // does resize idToPage_, so we still must hold the shared_lock on
+    // that path. Callers that need the fast path to be valid for the
+    // entire workload should set vec_file_capacity at Open to the max
+    // expected id+1 — the HTTP server / trial container does this.
     int64_t page_of(node_id_t id) const {
         if (is_direct_id(id)) {
-            // A1.15 introduced a lock-free read via totalVectors_atomic_;
-            // A1.16 (Codex review) reverted it because concurrent
-            // assign_location overflow into the sparse path makes the
-            // lock-free read unsafe in edge cases. totalVectors_atomic_
-            // remains for storeVectorToDisk publish ordering elsewhere.
             // 20260516_narrow_idtopage: idToPage_ is int32_t; widen for API.
+            const size_t cap =
+                totalVectors_atomic_.load(std::memory_order_acquire);
+            const size_t idx = static_cast<size_t>(id);
+            if (idx < cap) {
+                // Fast path: lock-free. The publish in assign_location
+                // ordered idToPage_[idx] write before totalVectors_atomic_
+                // increment, so our acquire-load synchronizes.
+                return static_cast<int64_t>(idToPage_[idx]);
+            }
+            // Slow path: id is at-or-beyond the published capacity.
+            // Take shared lock to coordinate with expandCapacity.
             std::shared_lock<std::shared_mutex> g(pages_alloc_mu_);
-            if (static_cast<size_t>(id) >= idToPage_.size()) return -1;
-            return static_cast<int64_t>(idToPage_[static_cast<size_t>(id)]);
+            if (idx >= idToPage_.size()) return -1;
+            return static_cast<int64_t>(idToPage_[idx]);
         }
         // update-id branch: sparse map under update_loc_mu_.
         std::lock_guard<std::mutex> g(update_loc_mu_);
@@ -520,9 +546,15 @@ private:
 
     uint16_t slot_of(node_id_t id) const {
         if (is_direct_id(id)) {
+            const size_t cap =
+                totalVectors_atomic_.load(std::memory_order_acquire);
+            const size_t idx = static_cast<size_t>(id);
+            if (idx < cap) {
+                return idToSlotInPage_[idx];   // lock-free fast path
+            }
             std::shared_lock<std::shared_mutex> g(pages_alloc_mu_);
-            if (static_cast<size_t>(id) >= idToSlotInPage_.size()) return 0;
-            return idToSlotInPage_[static_cast<size_t>(id)];
+            if (idx >= idToSlotInPage_.size()) return 0;
+            return idToSlotInPage_[idx];
         }
         // update-id branch: sparse map under update_loc_mu_.
         std::lock_guard<std::mutex> g(update_loc_mu_);
