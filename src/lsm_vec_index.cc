@@ -111,7 +111,6 @@ using namespace ROCKSDB_NAMESPACE;
         
         options_.create_if_missing = true;
         options_.db_paths.emplace_back(rocksdb::DbPath(db_path, db_options_.db_target_size));
-        options_.statistics = rocksdb::CreateDBStatistics();
 
         // RocksDB tuning: block cache, compaction parallelism, no compression
         {
