@@ -84,15 +84,17 @@ LAINN/
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  build-essential cmake libboost-dev \
-  libzstd-dev libsnappy-dev liblz4-dev libbz2-dev zlib1g-dev
+  build-essential cmake libboost-dev libzstd-dev
 ```
 
 **macOS (Homebrew)**
 
 ```bash
-brew install cmake boost zstd snappy lz4 bzip2
+brew install cmake boost zstd jemalloc
 ```
+
+> Only **zstd** is required for compression — Aster is built with RocksDB's
+> other codecs (snappy / lz4 / bzip / zlib) disabled, so you don't need them.
 
 ---
 
@@ -301,8 +303,8 @@ Run `./build/bin/lsm_vec --help` for the full list.
 Include headers from `include/` and link against `liblsmvec.a` (static) or
 `liblsmvec.so` / `liblsmvec.dylib` (shared).
 
-Transitive link dependencies: `rocksdb` (Aster), `zstd`, `snappy`, `lz4`,
-`bz2`, `z`, `pthread`, `dl`. On macOS, `jemalloc` is also required.
+Transitive link dependencies: `rocksdb` (Aster), `zstd`, `pthread`, `dl`.
+On macOS, `jemalloc` is also required.
 
 ```cpp
 #include "lsm_vec_db.h"
@@ -506,12 +508,12 @@ You are linking against system RocksDB instead of Aster. Make sure CMake
 resolves the library from `lib/aster/`, not `/usr/lib/`. Check the CMake output
 for the line `Using RocksDB library at ...`.
 
-### `libzstd not found` / `libsnappy not found` / `liblz4 not found` / `libbz2 not found`
+### `libzstd not found`
 
-Install the missing library:
+Install zstd (the only required compression library):
 
-- **Ubuntu:** `sudo apt-get install libzstd-dev libsnappy-dev liblz4-dev libbz2-dev`
-- **macOS:** `brew install zstd snappy lz4 bzip2`
+- **Ubuntu:** `sudo apt-get install libzstd-dev`
+- **macOS:** `brew install zstd`
 
 ### `FetchContent` fails to download pybind11 during `pip install .`
 
