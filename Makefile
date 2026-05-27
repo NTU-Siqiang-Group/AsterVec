@@ -24,7 +24,13 @@ bin: configure
 
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
+# Build Aster (RocksDB) with only ZSTD compression. snappy/lz4/bzip/zlib are
+# disabled so the build needs just libzstd (build_detect_platform reads these
+# env vars). NOTE: make_config.mk is cached — if you previously built Aster with
+# those libs, run `rm -f lib/aster/make_config.mk` (or `make -C lib/aster clean`)
+# before `make aster` so the platform is re-detected.
 aster:
+	ROCKSDB_DISABLE_SNAPPY=1 ROCKSDB_DISABLE_LZ4=1 ROCKSDB_DISABLE_BZIP=1 ROCKSDB_DISABLE_ZLIB=1 \
 	$(MAKE) -C lib/aster static_lib -j$(NPROC) DEBUG_LEVEL=0 DISABLE_WARNING_AS_ERROR=1 EXTRA_CXXFLAGS=-fPIC
 
 clean:

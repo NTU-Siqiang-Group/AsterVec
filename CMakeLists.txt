@@ -95,7 +95,14 @@ if(NOT ROCKSDB_LIB OR NOT ROCKSDB_INCLUDE_DIR)
         set(NPROC 4)
     endif()
     execute_process(
-        COMMAND make static_lib -j${NPROC} DEBUG_LEVEL=0
+        # Must match the top-level `make aster`: build Aster with only ZSTD
+        # (snappy/lz4/bzip/zlib disabled) so librocksdb.a doesn't reference
+        # codecs we no longer link. Used by the pip / direct-cmake path when
+        # `make aster` wasn't run first.
+        COMMAND ${CMAKE_COMMAND} -E env
+                ROCKSDB_DISABLE_SNAPPY=1 ROCKSDB_DISABLE_LZ4=1
+                ROCKSDB_DISABLE_BZIP=1 ROCKSDB_DISABLE_ZLIB=1
+                make static_lib -j${NPROC} DEBUG_LEVEL=0
                 DISABLE_WARNING_AS_ERROR=1 EXTRA_CXXFLAGS=-fPIC
         WORKING_DIRECTORY "${ASTER_ROCKSDB_ROOT}"
         RESULT_VARIABLE ASTER_BUILD_RESULT
@@ -143,40 +150,16 @@ endif()
 
 message(STATUS "Using ZSTD library at ${ZSTD_LIB}")
 
-find_library(SNAPPY_LIB snappy
-    HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/opt/snappy/lib
-          /opt/homebrew/lib /opt/homebrew/opt/snappy/lib
-)
-find_library(LZ4_LIB lz4
-    HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/opt/lz4/lib
-          /opt/homebrew/lib /opt/homebrew/opt/lz4/lib
-)
-find_library(BZ2_LIB bz2
-    HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/local/opt/bzip2/lib
-          /opt/homebrew/lib /opt/homebrew/opt/bzip2/lib
-)
-
-if(NOT SNAPPY_LIB)
-    message(FATAL_ERROR "libsnappy not found; please install snappy or provide its path")
-endif()
-if(NOT LZ4_LIB)
-    message(FATAL_ERROR "liblz4 not found; please install lz4 or provide its path")
-endif()
-if(NOT BZ2_LIB)
-    message(FATAL_ERROR "libbz2 not found; please install bzip2 or provide its path")
-endif()
-
-message(STATUS "Using Snappy library at ${SNAPPY_LIB}")
-message(STATUS "Using LZ4 library at ${LZ4_LIB}")
-message(STATUS "Using BZ2 library at ${BZ2_LIB}")
+# snappy / lz4 / bz2 / zlib are intentionally NOT required. Aster is built with
+# ROCKSDB_DISABLE_{SNAPPY,LZ4,BZIP,ZLIB}=1 (see the `aster` target in Makefile),
+# so librocksdb.a references none of those codecs. The only compression the
+# engine uses is ZSTD (the metadata/payload column family); the graph store is
+# kNoCompression. Keeping the build to a single compression dependency (zstd)
+# makes it far simpler to set up.
 
 set(LSMVEC_LINK_LIBS
     ${ROCKSDB_LIB}
     ${ZSTD_LIB}
-    ${SNAPPY_LIB}
-    ${LZ4_LIB}
-    ${BZ2_LIB}
-    z
     pthread
     dl
 )

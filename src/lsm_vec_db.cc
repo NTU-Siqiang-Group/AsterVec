@@ -132,6 +132,9 @@ Status LSMVecDB::Open(const std::string& path,
         rocksdb::BlockBasedTableOptions default_table_opts;
         default_table_opts.block_cache = shared_block_cache;
         rocksdb::ColumnFamilyOptions default_cfopts;
+        // Never written to, but set explicitly so it doesn't inherit RocksDB's
+        // kSnappy default (Snappy is no longer compiled into Aster).
+        default_cfopts.compression = rocksdb::kNoCompression;
         default_cfopts.table_factory.reset(
             rocksdb::NewBlockBasedTableFactory(default_table_opts));
         cfds.emplace_back(rocksdb::kDefaultColumnFamilyName, default_cfopts);
