@@ -16,6 +16,7 @@
 #include "rocksdb/status.h"
 #include <iostream>
 #include "bloom_filter.h"
+#include "cgroup_monitor.h"
 #include "disk_vector.h"
 #include "id_types.h"
 #include "lsm_vec_db.h"
@@ -618,5 +619,26 @@ using namespace ROCKSDB_NAMESPACE;
 
         // Edge LRU cache for L0 GetAllEdges
         std::unique_ptr<EdgeLRUCache> edge_cache_;
+
+        // ----------------------------------------------------------------
+        // Adaptive Direct I/O (see docs/local/..._ADAPTIVE_DIRECT_IO_*).
+        // During an incremental build we start with buffered I/O for the
+        // RocksGraph store. A background CgroupMemoryMonitor watches for
+        // sustained page-cache thrash under the cgroup cap; on trip, the
+        // insert driver performs a ONE-WAY escalation to RocksDB Direct I/O
+        // (close + reopen the RocksGraph handle) and sheds the stale SST page
+        // cache. The in-memory HNSW state (nodes_, entry_point_, edge_cache_)
+        // survives the swap untouched.
+        // ----------------------------------------------------------------
+        std::string                          db_path_;          // for RocksGraph reopen
+        std::unique_ptr<CgroupMemoryMonitor> mem_monitor_;
+        std::atomic<bool>                    direct_io_active_{false}; // one-way latch
+        std::mutex                           dio_switch_mu_;
+
+        void     startAdaptiveDirectIO();
+        void     maybeEscalateDirectIO();    // cheap check at insert boundaries
+        void     performDirectIOSwitch();    // heavyweight close+reopen
+        bool     directIOSupported();        // probe O_DIRECT on the data FS
+        size_t   dropSSTPageCache();         // posix_fadvise(DONTNEED) over *.sst
     };
 } // namespace ROCKSDB_NAMESPACE

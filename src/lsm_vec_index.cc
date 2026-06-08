@@ -13,6 +13,12 @@
 #include <sstream>
 #include <iostream>
 #include <cstdio>
+#include <cstdlib>
+#include <chrono>
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 
 uint8_t encode(int value)
@@ -176,6 +182,11 @@ using namespace ROCKSDB_NAMESPACE;
             LOG(INFO) << "Adaptive section layer: " << section_layer_
                       << " (vectorsPerPage=" << vpp << ", M=" << m_ << ")";
         }
+
+        // Adaptive Direct I/O: remember the path for a possible reopen and
+        // start the memory-pressure monitor (no-op unless under a cgroup cap).
+        db_path_ = db_path;
+        startAdaptiveDirectIO();
     }
 
     namespace {
@@ -621,6 +632,12 @@ using namespace ROCKSDB_NAMESPACE;
         //   6. Layer-0 Aster shrink (existing logic).
         //   7. Promotion CAS for entry_point_ / max_layer_.
         total_inserts_ever_.fetch_add(1, std::memory_order_relaxed);  // C8: stats (R3.a)
+
+        // Adaptive Direct I/O: cheap latch check; performs a one-way close+reopen
+        // escalation if the monitor has tripped. insertNode holds the engine's
+        // exclusive lock (see header contract), so swapping db_ here is safe.
+        maybeEscalateDirectIO();
+
         bool vectorStored = false;
 
         auto insert_timer = stats.startTimer();
@@ -2188,8 +2205,169 @@ using namespace ROCKSDB_NAMESPACE;
 
     void LSMVec::close()
     {
+        if (mem_monitor_) mem_monitor_->stop();
         vector_storage_->flushWrites();
         db_.reset();
+    }
+
+    // ----------------------------------------------------------------------
+    // Adaptive Direct I/O escalation.
+    // ----------------------------------------------------------------------
+    namespace {
+    bool env_bool(const char* k, bool def) {
+        const char* v = std::getenv(k);
+        if (!v || !*v) return def;
+        return !(v[0] == '0' && v[1] == '\0');
+    }
+    double env_double(const char* k, double def) {
+        const char* v = std::getenv(k);
+        if (!v || !*v) return def;
+        return std::atof(v);
+    }
+    uint64_t env_u64(const char* k, uint64_t def) {
+        const char* v = std::getenv(k);
+        if (!v || !*v) return def;
+        return std::strtoull(v, nullptr, 10);
+    }
+    } // namespace
+
+    void LSMVec::startAdaptiveDirectIO()
+    {
+        if (!env_bool("LSMVEC_ADAPTIVE_DIO", true)) {
+            LOG(INFO) << "[adaptive-dio] disabled (LSMVEC_ADAPTIVE_DIO=0)";
+            return;
+        }
+        CgroupMemoryMonitor::Config cfg;
+        cfg.high_fraction    = env_double("LSMVEC_DIO_HIGH_FRACTION", 0.90);
+        cfg.refault_min_rate = env_double("LSMVEC_DIO_REFAULT_MIN", 1000.0);
+        cfg.debounce_s       = static_cast<int>(env_u64("LSMVEC_DIO_DEBOUNCE_S", 4));
+        cfg.poll_ms          = static_cast<int>(env_u64("LSMVEC_DIO_POLL_MS", 1000));
+        cfg.enabled          = true;
+
+        mem_monitor_ = std::make_unique<CgroupMemoryMonitor>(
+            cfg,
+            [this] { return total_inserts_ever_.load(std::memory_order_relaxed); });
+        mem_monitor_->start();
+    }
+
+    void LSMVec::maybeEscalateDirectIO()
+    {
+        if (direct_io_active_.load(std::memory_order_acquire)) return;
+        if (mem_monitor_ && mem_monitor_->should_escalate()) {
+            performDirectIOSwitch();
+        }
+    }
+
+    void LSMVec::performDirectIOSwitch()
+    {
+        std::lock_guard<std::mutex> g(dio_switch_mu_);
+        if (direct_io_active_.load(std::memory_order_acquire)) return;  // double-check
+
+        // Fail safe: if the data filesystem doesn't support O_DIRECT, RocksGraph's
+        // ctor would exit(1) on the reopen's DB::Open. Probe first and, if
+        // unsupported, latch (so we don't retry every insert) and stay buffered.
+        if (!directIOSupported()) {
+            LOG(WARN) << "[adaptive-dio] Direct I/O unsupported on this filesystem; "
+                         "staying buffered (escalation disabled)";
+            direct_io_active_.store(true, std::memory_order_release);
+            return;
+        }
+
+        const uint64_t inserts_now = total_inserts_ever_.load(std::memory_order_relaxed);
+        const uint64_t before_mib =
+            (mem_monitor_ ? mem_monitor_->last_current() : 0) >> 20;
+        LOG(WARN) << "[adaptive-dio] ESCALATING to Direct I/O at insert #" << inserts_now
+                  << " (mem.current=" << before_mib << "MiB)";
+
+        using clock = std::chrono::steady_clock;
+        const auto t0 = clock::now();
+
+        // NOTE: deliberately do NOT flush the vector store here. The switch only
+        // reopens the RocksGraph (layer-0 edges); the vector store is kept as-is.
+        // A mid-build vector_storage_->flushWrites() corrupts already-stored
+        // vectors — it flushes partially-filled section pages and clears the
+        // buffers, but the section keeps writing to the same page with a fresh
+        // zero-filled buffer, so the next flush overwrites the earlier slots with
+        // zeros. flushWrites() is only safe at end-of-life, and the reopen
+        // doesn't need it (RocksGraph close/reopen preserves the graph on its own).
+
+        // 1. Durable close of the RocksGraph handle (~RocksGraph: SyncWAL + Close).
+        db_.reset();
+        const auto t_closed = clock::now();
+
+        // 2. Shed the stale buffered SST page cache so the freed budget goes to
+        //    the still-buffered vector file (read every insert for distances).
+        const size_t dropped = dropSSTPageCache();
+        const auto t_shed = clock::now();
+
+        // 3. Flip to Direct I/O. We intentionally do NOT resize the block cache:
+        //    growing it would replace reclaimable OS page cache with non-
+        //    reclaimable ANON that competes with the still-buffered vector file
+        //    (and races the working set's continued growth). Keeping the existing
+        //    small cache eliminates the page-cache thrash at the cost of a
+        //    bounded, predictable direct-read overhead.
+        options_.use_direct_reads = true;
+        options_.use_direct_io_for_flush_and_compaction = true;
+
+        // 4. Reopen the SAME path. auto_reinitialize MUST be false — true would
+        //    DestroyDB and wipe the graph.
+        db_ = std::make_unique<rocksdb::RocksGraph>(
+            options_,
+            EDGE_UPDATE_EAGER,
+            ENCODING_TYPE_NONE,
+            /*auto_reinitialize=*/false,
+            db_path_,
+            /*minimal_mode=*/true);
+        const auto t_reopened = clock::now();
+
+        direct_io_active_.store(true, std::memory_order_release);
+
+        auto ms = [](clock::time_point a, clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        LOG(WARN) << "[adaptive-dio] switch complete: close=" << ms(t0, t_closed)
+                  << "ms shed=" << ms(t_closed, t_shed)
+                  << "ms reopen=" << ms(t_shed, t_reopened)
+                  << "ms total=" << ms(t0, t_reopened)
+                  << "ms | sst_cache_dropped=" << (dropped >> 20) << "MiB";
+    }
+
+    bool LSMVec::directIOSupported()
+    {
+#if defined(__linux__) && defined(O_DIRECT)
+        const std::string probe = db_path_ + "/.lsmvec_dio_probe";
+        int fd = ::open(probe.c_str(), O_WRONLY | O_CREAT | O_DIRECT, 0644);
+        const bool ok = (fd >= 0);
+        if (fd >= 0) ::close(fd);
+        ::unlink(probe.c_str());
+        return ok;
+#else
+        return false;
+#endif
+    }
+
+    size_t LSMVec::dropSSTPageCache()
+    {
+        size_t total = 0;
+        DIR* d = ::opendir(db_path_.c_str());
+        if (!d) return 0;
+        struct dirent* e;
+        while ((e = ::readdir(d)) != nullptr) {
+            const std::string name = e->d_name;
+            if (name.size() < 4 || name.compare(name.size() - 4, 4, ".sst") != 0)
+                continue;
+            const std::string full = db_path_ + "/" + name;
+            int fd = ::open(full.c_str(), O_RDONLY);
+            if (fd < 0) continue;
+            struct stat st;
+            if (::fstat(fd, &st) == 0) total += static_cast<size_t>(st.st_size);
+#if defined(__linux__)
+            ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
+            ::close(fd);
+        }
+        ::closedir(d);
+        return total;
     }
 
     // void LSMVec::printStatistics() const
