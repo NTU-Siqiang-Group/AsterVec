@@ -128,6 +128,14 @@ using namespace ROCKSDB_NAMESPACE;
             options_.compression = rocksdb::kNoCompression;
         }
 
+        // Optional: open directly in Direct I/O mode (skip the buffered phase
+        // and the adaptive escalation). For known-tight-memory deployments and
+        // as the full-direct baseline. Default is buffered + adaptive escalation.
+        if (std::getenv("LSMVEC_DIO_FROM_START")) {
+            options_.use_direct_reads = true;
+            options_.use_direct_io_for_flush_and_compaction = true;
+        }
+
         // Aster minimal_mode=true disables MorrisCounter degree-tracking and
         // in-neighbor maintenance. LSM-Vec doesn't use either, and minimal_mode
         // also makes the graph tolerate u64 ids with bit 63 set (our update_id
