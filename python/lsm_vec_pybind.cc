@@ -1,3 +1,4 @@
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -322,6 +323,65 @@ PYBIND11_MODULE(lsm_vec, m)
         .def("flush_vector_writes",
              [](lsm_vec::LSMVecDB& db) { db.flushVectorWrites(); },
              "Flush any pending vector writes to the on-disk vector storage.")
+        .def("bulk_build",
+             [](lsm_vec::LSMVecDB& db,
+                const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
+                int threads) -> py::dict {
+                 if (array.ndim() != 2) {
+                     throw py::value_error("vectors must be a 2D array (n, dim)");
+                 }
+                 const ssize_t n = array.shape(0);
+                 const ssize_t dim = array.shape(1);
+                 if (n <= 0 || dim <= 0) {
+                     throw py::value_error("vectors must be a non-empty (n, dim) array");
+                 }
+                 lsm_vec::BulkBuildOptions bopts;
+                 if (threads > 0) bopts.num_threads = threads;  // 0 -> engine auto
+
+                 // c_style|forcecast guarantees a C-contiguous float32 buffer.
+                 const float* ptr = array.data();
+                 auto t0 = std::chrono::high_resolution_clock::now();
+                 RaiseStatus(db.BulkBuild(
+                     lsm_vec::Span<const float>(
+                         ptr, static_cast<size_t>(n) * static_cast<size_t>(dim)),
+                     static_cast<int>(n), bopts));
+                 auto t1 = std::chrono::high_resolution_clock::now();
+
+                 double elapsed_ms =
+                     std::chrono::duration<double, std::milli>(t1 - t0).count();
+                 py::dict report;
+                 report["n"] = static_cast<int>(n);
+                 report["elapsed_ms"] = elapsed_ms;
+                 report["vectors_per_sec"] =
+                     elapsed_ms > 0.0
+                         ? static_cast<double>(n) / (elapsed_ms / 1000.0)
+                         : 0.0;
+                 report["threads"] = bopts.num_threads;
+                 return report;
+             },
+             py::arg("vectors"), py::arg("threads") = 0,
+             "Build the whole index in one pass from a 2D (n, dim) float32 array "
+             "(or a list of equal-length rows). Initial-load only: the DB must be "
+             "empty; ids are assigned 0..n-1. Returns a report dict "
+             "{n, elapsed_ms, vectors_per_sec, threads}.")
+        .def("trim_memory",
+             [](lsm_vec::LSMVecDB& db) { db.trimMemory(); },
+             "Ask the allocator to return idle heap memory to the OS "
+             "(glibc malloc_trim; no-op elsewhere).")
+        .def("delete_stats",
+             [](const lsm_vec::LSMVecDB& db) -> py::dict {
+                 lsm_vec::LSMVecDB::DeleteStats s = db.GetDeleteStats();
+                 py::dict d;
+                 d["tombstones"]          = s.tombstones;
+                 d["updated_real_ids"]    = s.updated_real_ids;
+                 d["total_inserts_ever"]  = s.total_inserts_ever;
+                 d["tombstone_ratio"]     = s.tombstone_ratio;
+                 d["bloom_capacity"]      = s.bloom_capacity;
+                 d["bloom_fill_ratio"]    = s.bloom_fill_ratio;
+                 d["bloom_rebuild_count"] = s.bloom_rebuild_count;
+                 return d;
+             },
+             "Snapshot of delete/tombstone observability counters as a dict.")
         .def("close", [](lsm_vec::LSMVecDB& db) {
             RaiseStatus(db.Close());
         });
