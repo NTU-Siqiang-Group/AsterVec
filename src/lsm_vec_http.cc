@@ -411,8 +411,13 @@ private:
                 if (!parseId(body["id"].get<std::string>(), &id, &err)) {
                     sendError(res, 400, "bad_id", err); return 400;
                 }
-            } else {
+            } else if (body["id"].is_number_unsigned()) {
                 id = static_cast<node_id_t>(body["id"].get<unsigned long long>());
+            } else {
+                // Reject floats / negatives / non-numbers (no silent truncation).
+                sendError(res, 400, "bad_id",
+                          "id must be a non-negative integer or its string form");
+                return 400;
             }
         } catch (...) {
             sendError(res, 400, "bad_id", "id must be a u64 or its string form");
@@ -501,8 +506,13 @@ private:
                         sendError(res, 400, "bad_id", at + err);
                         return 400;
                     }
-                } else {
+                } else if (it["id"].is_number_unsigned()) {
                     ids[k] = static_cast<node_id_t>(it["id"].get<unsigned long long>());
+                } else {
+                    // Reject floats / negatives / non-numbers (no silent truncation).
+                    sendError(res, 400, "bad_id",
+                              at + "id must be a non-negative integer or its string form");
+                    return 400;
                 }
             } catch (...) {
                 sendError(res, 400, "bad_id", at + "id must be a u64 or its string form");
