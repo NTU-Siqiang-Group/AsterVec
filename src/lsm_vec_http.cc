@@ -645,14 +645,58 @@ private:
                       std::to_string(cfg_.dim) + ")");
             return 400;
         }
-        const std::size_t expected_bytes =
+        const std::size_t vector_bytes =
             static_cast<std::size_t>(n_ll) *
             static_cast<std::size_t>(dim_ll) * sizeof(float);
-        if (req.body.size() != expected_bytes) {
+        if (req.body.size() < vector_bytes) {
             sendError(res, 400, "bad_payload",
                       "body size " + std::to_string(req.body.size()) +
-                      " != n*dim*4 = " + std::to_string(expected_bytes));
+                      " < n*dim*4 = " + std::to_string(vector_bytes));
             return 400;
+        }
+        // Optional trailing payloads: bytes beyond the vector blob are a JSON
+        // array of n payload objects (or nulls), positionally mapped to ids
+        // 0..n-1. Validate SHAPE + size here (before BulkBuild) so malformed
+        // payloads never build a half-index; collect (id, json) for an atomic
+        // post-build write.
+        static constexpr std::size_t kMaxPayloadBytes = 64 * 1024;  // matches DB cap
+        std::vector<std::pair<node_id_t, std::string>> payload_items;
+        if (req.body.size() > vector_bytes) {
+            std::string_view tail(req.body.data() + vector_bytes,
+                                  req.body.size() - vector_bytes);
+            json payloads;
+            try { payloads = json::parse(tail); }
+            catch (const std::exception& e) {
+                sendError(res, 400, "bad_payloads",
+                          std::string("payload tail JSON parse error: ") + e.what());
+                return 400;
+            }
+            if (!payloads.is_array() ||
+                payloads.size() != static_cast<std::size_t>(n_ll)) {
+                sendError(res, 400, "bad_payloads",
+                          "payloads must be a JSON array of length n=" +
+                          std::to_string(n_ll));
+                return 400;
+            }
+            payload_items.reserve(payloads.size());
+            for (std::size_t i = 0; i < payloads.size(); ++i) {
+                if (payloads[i].is_null()) continue;
+                if (!payloads[i].is_object()) {
+                    sendError(res, 400, "bad_payloads",
+                              "payload " + std::to_string(i) +
+                              " must be an object or null");
+                    return 400;
+                }
+                std::string md = payloads[i].dump();
+                if (md.size() > kMaxPayloadBytes) {
+                    sendError(res, 400, "bad_payloads",
+                              "payload " + std::to_string(i) + " exceeds " +
+                              std::to_string(kMaxPayloadBytes) + " bytes");
+                    return 400;
+                }
+                payload_items.emplace_back(static_cast<node_id_t>(i),
+                                           std::move(md));
+            }
         }
 
         BulkBuildOptions bopts;
@@ -686,13 +730,32 @@ private:
             return status;
         }
 
+        // Attach payloads (validated pre-build) atomically. Best-effort: if this
+        // fails the index is already built (DB non-empty) and bulk_build cannot
+        // retry, so the caller must rebuild — signaled by rebuild_required.
+        std::size_t payloads_written = 0;
+        if (!payload_items.empty()) {
+            Status ps = db_->SetPayloadBatch(payload_items);
+            if (!ps.ok()) {
+                int status = statusFromDb(ps);
+                sendJson(res, status, {{"code", "payloads_failed"},
+                                       {"error", ps.ToString()},
+                                       {"n", n},
+                                       {"payloads_written", 0},
+                                       {"rebuild_required", true}});
+                return status;
+            }
+            payloads_written = payload_items.size();
+        }
+
         double elapsed_ms =
             std::chrono::duration<double, std::milli>(t1 - t0).count();
         double vps = static_cast<double>(n) / (elapsed_ms / 1000.0);
         sendJson(res, 200, {{"n", n},
                             {"elapsed_ms", elapsed_ms},
                             {"vectors_per_sec", vps},
-                            {"threads", bopts.num_threads}});
+                            {"threads", bopts.num_threads},
+                            {"payloads_written", payloads_written}});
         return 200;
     }
 

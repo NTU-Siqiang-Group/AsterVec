@@ -4,6 +4,7 @@
 
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "rocksdb/write_batch.h"
 
 namespace lsm_vec {
 
@@ -33,6 +34,17 @@ MetadataStore::Status MetadataStore::Put(node_id_t id, std::string_view json_byt
 MetadataStore::Status MetadataStore::Put(node_id_t id, const Json& doc) {
     auto s = doc.dump();
     return Put(id, std::string_view(s));
+}
+
+MetadataStore::Status MetadataStore::PutBatch(
+        const std::vector<std::pair<node_id_t, std::string>>& items) {
+    ROCKSDB_NAMESPACE::WriteBatch batch;
+    for (const auto& kv : items) {
+        auto s = batch.Put(cf_, EncodeKey(kv.first),
+                           Slice(kv.second.data(), kv.second.size()));
+        if (!s.ok()) return s;
+    }
+    return db_->Write(WriteOptions(), &batch);
 }
 
 MetadataStore::Status MetadataStore::Get(node_id_t id, std::string* out_bytes) const {

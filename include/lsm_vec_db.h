@@ -10,6 +10,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "disk_vector.h"
@@ -110,6 +111,11 @@ public:
     Status Insert(node_id_t id, Span<float> vec, std::string_view metadata_json);
     Status GetPayload(node_id_t id, std::string* out_json);
     Status SetPayload(node_id_t id, std::string_view metadata_json);
+    // Set payloads for many alive ids atomically (one WriteBatch). Validates
+    // every item (id alive, metadata is an object within the size cap) before
+    // writing, so a bad item writes nothing. Used by the bulk-build payload path.
+    Status SetPayloadBatch(
+        const std::vector<std::pair<node_id_t, std::string>>& items);
     Status UpdatePayload(node_id_t id, std::string_view partial_json);
     Status DeletePayloadKeys(node_id_t id, Span<const std::string> keys);
     Status Update(node_id_t id, Span<float> vec);

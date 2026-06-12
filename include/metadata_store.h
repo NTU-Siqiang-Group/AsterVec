@@ -2,6 +2,7 @@
 
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "disk_vector.h"  // provides lsm_vec::node_id_t
@@ -31,6 +32,10 @@ public:
     Status Put(node_id_t id, const char* json_bytes) {
         return Put(id, std::string_view(json_bytes));
     }
+
+    // Write many (id, raw-json) rows atomically in a single WriteBatch
+    // (all-or-nothing). Used by the bulk-build payload path.
+    Status PutBatch(const std::vector<std::pair<node_id_t, std::string>>& items);
 
     // Read the raw JSON bytes. Returns NotFound if no metadata exists for id.
     Status Get(node_id_t id, std::string* out_bytes) const;

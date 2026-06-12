@@ -314,6 +314,29 @@ Status LSMVecDB::SetPayload(node_id_t id, std::string_view metadata_json)
     return metadata_store_->Put(i, metadata_json);
 }
 
+Status LSMVecDB::SetPayloadBatch(
+    const std::vector<std::pair<node_id_t, std::string>>& items)
+{
+    if (!metadata_store_) return Status::NotFound("metadata store unavailable");
+    // Validate EVERY item (alive + metadata object within size cap) before any
+    // write, then commit all rows in one atomic WriteBatch.
+    std::vector<std::pair<node_id_t, std::string>> internal_items;
+    internal_items.reserve(items.size());
+    for (const auto& kv : items) {
+        const real_id_t r = static_cast<real_id_t>(kv.first);
+        if (!index_->is_alive(r)) {
+            return Status::NotFound("vector not found for id " +
+                                    std::to_string(kv.first));
+        }
+        nlohmann::json parsed;
+        auto pst = ParseMetadataObject(kv.second, &parsed);
+        if (!pst.ok()) return pst;
+        const internal_id_t i = index_->resolve_internal(r);
+        internal_items.emplace_back(static_cast<node_id_t>(i), kv.second);
+    }
+    return metadata_store_->PutBatch(internal_items);
+}
+
 Status LSMVecDB::UpdatePayload(node_id_t id, std::string_view partial_json)
 {
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
