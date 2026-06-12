@@ -320,6 +320,12 @@ public:
             int status = handleInsert(req, res);
             logReq(req, status, t.ms());
         });
+        s.Post("/v1/vectors/batch",
+               [this](const httplib::Request& req, httplib::Response& res) {
+            ReqTimer t;
+            int status = handleInsertBatch(req, res);
+            logReq(req, status, t.ms());
+        });
 
         // Get / upsert / delete by id.
         s.Get(R"(/v1/vectors/(\d+))",
@@ -440,6 +446,110 @@ private:
             return statusFromDb(s);
         }
         sendJson(res, 201, {{"id", id}});
+        return 201;
+    }
+
+    int handleInsertBatch(const httplib::Request& req, httplib::Response& res) {
+        static constexpr std::size_t kMaxBatchItems = 10000;
+        static constexpr std::size_t kMaxBatchBytes = 64 * 1024 * 1024;  // 64 MB
+        // R3: bound the body BEFORE parsing (global cap is bulk_build_max_length).
+        if (req.body.size() > kMaxBatchBytes) {
+            sendError(res, 413, "batch_too_large",
+                      "body exceeds " + std::to_string(kMaxBatchBytes) + " bytes");
+            return 413;
+        }
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception& e) {
+            sendError(res, 400, "bad_json", e.what());
+            return 400;
+        }
+        if (!body.contains("items") || !body["items"].is_array()) {
+            sendError(res, 400, "missing_field", "items array is required");
+            return 400;
+        }
+        const auto& items = body["items"];
+        if (items.empty()) {
+            sendError(res, 400, "empty_batch", "items must be non-empty");
+            return 400;
+        }
+        if (items.size() > kMaxBatchItems) {
+            sendError(res, 413, "batch_too_large",
+                      "batch has " + std::to_string(items.size()) +
+                      " items, max is " + std::to_string(kMaxBatchItems));
+            return 413;
+        }
+
+        // Preflight: parse + FULLY validate every item (id range, vector, dim,
+        // metadata) before any write — so a malformed item writes nothing.
+        const std::size_t n = items.size();
+        std::vector<node_id_t> ids(n);
+        std::vector<std::vector<float>> vecs(n);
+        std::vector<std::string> metas(n);
+        std::vector<char> has_meta(n, 0);
+        for (std::size_t k = 0; k < n; ++k) {
+            const auto& it = items[k];
+            const std::string at = "item " + std::to_string(k) + ": ";
+            if (!it.contains("id") || !it.contains("vector")) {
+                sendError(res, 400, "missing_field", at + "id and vector are required");
+                return 400;
+            }
+            try {
+                if (it["id"].is_string()) {
+                    std::string err;
+                    if (!parseId(it["id"].get<std::string>(), &ids[k], &err)) {
+                        sendError(res, 400, "bad_id", at + err);
+                        return 400;
+                    }
+                } else {
+                    ids[k] = static_cast<node_id_t>(it["id"].get<unsigned long long>());
+                }
+            } catch (...) {
+                sendError(res, 400, "bad_id", at + "id must be a u64 or its string form");
+                return 400;
+            }
+            std::string err;
+            if (!extractVector(it["vector"], &vecs[k], &err)) {
+                sendError(res, 400, "bad_vector", at + err);
+                return 400;
+            }
+            if (static_cast<int>(vecs[k].size()) != cfg_.dim) {
+                sendError(res, 400, "wrong_dim",
+                          at + "vector dim is " + std::to_string(vecs[k].size()) +
+                          " but DB dim is " + std::to_string(cfg_.dim));
+                return 400;
+            }
+            if (it.contains("metadata")) {
+                metas[k] = it["metadata"].is_string()
+                    ? it["metadata"].get<std::string>()
+                    : it["metadata"].dump();
+                has_meta[k] = 1;
+            }
+            // R1: id-range + metadata validation via the engine (no write).
+            Status vs = db_->ValidateInsert(
+                ids[k], Span<float>(vecs[k]),
+                has_meta[k] ? std::string_view(metas[k]) : std::string_view{});
+            if (!vs.ok()) {
+                int code = statusFromDb(vs);
+                sendError(res, code, "bad_item", at + vs.ToString());
+                return code;
+            }
+        }
+
+        // Insert all (sequential). On a mid-batch engine error, report progress.
+        for (std::size_t k = 0; k < n; ++k) {
+            Status s = has_meta[k]
+                ? db_->Insert(ids[k], Span<float>(vecs[k]), std::string_view(metas[k]))
+                : db_->Insert(ids[k], Span<float>(vecs[k]));
+            if (!s.ok()) {
+                int code = statusFromDb(s);
+                sendJson(res, code, {{"code", "db_error"}, {"error", s.ToString()},
+                                     {"inserted", static_cast<uint64_t>(k)},
+                                     {"failed_index", static_cast<uint64_t>(k)}});
+                return code;
+            }
+        }
+        sendJson(res, 201, {{"inserted", static_cast<uint64_t>(n)}});
         return 201;
     }
 

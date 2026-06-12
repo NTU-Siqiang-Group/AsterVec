@@ -109,6 +109,11 @@ public:
 
     Status Insert(node_id_t id, Span<float> vec);
     Status Insert(node_id_t id, Span<float> vec, std::string_view metadata_json);
+    // Validate insert args WITHOUT mutating (id range, metric, vector dim/finite,
+    // metadata object/size). Insert() calls this; batch callers use it to
+    // preflight a whole batch so a bad item writes nothing.
+    Status ValidateInsert(node_id_t id, Span<float> vec,
+                          std::string_view metadata_json) const;
     Status GetPayload(node_id_t id, std::string* out_json);
     Status SetPayload(node_id_t id, std::string_view metadata_json);
     // Set payloads for many alive ids atomically (one WriteBatch). Validates

@@ -232,12 +232,29 @@ bool LSMVecDB::HasLiveVector(node_id_t id) const {
     return index_ && index_->is_alive(static_cast<real_id_t>(id));
 }
 
-Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata_json)
+Status LSMVecDB::ValidateInsert(node_id_t id, Span<float> vec,
+                                std::string_view metadata_json) const
 {
     const real_id_t r = static_cast<real_id_t>(id);
     if (r > kMaxRealId) {
         return Status::InvalidArgument("real_id must fit in 63 bits");
     }
+    if (auto s = EnsureMetricSupported(); !s.ok()) return s;
+    if (auto s = ValidateVector(vec); !s.ok()) return s;
+    // Metadata must be a JSON object within the size cap (empty / "{}" = none).
+    if (!metadata_json.empty() && metadata_json != "{}") {
+        nlohmann::json parsed;
+        if (auto s = ParseMetadataObject(metadata_json, &parsed); !s.ok()) return s;
+    }
+    return Status::OK();
+}
+
+Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata_json)
+{
+    // Validate everything up front (id range, metric, vector, metadata). Batch
+    // callers run this for every item first, so a bad item writes nothing.
+    if (auto s = ValidateInsert(id, vec, metadata_json); !s.ok()) return s;
+    const real_id_t r = static_cast<real_id_t>(id);
 
     // Phase 3 (concurrent-writer-refactor-plan §5.2): acquire the
     // per-real-id transaction lock for the entire Insert/Upsert flow.
@@ -247,16 +264,7 @@ Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata
     // re-enter the same shard (re-insert path).
     std::lock_guard<std::recursive_mutex> txn_lk(real_id_lock(r));
 
-    if (auto s = EnsureMetricSupported(); !s.ok()) return s;
-    if (auto s = ValidateVector(vec); !s.ok()) return s;
-
-    // Pre-parse metadata (fail-fast; no writes yet).
     const bool has_metadata = !metadata_json.empty() && metadata_json != "{}";
-    if (has_metadata) {
-        nlohmann::json parsed;
-        auto pst = ParseMetadataObject(metadata_json, &parsed);
-        if (!pst.ok()) return pst;
-    }
 
     // A1: upsert on an alive real_id → route to Update.
     if (index_->is_alive(r)) {
