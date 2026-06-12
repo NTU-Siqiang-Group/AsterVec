@@ -1,0 +1,11 @@
+# SSH private key for the trial server — never commit
+lsmvec-key.pem
+*.pem
+
+# Benchmark scaffolding & datasets — local only, not tracked.
+# Dataset test code/scripts (SIFT/Gist/BEIR/…) default to off-Git (see CLAUDE.md).
+bench/cache/
+bench/data/
+bench/out/
+bench/__pycache__/
+bench/tests/__pycache__/
