@@ -1007,6 +1007,11 @@ private:
         }
         const int dim = static_cast<int>(dim_u);
 
+        if (body.contains("metric") && !body["metric"].is_string()) {
+            sendError(res, 400, "bad_metric",
+                      "metric must be a string ('l2' or 'cosine')");
+            return 400;
+        }
         std::string metric = body.value("metric", std::string("l2"));
         for (auto& c : metric) c = static_cast<char>(std::tolower(c));
         DistanceMetric dm;
@@ -1054,21 +1059,46 @@ private:
 
     int handleDeleteIndex(const httplib::Request& req, httplib::Response& res) {
         (void)req;
+        namespace fs = std::filesystem;
         std::lock_guard<std::mutex> lk(st_->mu);
         // Close the DB (graceful RocksDB/Aster shutdown via destructor) BEFORE
         // touching files so handles are released.
         st_->db.reset();
+
         // Wipe the on-disk index: remove the CONTENTS of data_dir (bootstrap,
         // RocksGraph, vector.log, metadata/), never the mount point itself.
-        std::error_code ec;
-        std::filesystem::path dir(cfg_.data_dir);
-        if (std::filesystem::exists(dir, ec)) {
-            for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-                std::filesystem::remove_all(entry.path(), ec);
+        // Remove the bootstrap FIRST so that even if a later removal fails, a
+        // restart comes up cleanly uninitialized. This is a destructive
+        // endpoint: a non-empty failure must surface as 500, never a false 200.
+        fs::path dir(cfg_.data_dir);
+        std::string failed;     // first path that could not be removed
+        std::string err_msg;
+
+        std::error_code bec;
+        fs::remove(dir / kBootstrapFileName, bec);  // false (no ec) if absent
+        if (bec) { failed = (dir / kBootstrapFileName).string(); err_msg = bec.message(); }
+
+        if (failed.empty()) {
+            std::error_code iec;
+            for (fs::directory_iterator it(dir, iec), end; it != end; it.increment(iec)) {
+                if (iec) { failed = dir.string(); err_msg = iec.message(); break; }
+                std::error_code rec;
+                fs::remove_all(it->path(), rec);
+                if (rec) { failed = it->path().string(); err_msg = rec.message(); break; }
             }
         }
+
+        // The DB is closed regardless, so in-memory state is uninitialized.
         cfg_.dim = 0;
         cfg_.metric = DistanceMetric::kL2;
+
+        if (!failed.empty()) {
+            std::cerr << "{\"event\":\"index_delete_failed\",\"path\":\"" << failed
+                      << "\",\"error\":\"" << err_msg << "\"}\n";
+            sendError(res, 500, "delete_failed",
+                      "failed to remove '" + failed + "': " + err_msg);
+            return 500;
+        }
         std::cerr << "{\"event\":\"index_deleted\"}\n";
         sendJson(res, 200, {{"initialized", false}});
         return 200;
