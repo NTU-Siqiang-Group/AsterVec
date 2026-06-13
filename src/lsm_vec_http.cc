@@ -27,9 +27,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -258,16 +260,16 @@ bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err) {
         if      (saved_metric == "cosine") cfg->metric = DistanceMetric::kCosine;
         else                               cfg->metric = DistanceMetric::kL2;
     } else {
-        // First boot: dim must be set in env.
-        if (cfg->dim <= 0) {
-            *err = "LSMVEC_DIM is required on first boot (no existing DB at " +
-                   cfg->data_dir + ")";
-            return false;
-        }
-        std::string err_w;
-        if (!writeBootstrap(cfg->data_dir, {cfg->dim, metric}, &err_w)) {
-            *err = err_w;
-            return false;
+        // First boot. If LSMVEC_DIM was provided (operator pre-init / back-compat),
+        // persist it now and the server opens the DB at boot. Otherwise leave the
+        // index UNINITIALIZED (cfg->dim stays 0, no bootstrap written): the server
+        // boots without a DB and the user calls PUT /v1/index to set the dimension.
+        if (cfg->dim > 0) {
+            std::string err_w;
+            if (!writeBootstrap(cfg->data_dir, {cfg->dim, metric}, &err_w)) {
+                *err = err_w;
+                return false;
+            }
         }
     }
     return true;
@@ -279,9 +281,46 @@ bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err) {
 
 namespace {
 
+const char* metricToString(DistanceMetric m) {
+    return (m == DistanceMetric::kCosine) ? "cosine" : "l2";
+}
+
+// Build engine options from the server config. Used both at boot
+// (RunHttpServer) and at runtime when PUT /v1/index opens the DB.
+LSMVecDBOptions buildOptions(const HttpServerConfig& cfg) {
+    LSMVecDBOptions opts;
+    opts.dim                  = cfg.dim;
+    opts.metric               = cfg.metric;
+    opts.m                    = cfg.m;
+    opts.m_max                = cfg.m_max;
+    opts.ef_construction      = static_cast<float>(cfg.ef_construction);
+    opts.ef_search            = cfg.ef_search_default;
+    opts.vec_file_capacity    = cfg.vec_file_capacity;
+    opts.paged_max_cached_pages = cfg.paged_max_cached_pages;
+    opts.vector_storage_type  = 1;
+    opts.edge_cache_size      = cfg.edge_cache_size;
+    opts.enable_stats         = cfg.enable_stats;
+    opts.enable_batch_read    = true;
+    opts.reinit               = false;
+    opts.vector_file_path     = cfg.data_dir + "/vector.log";
+    return opts;
+}
+
+// Shared, mutable server state. The DB starts null when the index is
+// uninitialized (no dimension yet); PUT /v1/index opens it and DELETE
+// /v1/index closes + wipes it. `mu` serializes those structural changes
+// and guards `cfg` (dim/metric) mutation. Data handlers take a shared_ptr
+// copy under `mu` so the DB stays alive for the request even if a
+// concurrent DELETE swaps it out.
+struct ServerState {
+    std::mutex                  mu;
+    std::shared_ptr<LSMVecDB>   db;   // null == uninitialized
+    HttpServerConfig            cfg;  // dim/metric set by PUT /v1/index
+};
+
 class Handlers {
 public:
-    Handlers(LSMVecDB* db, const HttpServerConfig& cfg) : db_(db), cfg_(cfg) {}
+    explicit Handlers(ServerState* st) : st_(st), cfg_(st->cfg) {}
 
     void registerRoutes(httplib::Server& s) {
         // Health / readiness.
@@ -292,15 +331,35 @@ public:
         });
         s.Get("/ready", [this](const httplib::Request& req, httplib::Response& res) {
             ReqTimer t;
-            int status = (db_ != nullptr) ? 200 : 503;
-            sendJson(res, status, {{"status", db_ ? "ok" : "no db"}});
+            bool ok = (dbShared() != nullptr);
+            int status = ok ? 200 : 503;
+            sendJson(res, status, {{"status", ok ? "ok" : "no db"}});
+            logReq(req, status, t.ms());
+        });
+
+        // Index lifecycle: set / inspect / delete the dimension.
+        s.Put("/v1/index", [this](const httplib::Request& req, httplib::Response& res) {
+            ReqTimer t;
+            int status = handleCreateIndex(req, res);
+            logReq(req, status, t.ms());
+        });
+        s.Delete("/v1/index", [this](const httplib::Request& req, httplib::Response& res) {
+            ReqTimer t;
+            int status = handleDeleteIndex(req, res);
+            logReq(req, status, t.ms());
+        });
+        s.Get("/v1/index", [this](const httplib::Request& req, httplib::Response& res) {
+            ReqTimer t;
+            int status = handleGetIndex(req, res);
             logReq(req, status, t.ms());
         });
 
         // Stats.
         s.Get("/v1/stats", [this](const httplib::Request& req, httplib::Response& res) {
             ReqTimer t;
-            auto ds = db_->GetDeleteStats();
+            auto sp = requireInit(res);
+            if (!sp) { logReq(req, 409, t.ms()); return; }
+            auto ds = sp->GetDeleteStats();
             json body = {
                 {"tombstones", ds.tombstones},
                 {"updated_real_ids", ds.updated_real_ids},
@@ -385,6 +444,23 @@ public:
     }
 
 private:
+    // Live DB pointer (null when uninitialized). Copy under the lock so the
+    // DB stays alive for the caller even if a concurrent DELETE swaps it out.
+    std::shared_ptr<LSMVecDB> dbShared() {
+        std::lock_guard<std::mutex> lk(st_->mu);
+        return st_->db;
+    }
+
+    // Data-route guard: returns the live DB, or null after sending a 409.
+    std::shared_ptr<LSMVecDB> requireInit(httplib::Response& res) {
+        auto sp = dbShared();
+        if (!sp) {
+            sendError(res, 409, "index_not_initialized",
+                      "index has no dimension yet; call PUT /v1/index first");
+        }
+        return sp;
+    }
+
     int statusFromDb(const Status& s) {
         if (s.ok()) return 200;
         if (s.IsNotFound()) return 404;
@@ -394,6 +470,9 @@ private:
     }
 
     int handleInsert(const httplib::Request& req, httplib::Response& res) {
+        auto sp = requireInit(res);
+        if (!sp) return 409;
+        LSMVecDB* db_ = sp.get();
         json body;
         try { body = json::parse(req.body); }
         catch (const std::exception& e) {
@@ -455,6 +534,9 @@ private:
     }
 
     int handleInsertBatch(const httplib::Request& req, httplib::Response& res) {
+        auto sp = requireInit(res);
+        if (!sp) return 409;
+        LSMVecDB* db_ = sp.get();
         static constexpr std::size_t kMaxBatchItems = 10000;
         static constexpr std::size_t kMaxBatchBytes = 64 * 1024 * 1024;  // 64 MB
         // R3: bound the body BEFORE parsing (global cap is bulk_build_max_length).
@@ -564,6 +646,9 @@ private:
     }
 
     int handleGet(const httplib::Request& req, httplib::Response& res) {
+        auto sp = requireInit(res);
+        if (!sp) return 409;
+        LSMVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -580,6 +665,9 @@ private:
     }
 
     int handlePut(const httplib::Request& req, httplib::Response& res) {
+        auto sp = requireInit(res);
+        if (!sp) return 409;
+        LSMVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -613,6 +701,9 @@ private:
     }
 
     int handleDelete(const httplib::Request& req, httplib::Response& res) {
+        auto sp = requireInit(res);
+        if (!sp) return 409;
+        LSMVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -628,6 +719,9 @@ private:
     }
 
     int handleGetPayload(const httplib::Request& req, httplib::Response& res) {
+        auto sp = requireInit(res);
+        if (!sp) return 409;
+        LSMVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -646,6 +740,9 @@ private:
     }
 
     int handleSetPayload(const httplib::Request& req, httplib::Response& res) {
+        auto sp = requireInit(res);
+        if (!sp) return 409;
+        LSMVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -666,6 +763,9 @@ private:
     }
 
     int handlePatchPayload(const httplib::Request& req, httplib::Response& res) {
+        auto sp = requireInit(res);
+        if (!sp) return 409;
+        LSMVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -685,6 +785,9 @@ private:
     }
 
     int handleSearch(const httplib::Request& req, httplib::Response& res) {
+        auto sp = requireInit(res);
+        if (!sp) return 409;
+        LSMVecDB* db_ = sp.get();
         json body;
         try { body = json::parse(req.body); }
         catch (const std::exception& e) {
@@ -732,6 +835,9 @@ private:
     }
 
     int handleBulkBuild(const httplib::Request& req, httplib::Response& res) {
+        auto sp = requireInit(res);
+        if (!sp) return 409;
+        LSMVecDB* db_ = sp.get();
         // Header-driven shape (avoids JSON parsing of a 50+ MB blob).
         auto get_hdr = [&](const char* k) -> std::string {
             auto it = req.headers.find(k);
@@ -879,8 +985,111 @@ private:
         return 200;
     }
 
-    LSMVecDB*               db_;
-    const HttpServerConfig& cfg_;
+    // ---- index lifecycle ----
+
+    int handleCreateIndex(const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception& e) {
+            sendError(res, 400, "bad_json", e.what()); return 400;
+        }
+        if (!body.contains("dim")) {
+            sendError(res, 400, "missing_field", "dim is required"); return 400;
+        }
+        if (!body["dim"].is_number_unsigned()) {
+            sendError(res, 400, "bad_dim", "dim must be a positive integer");
+            return 400;
+        }
+        const unsigned long long dim_u = body["dim"].get<unsigned long long>();
+        if (dim_u == 0 || dim_u > 100000) {
+            sendError(res, 400, "bad_dim", "dim must be in [1, 100000]");
+            return 400;
+        }
+        const int dim = static_cast<int>(dim_u);
+
+        std::string metric = body.value("metric", std::string("l2"));
+        for (auto& c : metric) c = static_cast<char>(std::tolower(c));
+        DistanceMetric dm;
+        if      (metric == "l2")     dm = DistanceMetric::kL2;
+        else if (metric == "cosine") dm = DistanceMetric::kCosine;
+        else {
+            sendError(res, 400, "bad_metric", "metric must be 'l2' or 'cosine'");
+            return 400;
+        }
+
+        std::lock_guard<std::mutex> lk(st_->mu);
+        if (st_->db) {
+            sendError(res, 409, "index_already_initialized",
+                      "index already has dimension " + std::to_string(cfg_.dim));
+            return 409;
+        }
+
+        // Persist dim/metric, then open. Use a temp config so a failed open
+        // leaves cfg_ untouched (still uninitialized) and retryable.
+        std::string werr;
+        if (!writeBootstrap(cfg_.data_dir, {dim, metric}, &werr)) {
+            sendError(res, 500, "bootstrap_write_failed", werr); return 500;
+        }
+        HttpServerConfig tmp = cfg_;
+        tmp.dim = dim;
+        tmp.metric = dm;
+        std::unique_ptr<LSMVecDB> dbu;
+        auto st = LSMVecDB::Open(tmp.data_dir, buildOptions(tmp), &dbu);
+        if (!st.ok()) {
+            std::error_code ec;
+            std::filesystem::remove(
+                std::filesystem::path(cfg_.data_dir) / kBootstrapFileName, ec);
+            sendError(res, 500, "open_failed", st.ToString());
+            return 500;
+        }
+        cfg_.dim = dim;
+        cfg_.metric = dm;
+        st_->db = std::move(dbu);
+        std::cerr << "{\"event\":\"index_created\",\"dim\":" << dim
+                  << ",\"metric\":\"" << metric << "\"}\n";
+        sendJson(res, 200,
+                 {{"dim", dim}, {"metric", metric}, {"initialized", true}});
+        return 200;
+    }
+
+    int handleDeleteIndex(const httplib::Request& req, httplib::Response& res) {
+        (void)req;
+        std::lock_guard<std::mutex> lk(st_->mu);
+        // Close the DB (graceful RocksDB/Aster shutdown via destructor) BEFORE
+        // touching files so handles are released.
+        st_->db.reset();
+        // Wipe the on-disk index: remove the CONTENTS of data_dir (bootstrap,
+        // RocksGraph, vector.log, metadata/), never the mount point itself.
+        std::error_code ec;
+        std::filesystem::path dir(cfg_.data_dir);
+        if (std::filesystem::exists(dir, ec)) {
+            for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                std::filesystem::remove_all(entry.path(), ec);
+            }
+        }
+        cfg_.dim = 0;
+        cfg_.metric = DistanceMetric::kL2;
+        std::cerr << "{\"event\":\"index_deleted\"}\n";
+        sendJson(res, 200, {{"initialized", false}});
+        return 200;
+    }
+
+    int handleGetIndex(const httplib::Request& req, httplib::Response& res) {
+        (void)req;
+        std::lock_guard<std::mutex> lk(st_->mu);
+        json body;
+        if (st_->db) {
+            body = {{"initialized", true}, {"dim", cfg_.dim},
+                    {"metric", metricToString(cfg_.metric)}};
+        } else {
+            body = {{"initialized", false}, {"dim", nullptr}, {"metric", nullptr}};
+        }
+        sendJson(res, 200, body);
+        return 200;
+    }
+
+    ServerState*       st_;
+    HttpServerConfig&  cfg_;   // alias of st_->cfg (dim/metric mutable)
 };
 
 }  // namespace
@@ -899,35 +1108,31 @@ int RunHttpServer(const HttpServerConfig& cfg) {
     // action (terminate) → process dies before our handler runs.
     blockShutdownSignalsInThisThread();
 
-    // 1. Open DB.
-    LSMVecDBOptions opts;
-    opts.dim = cfg.dim;
-    opts.metric = cfg.metric;
-    opts.m = cfg.m;
-    opts.m_max = cfg.m_max;
-    opts.ef_construction = static_cast<float>(cfg.ef_construction);
-    opts.ef_search = cfg.ef_search_default;
-    opts.vec_file_capacity = cfg.vec_file_capacity;
-    opts.paged_max_cached_pages = cfg.paged_max_cached_pages;
-    opts.vector_storage_type = 1;
-    opts.edge_cache_size = cfg.edge_cache_size;
-    opts.enable_stats = cfg.enable_stats;
-    opts.enable_batch_read = true;
-    opts.reinit = false;
-    opts.vector_file_path = cfg.data_dir + "/vector.log";
+    // 1. Server state. Open the DB now only if a dimension is known (existing
+    //    bootstrap.json, or LSMVEC_DIM on first boot). Otherwise stay
+    //    UNINITIALIZED — the DB opens later when a client calls PUT /v1/index.
+    ServerState state;
+    state.cfg = cfg;
 
-    std::unique_ptr<LSMVecDB> db;
-    auto st = LSMVecDB::Open(cfg.data_dir, opts, &db);
-    if (!st.ok()) {
-        std::cerr << "{\"event\":\"open_failed\",\"error\":\""
-                  << st.ToString() << "\"}\n";
-        return 1;
+    if (cfg.dim > 0) {
+        std::unique_ptr<LSMVecDB> db;
+        auto st = LSMVecDB::Open(cfg.data_dir, buildOptions(cfg), &db);
+        if (!st.ok()) {
+            std::cerr << "{\"event\":\"open_failed\",\"error\":\""
+                      << st.ToString() << "\"}\n";
+            return 1;
+        }
+        state.db = std::move(db);
+        std::cerr << "{\"event\":\"db_open\",\"data_dir\":\""
+                  << cfg.data_dir << "\",\"dim\":" << cfg.dim
+                  << ",\"edge_cache_size\":" << cfg.edge_cache_size
+                  << ",\"enable_stats\":" << (cfg.enable_stats ? "true" : "false")
+                  << "}\n";
+    } else {
+        std::cerr << "{\"event\":\"uninitialized\",\"data_dir\":\""
+                  << cfg.data_dir
+                  << "\",\"note\":\"awaiting PUT /v1/index to set dimension\"}\n";
     }
-    std::cerr << "{\"event\":\"db_open\",\"data_dir\":\""
-              << cfg.data_dir << "\",\"dim\":" << cfg.dim
-              << ",\"edge_cache_size\":" << cfg.edge_cache_size
-              << ",\"enable_stats\":" << (cfg.enable_stats ? "true" : "false")
-              << "}\n";
 
     // 2. Build server, register routes.
     httplib::Server srv;
@@ -939,7 +1144,7 @@ int RunHttpServer(const HttpServerConfig& cfg) {
     srv.set_read_timeout(cfg.read_timeout_sec, 0);
     srv.set_write_timeout(cfg.write_timeout_sec, 0);
 
-    Handlers handlers(db.get(), cfg);
+    Handlers handlers(&state);
     handlers.registerRoutes(srv);
 
     // Reject any unknown path with a JSON 404. ONLY fill the body when
@@ -978,12 +1183,16 @@ int RunHttpServer(const HttpServerConfig& cfg) {
     }
 
     // 3. Graceful shutdown: server returned (either listen failed OR
-    // signal handler called stop()). Flush + close.
+    // signal handler called stop()). Flush + close under the lock (a
+    // concurrent create/delete also takes it).
     std::cerr << "{\"event\":\"shutdown_begin\"}\n";
-    if (db) {
-        db->flushVectorWrites();
-        db->Close();
-        db.reset();
+    {
+        std::lock_guard<std::mutex> lk(state.mu);
+        if (state.db) {
+            state.db->flushVectorWrites();
+            state.db->Close();
+            state.db.reset();
+        }
     }
     std::cerr << "{\"event\":\"shutdown_done\"}\n";
     return 0;
