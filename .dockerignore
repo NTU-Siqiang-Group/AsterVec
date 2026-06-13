@@ -18,6 +18,12 @@ lib/aster/**/*.d
 lib/aster/**/*.a
 lib/aster/**/*.so
 lib/aster/**/*.dylib
+# Cached platform detection from a host build. A macOS-generated
+# make_config.mk (PLATFORM=OS_MACOSX) copied into the linux build makes
+# `make aster` skip build_detect_platform and compile a mismatched,
+# truncated librocksdb.a -> undefined references at the final link.
+# Exclude it so the container always re-detects its own platform.
+lib/aster/make_config.mk
 
 # Bench / dataset artefacts
 data/sift*
