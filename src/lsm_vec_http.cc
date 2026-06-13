@@ -502,6 +502,16 @@ private:
             sendError(res, 400, "bad_id", "id must be a u64 or its string form");
             return 400;
         }
+        // IDs are dense storage positions: reject ids beyond the vector-file
+        // capacity with a clean 400 instead of letting the file expansion OOM
+        // the box. Ids must be sequential/dense (0-based).
+        if (id >= cfg_.vec_file_capacity) {
+            sendError(res, 400, "id_too_large",
+                      "id " + std::to_string(id) + " exceeds capacity " +
+                      std::to_string(cfg_.vec_file_capacity) +
+                      "; use sequential (dense, 0-based) ids");
+            return 400;
+        }
 
         std::vector<float> v;
         std::string err;
@@ -598,6 +608,13 @@ private:
                 }
             } catch (...) {
                 sendError(res, 400, "bad_id", at + "id must be a u64 or its string form");
+                return 400;
+            }
+            if (ids[k] >= cfg_.vec_file_capacity) {
+                sendError(res, 400, "id_too_large",
+                          at + "id " + std::to_string(ids[k]) + " exceeds capacity " +
+                          std::to_string(cfg_.vec_file_capacity) +
+                          "; use sequential (dense, 0-based) ids");
                 return 400;
             }
             std::string err;
@@ -1001,8 +1018,8 @@ private:
             return 400;
         }
         const unsigned long long dim_u = body["dim"].get<unsigned long long>();
-        if (dim_u == 0 || dim_u > 100000) {
-            sendError(res, 400, "bad_dim", "dim must be in [1, 100000]");
+        if (dim_u == 0 || dim_u > 4000) {
+            sendError(res, 400, "bad_dim", "dim must be in [1, 4000]");
             return 400;
         }
         const int dim = static_cast<int>(dim_u);
