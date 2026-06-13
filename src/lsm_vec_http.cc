@@ -293,6 +293,24 @@ const char* metricToString(DistanceMetric m) {
     return (m == DistanceMetric::kCosine) ? "cosine" : "l2";
 }
 
+// Process anonymous resident memory in bytes — the real working set, excluding
+// reclaimable OS file-cache buffers (the kernel's page cache for the on-disk
+// vector / SST files). Reads RssAnon from /proc/self/status on Linux;
+// best-effort 0 elsewhere (production is Linux).
+std::size_t processAnonRssBytes() {
+    std::ifstream f("/proc/self/status");
+    if (!f.is_open()) return 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("RssAnon:", 0) == 0) {
+            std::size_t kb = 0;
+            for (char c : line) if (c >= '0' && c <= '9') kb = kb * 10 + (c - '0');
+            return kb * 1024;
+        }
+    }
+    return 0;
+}
+
 // Build engine options from the server config. Used both at boot
 // (RunHttpServer) and at runtime when PUT /v1/index opens the DB.
 LSMVecDBOptions buildOptions(const HttpServerConfig& cfg) {
@@ -367,15 +385,11 @@ public:
             ReqTimer t;
             auto sp = requireInit(res);
             if (!sp) { logReq(req, 409, t.ms()); return; }
-            auto ds = sp->GetDeleteStats();
             json body = {
-                {"tombstones", ds.tombstones},
-                {"updated_real_ids", ds.updated_real_ids},
-                {"total_inserts_ever", ds.total_inserts_ever},
-                {"tombstone_ratio", ds.tombstone_ratio},
-                {"bloom_capacity", ds.bloom_capacity},
-                {"bloom_fill_ratio", ds.bloom_fill_ratio},
-                {"bloom_rebuild_count", ds.bloom_rebuild_count},
+                {"vectors", sp->VectorCount()},
+                {"dim", cfg_.dim},
+                {"metric", metricToString(cfg_.metric)},
+                {"memory_bytes", processAnonRssBytes()},
             };
             sendJson(res, 200, body);
             logReq(req, 200, t.ms());

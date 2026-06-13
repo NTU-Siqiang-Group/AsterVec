@@ -170,6 +170,9 @@ Status LSMVecDB::Open(const std::string& path,
         meta_raw->DestroyColumnFamilyHandle(handles[0]);
     }
 
+    // Restore the live vector count persisted by a prior flush/Close (0 on a
+    // fresh or wiped index, or after an unclean crash with no persisted file).
+    (*db)->loadCount();
     return Status::OK();
 }
 
@@ -291,6 +294,10 @@ Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata
     } catch (const std::exception& ex) {
         return Status::IOError(ex.what());
     }
+    // A new live vector now exists (this branch is reached only when r was not
+    // alive — first insert or re-insert after delete). Upserts route to Update
+    // above and don't reach here, so this never double-counts.
+    live_count_.fetch_add(1, std::memory_order_relaxed);
 
     if (has_metadata && metadata_store_) {
         auto mst = metadata_store_->Put(target_internal, metadata_json);
@@ -454,6 +461,11 @@ Status LSMVecDB::Delete(node_id_t id)
     // delete (resolve → tombstone → metadata delete → forget mapping).
     std::lock_guard<std::recursive_mutex> txn_lk(real_id_lock(r));
 
+    // Capture liveness BEFORE tombstoning so the count only drops for a real
+    // live->deleted transition (a repeat delete re-tombstones harmlessly but
+    // must not decrement again).
+    const bool was_alive = index_->is_alive(r);
+
     const internal_id_t i = index_->resolve_internal(r);
     // Idempotent: if r never had a live vector, nothing to do (per design §5.3).
     if (!index_->vector_storage_ || !index_->vector_storage_->exists(i)) {
@@ -472,6 +484,9 @@ Status LSMVecDB::Delete(node_id_t id)
     // A4: if r was update-allocated, drop the sparse-map entries so future
     // resolve_internal(r) returns identity.
     index_->forget_update_mapping(r);
+    // Decrement only for a genuine live->deleted transition (was_alive captured
+    // above); a repeat delete of an already-tombstoned id must not double-count.
+    if (was_alive) live_count_.fetch_sub(1, std::memory_order_relaxed);
     return Status::OK();
 }
 
@@ -664,9 +679,35 @@ Status LSMVecDB::BulkBuild(Span<const float> vectors, int n,
         return Status::IOError("BulkBuild failed (unknown exception)");
     }
 
+    // Bulk build loads n vectors at dense ids 0..n-1 into a fresh, empty index.
+    live_count_.store(static_cast<std::int64_t>(n), std::memory_order_relaxed);
+
     // Match Insert's post-write side effects.
     flushVectorWrites();
     return Status::OK();
+}
+
+std::size_t LSMVecDB::VectorCount() const
+{
+    const std::int64_t v = live_count_.load(std::memory_order_relaxed);
+    return v > 0 ? static_cast<std::size_t>(v) : 0;
+}
+
+void LSMVecDB::persistCount() const
+{
+    std::ofstream f(db_path_ + "/vector_count", std::ios::trunc);
+    if (f.is_open()) f << live_count_.load(std::memory_order_relaxed) << "\n";
+}
+
+void LSMVecDB::loadCount()
+{
+    std::ifstream f(db_path_ + "/vector_count");
+    long long v = 0;
+    if (f.is_open() && (f >> v) && v >= 0) {
+        live_count_.store(static_cast<std::int64_t>(v), std::memory_order_relaxed);
+    } else {
+        live_count_.store(0, std::memory_order_relaxed);
+    }
 }
 
 void LSMVecDB::flushVectorWrites()
@@ -674,6 +715,7 @@ void LSMVecDB::flushVectorWrites()
     if (index_) {
         index_->vector_storage_->flushWrites();
     }
+    persistCount();
     // 20260516_malloc_trim: a bulk insert leaves the glibc heap fragmented
     // (RocksDB / Aster churn temporary buffers; our edge + page caches grow
     // and shrink). Trim now while we know we're at a write-batch boundary.
@@ -704,6 +746,9 @@ Status LSMVecDB::Close()
     if (!index_) {
         return Status::InvalidArgument("database not initialized");
     }
+
+    // Persist the live count so a graceful restart restores it exactly.
+    persistCount();
 
     // Tear down the metadata column family / DB FIRST, so file locks on
     // <path>/metadata are released even if the index-metadata file write

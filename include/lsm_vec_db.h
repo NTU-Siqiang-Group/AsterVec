@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -181,6 +182,13 @@ public:
     };
     DeleteStats GetDeleteStats() const;
 
+    // Live vector count (inserts of new ids minus deletes; upserts don't change
+    // it). Maintained in memory and persisted on flush/Close, reloaded on Open —
+    // so it is exact in steady state and across graceful restarts, and may be
+    // approximate only after an unclean crash (in the spirit of Qdrant's
+    // approximate count / Postgres reltuples). 0 on a fresh or wiped index.
+    std::size_t VectorCount() const;
+
     // Test-only accessor: exposes the underlying LSMVec so unit tests can
     // exercise low-level resolvers (resolve_internal / resolve_real / is_alive).
     // Not intended for production use.
@@ -212,6 +220,12 @@ private:
     std::unique_ptr<ROCKSDB_NAMESPACE::DB>  metadata_db_;
     ROCKSDB_NAMESPACE::ColumnFamilyHandle*  metadata_cf_ = nullptr;
     std::unique_ptr<MetadataStore>          metadata_store_;
+
+    // Live vector count (see VectorCount()). Maintained on insert/delete,
+    // persisted to <db_path_>/vector_count, reloaded on Open.
+    std::atomic<std::int64_t>  live_count_{0};
+    void persistCount() const;
+    void loadCount();
 
     // Phase 3 (concurrent-writer-refactor-plan §5.2): per-real-id
     // transaction lock. 256 sharded mutexes covering Insert / Update /
