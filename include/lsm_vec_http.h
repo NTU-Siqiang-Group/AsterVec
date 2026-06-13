@@ -42,7 +42,7 @@ struct HttpServerConfig {
     int ef_construction = 32;
     int ef_search_default = 128;
     std::size_t edge_cache_size = 100000;
-    std::size_t vec_file_capacity = 10000000;
+    std::size_t vec_file_capacity = 1000000;   // initial idToPage_ size; auto-expands
     std::size_t paged_max_cached_pages = 8192;
 
     // ---- Observability ----

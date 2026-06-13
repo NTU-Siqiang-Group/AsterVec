@@ -228,7 +228,7 @@ bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err) {
     cfg->ef_construction    = env_int("LSMVEC_EFC", 32);
     cfg->ef_search_default  = env_int("LSMVEC_EFS_DEFAULT", 128);
     cfg->edge_cache_size    = env_size("LSMVEC_EDGE_CACHE_SIZE", 100000);
-    cfg->vec_file_capacity  = env_size("LSMVEC_VEC_FILE_CAPACITY", 10000000);
+    cfg->vec_file_capacity  = env_size("LSMVEC_VEC_FILE_CAPACITY", 1000000);
     cfg->paged_max_cached_pages = env_size("LSMVEC_PAGED_MAX_CACHED_PAGES", 8192);
     cfg->enable_stats       = env_bool("LSMVEC_ENABLE_STATS", false);
     cfg->log_level          = env_or("LSMVEC_LOG_LEVEL", "info");
@@ -280,6 +280,14 @@ bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err) {
 // ============================================================
 
 namespace {
+
+// TEMPORARY pilot-tier guard: the largest vector id accepted on the current
+// pilot. IDs are dense storage positions, so the id directly sizes the in-RAM
+// idToPage_ array (4 bytes/id -> ~400 MB at this ceiling). This is a PILOT limit
+// to keep a single large/sparse id from OOM-ing the small box — NOT a hard engine
+// limit. Larger instances can raise it; it is intentionally decoupled from
+// vec_file_capacity (which only sets the initial idToPage_ size and auto-expands).
+constexpr node_id_t kMaxInsertId = 100000000;  // 100M
 
 const char* metricToString(DistanceMetric m) {
     return (m == DistanceMetric::kCosine) ? "cosine" : "l2";
@@ -502,14 +510,14 @@ private:
             sendError(res, 400, "bad_id", "id must be a u64 or its string form");
             return 400;
         }
-        // IDs are dense storage positions: reject ids beyond the vector-file
-        // capacity with a clean 400 instead of letting the file expansion OOM
-        // the box. Ids must be sequential/dense (0-based).
-        if (id >= cfg_.vec_file_capacity) {
+        // IDs are dense storage positions: reject an id beyond the pilot ceiling
+        // with a clean 400 instead of letting idToPage_ expansion OOM the box.
+        if (id > kMaxInsertId) {
             sendError(res, 400, "id_too_large",
-                      "id " + std::to_string(id) + " exceeds capacity " +
-                      std::to_string(cfg_.vec_file_capacity) +
-                      "; use sequential (dense, 0-based) ids");
+                      "id " + std::to_string(id) + " exceeds the current pilot id "
+                      "limit of " + std::to_string(kMaxInsertId) +
+                      " — use sequential (dense, 0-based) ids. This is a temporary "
+                      "pilot-tier ceiling and may be higher on larger instances.");
             return 400;
         }
 
@@ -610,11 +618,12 @@ private:
                 sendError(res, 400, "bad_id", at + "id must be a u64 or its string form");
                 return 400;
             }
-            if (ids[k] >= cfg_.vec_file_capacity) {
+            if (ids[k] > kMaxInsertId) {
                 sendError(res, 400, "id_too_large",
-                          at + "id " + std::to_string(ids[k]) + " exceeds capacity " +
-                          std::to_string(cfg_.vec_file_capacity) +
-                          "; use sequential (dense, 0-based) ids");
+                          at + "id " + std::to_string(ids[k]) + " exceeds the current "
+                          "pilot id limit of " + std::to_string(kMaxInsertId) +
+                          " — use sequential (dense, 0-based) ids. This is a temporary "
+                          "pilot-tier ceiling and may be higher on larger instances.");
                 return 400;
             }
             std::string err;
