@@ -210,7 +210,7 @@ set_target_properties(lsm_vec PROPERTIES
 )
 
 # Concurrent search benchmark tool — for Phase A multi-thread perf testing.
-add_executable(concurrent_search_bench tools/concurrent_search_bench.cc)
+add_executable(concurrent_search_bench test/concurrent_search_bench.cc)
 target_include_directories(concurrent_search_bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(concurrent_search_bench PRIVATE lsmvec_shared)
 set_target_properties(concurrent_search_bench PROPERTIES
