@@ -13,7 +13,7 @@ Features added to the engine since the initial public release.
   engine — plus a Docker image. See [docs/HTTP_API.md](docs/HTTP_API.md).
 - **Index lifecycle** over HTTP: `PUT` / `GET` / `DELETE /v1/index` to create,
   inspect, and wipe the index (user-set dimension and metric).
-- **`GET /v1/stats`** — a runtime stats snapshot:
+- **`GET /v1/stats`** — a runtime stats endpoint:
   `{vectors, dim, metric, memory_bytes}`.
 - **Metadata payloads + filtered search** — per-vector JSON documents and
   Mongo-style query predicates (`$eq`, `$ne`, comparisons, `$in`/`$nin`,

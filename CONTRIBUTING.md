@@ -1,7 +1,8 @@
 # Contributing to LSM-Vec
 
-Thanks for your interest in LSM-Vec, the open-source core of Asteroid. This guide
-covers building from source, running the tests, and submitting changes.
+Thanks for your interest in LSM-Vec, an embeddable vector engine for local retrieval
+workloads. This guide covers building from source, running tests, and submitting
+changes.
 
 ## Development setup
 

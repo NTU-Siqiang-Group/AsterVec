@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <b>An embeddable, memory-friendly vector storage engine — your index lives mostly on disk.</b>
+  <b>A lightweight, memory-friendly vector storage engine for on-device retrieval.</b>
 </p>
 
 <p align="center">
@@ -16,55 +16,46 @@
   <a href="docs/HTTP_API.md">HTTP API</a>
 </p>
 
-LSM-Vec is a persistent, disk-oriented vector database for approximate
-nearest-neighbor (ANN) search. It pairs an [HNSW](https://arxiv.org/abs/1603.09320)
-graph index with **[Aster](https://github.com/NTU-Siqiang-Group/Aster)**, a
-graph-oriented LSM-tree storage engine (a RocksDB fork), so that most of the
-index lives on disk — keeping memory small and predictable as your data grows.
+LSM-Vec is an embeddable vector engine for AI applications that need persistent
+retrieval close to the app. It keeps large vector indexes mostly on disk using
+**[Aster](https://github.com/NTU-Siqiang-Group/Aster)**, a graph-oriented LSM-tree storage engine,
+so agents and desktop RAG systems can run vector search without assuming a large always-on database server.
 
-You use it in one of two ways:
+Use LSM-Vec as local retrieval infrastructure in two modes:
 
-- **Embed it** *(primary)* — link the C++ library, or `import lsm_vec` in Python,
-  and run the engine **in your own process**. No server, no network hop.
-- **Serve it** *(optional)* — the repo also builds a small standalone REST server,
-  [`lsm_vec_http`](#run-as-an-http-service-optional), if you'd rather talk to it
-  over HTTP.
+- **Embed it** *(primary)* — run the engine in-process for local agent memory,
+  RAG indexes, and app-owned vector storage.
+- **Serve it** *(optional)* — run `lsm_vec_http` when an app needs a local REST
+  boundary.
 
-> **Naming.** *Asteroid* is the product; **LSM-Vec** is its open-source engine —
-> this repository. The Python module is `import lsm_vec`. A managed, hosted option
-> is available as **Asteroid Cloud** ([lsmvec.com](https://lsmvec.com)).
+> **Naming.** Asteroid is the product; LSM-Vec is the open-source engine in this
+> repo. The Python module is `lsm_vec`; Asteroid Cloud is the managed service.
 
 ## Why LSM-Vec?
 
 - **Minimal memory footprint.** Unlike vector databases that hold the whole index
   in RAM, LSM-Vec is disk-oriented — memory stays small and predictable at scale.
-- **Graph-oriented LSM-tree storage.** Layer-0 HNSW edges are persisted inside
-  **Aster** (`RocksGraph`); only the small upper layers stay in memory. This
-  graph-in-LSM design is the core of the engine: it keeps the largest graph layer
-  and vector data off the heap, supports efficient graph updates, and manages
-  variable per-node edge counts compactly — preserving fast graph traversal and
-  updates while the bulk of the index stays on disk.
-- **A lightweight engine for on-device retrieval.** LSM-Vec keeps large vector
-  indexes mostly on disk, making persistent search practical for personal AI
-  agents and desktop RAG.
+- **Built for on-device retrieval.** Disk-backed indexing keeps persistent vector
+  search practical for agents, desktop RAG, and small servers.
+- **Graph-in-LSM storage.** LSM-Vec persists the largest HNSW layer in Aster
+  `RocksGraph`, keeping only the upper navigation layers in memory.
+- **Designed as an engine.** Embed it into your app when retrieval state should stay
+  local, private, and application-owned.
 
 ## Features
 
-- **Embeddable** — C++ library + Python bindings (`import lsm_vec`); runs in-process.
-- **HNSW search** — fully configurable (`m`, `m_max`, `ef_construction`, `ef_search`);
-  **L2** and **Cosine** metrics with SIMD acceleration (AVX2/SSE2).
-- **Graph-in-LSM** — layer-0 edges persisted in Aster `RocksGraph`; upper layers
+- **Local retrieval engine** — embed persistent vector search directly in Python or
+  C++ applications.
+- **Agent/RAG-ready metadata** — attach JSON payloads and filter retrieval with
+  Mongo-style predicates (`$eq`, `$gt`, `$in`, `$and`, ...).
+- **Disk-backed HNSW** — layer-0 edges live in Aster `RocksGraph`; upper layers stay
   in memory.
-- **Metadata payloads + filtered search** — attach a JSON document per vector and
-  restrict queries with Mongo-style predicates (`$eq`, `$gt`, `$in`, `$and`, …).
-- **SQ8 quantization** — vectors stored with 8-bit scalar quantization for a small
-  on-disk footprint.
-- **Fast ingestion** — per-vector `insert`/`upsert`, batch insert, and an
-  **in-memory bulk build** (RNN-Descent) for initial loads.
-- **Paged vector storage** — 4 KB page layout with a user-space page cache and
-  batch (by-page) neighbor reads during search.
-- **Persistent** — close and reopen without re-indexing.
-- **Optional HTTP server** — one-binary `lsm_vec_http` REST service + Docker image.
+- **Compact vector storage** — SQ8 quantization and paged storage reduce disk and
+  memory pressure.
+- **Ingestion paths** — insert/upsert, batch insert, and in-memory bulk build for
+  initial retrieval indexes.
+- **Optional service mode** — expose the same engine through `lsm_vec_http` when a
+  REST boundary is useful.
 
 ## Quick Start
 
@@ -89,14 +80,14 @@ opts.reinit = True               # start fresh
 
 db = lsm_vec.LSMVecDB.open("./db", opts)
 
-db.insert(1, [0.1] * 128, metadata={"category": "docs"})
+db.insert(1, [0.1] * 128, metadata={"source": "notes", "type": "memory"})
 
 # k-NN search → list[SearchResult(id, distance)]
 for r in db.search_knn([0.1] * 128, k=10, ef_search=128):
     print(r.id, r.distance)
 
 # filtered search → list[dict] of {"id", "distance"}
-hits = db.search([0.1] * 128, k=10, filter={"category": "docs"})
+hits = db.search([0.1] * 128, k=10, filter={"source": "notes"})
 
 db.close()
 ```
@@ -143,10 +134,9 @@ LSMVecDB (public API — lsm_vec_db.h)
        └─ IVectorStorage      — raw vectors on disk (paged + cached)
 ```
 
-Layer-0 edges are persisted in Aster's LSM-tree; the much smaller upper layers are
-kept in memory for fast navigation. Vectors are stored by `PagedVectorStorage`
-(4 KB pages, FIFO page cache) with neighbors co-located by HNSW entry point for
-locality.
+LSM-Vec keeps the hot navigation path small. Upper HNSW layers stay in memory,
+while layer-0 edges and vector data are stored on disk. `PagedVectorStorage` stores
+vectors in 4 KB pages and caches recently used pages during search.
 
 ## Build from source
 
@@ -186,10 +176,10 @@ compiles the bindings via scikit-build-core (no separate `make lib` needed).
 
 ## Run as an HTTP service (optional)
 
-`lsm_vec_http` is a thin, single-process REST wrapper around the same engine — for
-when you want a network service instead of (or alongside) embedding. It does **not**
-authenticate requests itself; run it behind your own reverse proxy if you need TLS
-or an API key.
+`lsm_vec_http` exposes the same local engine over REST. Use it when an agent,
+desktop app, or local service needs a process boundary instead of embedding directly.
+It does **not** authenticate requests itself; run it behind your own reverse proxy if
+you need TLS or an API key.
 
 ```bash
 # Build the server target (configured by default after `make`):
@@ -232,19 +222,19 @@ Pass an `LSMVecDBOptions` to `open`. Common fields:
 
 Higher `m` / `ef_construction` → better recall, slower build. Higher `ef_search` →
 better recall, slower queries. See [API_REFERENCE.md](docs/API_REFERENCE.md) for
-the complete list; the HTTP server is configured with the matching `LSMVEC_*`
-environment variables (see [HTTP_API.md](docs/HTTP_API.md)).
+the complete list.
+
+For service mode, use `LSMVEC_*` environment variables; see
+[HTTP_API.md](docs/HTTP_API.md).
 
 ## Storage & quantization
 
-- **PagedVectorStorage** (`vector_storage_type = 1`, default) — 4 KB pages; no
-  vector crosses a page boundary; vectors sharing an HNSW entry point are
-  co-located; a user-space FIFO page cache plus by-page batch reads cut I/O.
-- **BasicVectorStorage** (`vector_storage_type = 0`) — contiguous flat file,
-  `offset = id * dim * sizeof(float)`; relies on the OS page cache.
-- **SQ8** — vectors are stored with 8-bit scalar quantization; `get` returns a
-  dequantized vector (≈`range/255` per element), and distances/recall use the
-  quantized form.
+- **PagedVectorStorage** — stores vectors in 4 KB pages and caches recently used
+  pages, reducing repeated disk reads during graph search.
+- **BasicVectorStorage** — stores vectors in a contiguous flat file and relies on the
+  OS page cache.
+- **SQ8** — stores vectors as 8-bit scalar-quantized values; `get` returns
+  dequantized vectors, and search runs on the quantized representation.
 
 ## Test binary / benchmarking
 
