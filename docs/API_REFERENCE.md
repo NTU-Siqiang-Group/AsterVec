@@ -1,68 +1,72 @@
 # LSM-Vec API Reference
 
-This document covers the public APIs of the LSM-Vec library for both **C++** and **Python**.
-
-Only one header is needed for C++:
+This document covers the **engine library** API of LSM-Vec for both **C++** and
+**Python** (`import lsm_vec`) — the embeddable, in-process interface.
 
 ```cpp
-#include "lsm_vec_db.h"
+#include "lsm_vec_db.h"   // C++: the only header you need
 ```
-
-For Python:
-
 ```python
-import lsm_vec
+import lsm_vec            # Python (pybind11 bindings)
 ```
+
+> For the optional HTTP/REST server (`lsm_vec_http`), see
+> [HTTP_API.md](HTTP_API.md) instead.
 
 ---
 
 ## Table of Contents
 
 - [C++ API](#c-api)
-  - [1. Opening and Closing a Database](#1-opening-and-closing-a-database)
+  - [1. Opening and Closing](#1-opening-and-closing)
   - [2. Inserting Vectors](#2-inserting-vectors)
   - [3. Searching](#3-searching)
-  - [4. Retrieving, Updating, and Deleting](#4-retrieving-updating-and-deleting)
-  - [5. Configuration Reference](#5-configuration-reference)
-  - [6. Types](#6-types)
+  - [4. Retrieving, Updating, Deleting](#4-retrieving-updating-deleting)
+  - [5. Metadata Payloads](#5-metadata-payloads)
+  - [6. Bulk Build](#6-bulk-build)
+  - [7. Configuration Reference](#7-configuration-reference)
+  - [8. Types](#8-types)
 - [Python API](#python-api)
-  - [7. Installation](#7-installation)
-  - [8. Opening and Closing a Database](#8-opening-and-closing-a-database)
-  - [9. Inserting Vectors](#9-inserting-vectors)
-  - [10. Searching](#10-searching)
-  - [11. Retrieving, Updating, and Deleting](#11-retrieving-updating-and-deleting)
-  - [12. Configuration Reference](#12-configuration-reference)
-  - [13. Error Handling](#13-error-handling)
+  - [9. Installation](#9-installation)
+  - [10. Opening and Closing](#10-opening-and-closing)
+  - [11. Inserting Vectors](#11-inserting-vectors)
+  - [12. Searching](#12-searching)
+  - [13. Retrieving, Updating, Deleting](#13-retrieving-updating-deleting)
+  - [14. Metadata Payloads](#14-metadata-payloads)
+  - [15. Bulk Build](#15-bulk-build)
+  - [16. Configuration Reference](#16-configuration-reference)
+  - [17. Metadata Filter Operators](#17-metadata-filter-operators)
+  - [18. Error Handling](#18-error-handling)
 - [Build and Linking](#build-and-linking)
+
+> **Note on quantization.** Vectors are stored with 8-bit scalar quantization
+> (SQ8): `Get`/`get` returns a dequantized vector that differs from the input by
+> up to ~`range/255` per element, and distances/recall are computed on the
+> quantized form.
 
 ---
 
 # C++ API
 
-All types live in the `lsm_vec` namespace. Every mutating or querying method
-returns a `Status` object (aliased from RocksDB). Call `.ok()` to check for
-success and `.ToString()` for an error message.
+All types live in the `lsm_vec` namespace. Mutating/querying methods return a
+`Status` (aliased from RocksDB); call `.ok()` and `.ToString()`.
 
-## 1. Opening and Closing a Database
+## 1. Opening and Closing
 
 ```cpp
 #include "lsm_vec_db.h"
 using namespace lsm_vec;
 
-// Configure
 LSMVecDBOptions opts;
 opts.dim = 128;                              // required
-opts.vector_file_path = "./db/vectors.bin";  // required
+opts.vector_file_path = "./db/vectors.bin";
 opts.reinit = true;                          // true = start fresh
 
-// Open
 std::unique_ptr<LSMVecDB> db;
 Status s = LSMVecDB::Open("./db", opts, &db);
-if (!s.ok()) { /* handle error */ }
+if (!s.ok()) { /* handle s.ToString() */ }
 
 // ... use the database ...
-
-// Close
 db->Close();
 ```
 
@@ -74,13 +78,8 @@ static Status Open(const std::string& path,
                    std::unique_ptr<LSMVecDB>* db);
 ```
 
-Creates or opens a database at the given directory.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `path` | `const std::string&` | Directory for database files. Created automatically if it does not exist. |
-| `opts` | `const LSMVecDBOptions&` | Configuration. `opts.dim` must be > 0. |
-| `db` | `std::unique_ptr<LSMVecDB>*` | On success, `*db` holds the opened database handle. |
+Creates or opens a database directory. `opts.dim` must be > 0. On success `*db`
+holds the handle.
 
 ### `LSMVecDB::Close`
 
@@ -88,8 +87,7 @@ Creates or opens a database at the given directory.
 Status Close();
 ```
 
-Flushes pending writes and releases all resources. The handle is unusable after
-this call.
+Flushes pending writes and releases resources. The handle is unusable afterward.
 
 ---
 
@@ -97,206 +95,175 @@ this call.
 
 ```cpp
 std::vector<float> vec(128, 0.5f);
-db->Insert(42, Span<float>(vec));
+db->Insert(42, vec);                                   // vector only
+db->Insert(43, vec, R"({"category":"docs"})");         // with JSON metadata
 ```
-
-### `LSMVecDB::Insert`
 
 ```cpp
 Status Insert(node_id_t id, Span<float> vec);
+Status Insert(node_id_t id, Span<float> vec, std::string_view metadata_json);
 ```
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `id` | `node_id_t` (`uint64_t`) | Unique identifier for this vector. |
-| `vec` | `Span<float>` | Vector data. Length must equal `opts.dim`. A `std::vector<float>` converts implicitly. |
-
-Inserts a new vector and builds its HNSW graph connections. Returns
-`InvalidArgument` if the dimension mismatches.
+Inserts a vector and builds its HNSW connections. `vec` length must equal
+`opts.dim`. The optional `metadata_json` is a JSON object stored as the vector's
+payload. Returns `InvalidArgument` on a dimension mismatch or malformed metadata.
+A `std::vector<float>` converts implicitly to `Span<float>`.
 
 ---
 
 ## 3. Searching
 
 ```cpp
-std::vector<float> query(128, 0.1f);
+SearchOptions so;
+so.k = 10;
+so.ef_search = 128;
 
-SearchOptions search_opts;
-search_opts.k = 10;           // number of neighbors
-search_opts.ef_search = 128;  // candidate pool size (higher = better recall)
-
-std::vector<SearchResult> results;
-db->SearchKnn(Span<float>(query), search_opts, &results);
-
-for (const auto& r : results) {
-    std::cout << "id=" << r.id << " dist=" << r.distance << "\n";
-}
+std::vector<SearchResult> out;
+db->SearchKnn(query, so, &out);                         // plain k-NN
+db->SearchKnn(query, so, R"({"category":{"$eq":"docs"}})", &out);  // filtered
 ```
 
-### `LSMVecDB::SearchKnn`
-
 ```cpp
-Status SearchKnn(Span<float> query,
-                 const SearchOptions& options,
+Status SearchKnn(Span<float> query, const SearchOptions& options,
                  std::vector<SearchResult>* out);
+Status SearchKnn(Span<float> query, const SearchOptions& options,
+                 std::string_view filter_json, std::vector<SearchResult>* out);
+Status SearchKnn(Span<float> query, std::vector<SearchResult>* out);  // uses opts.k/ef_search
 ```
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `query` | `Span<float>` | Query vector. Length must equal `opts.dim`. |
-| `options` | `const SearchOptions&` | Search parameters (see below). |
-| `out` | `std::vector<SearchResult>*` | Results sorted by ascending distance, up to `k` entries. |
-
-### SearchOptions
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `k` | `int` | `1` | Number of nearest neighbors to return. |
-| `ef_search` | `int` | `64` | Candidate pool size during search. Must be >= `k`. Higher values improve recall at the cost of latency. |
-
-### SearchResult
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `node_id_t` | Identifier of the matched vector. |
-| `distance` | `float` | Distance from the query vector. |
+Results are sorted by ascending distance, up to `k` entries. `filter_json` is a
+Mongo-style predicate (see [§17](#17-metadata-filter-operators)). The last overload
+uses the `k` and `ef_search` set on `LSMVecDBOptions` at open time.
 
 ---
 
-## 4. Retrieving, Updating, and Deleting
-
-### `LSMVecDB::Get`
+## 4. Retrieving, Updating, Deleting
 
 ```cpp
-Status Get(node_id_t id, std::vector<float>* vec);
+Status Get(node_id_t id, std::vector<float>* vec);   // resizes to dim; NotFound if absent
+Status Update(node_id_t id, Span<float> vec);        // replace vector; rebuilds edges
+Status Delete(node_id_t id);                          // soft delete (tombstone)
+std::size_t VectorCount() const;                      // live vector count
 ```
 
-Retrieves the vector for a given ID. `vec` is resized to `opts.dim` on success.
-Returns `NotFound` if the ID does not exist.
-
-### `LSMVecDB::Update`
-
-```cpp
-Status Update(node_id_t id, Span<float> vec);
-```
-
-Replaces the vector data for an existing ID and rebuilds its graph connections.
-Returns `NotFound` if the ID does not exist.
-
-### `LSMVecDB::Delete`
-
-```cpp
-Status Delete(node_id_t id);
-```
-
-Marks a vector as deleted. Deleted vectors are excluded from future search
-results.
-
-### `LSMVecDB::printStatistics`
-
-```cpp
-void printStatistics() const;
-```
-
-Prints I/O and timing statistics to stdout. Only meaningful when
-`opts.enable_stats = true`.
+`Delete` tombstones the id (excluded from future searches; survives reopen).
+`VectorCount` is exact in steady state and across graceful restarts (approximate
+only after an unclean crash).
 
 ---
 
-## 5. Configuration Reference
+## 5. Metadata Payloads
+
+```cpp
+Status GetPayload(node_id_t id, std::string* out_json);
+Status SetPayload(node_id_t id, std::string_view metadata_json);     // full replace
+Status UpdatePayload(node_id_t id, std::string_view partial_json);   // RFC 7396 merge
+Status DeletePayloadKeys(node_id_t id, Span<const std::string> keys);
+```
+
+`UpdatePayload` merge-patches: keys in `partial_json` overwrite, and a key set to
+`null` deletes it. `Delete(id)` removes the vector and its payload together.
+
+---
+
+## 6. Bulk Build
+
+The fastest way to populate an **empty** database: build the whole index in memory
+(RNN-Descent), then write it in one pass. IDs are assigned `0..n-1`.
+
+```cpp
+Status BulkBuild(Span<const float> vectors, int n, const BulkBuildOptions& opts);
+```
+
+```cpp
+struct BulkBuildOptions {
+    int num_threads = 0;   // 0 = auto (min(4, hardware_concurrency))
+    int rnnd_S  = 16;      // initial random neighbours
+    int rnnd_T1 = 4;       // outer iterations
+    int rnnd_T2 = 15;      // inner iterations per outer
+    int rnnd_R  = 64;      // pool cap / max output degree (truncated to m_max on write)
+};
+```
+
+`vectors` is `n * dim` contiguous floats (vector `i` at `[i*dim, (i+1)*dim)`).
+Requires an empty DB — returns `InvalidArgument` otherwise. For incremental updates
+on a non-empty DB, use `Insert` (single calls or a thread pool; the engine is
+thread-safe).
+
+---
+
+## 7. Configuration Reference
 
 ### LSMVecDBOptions
 
-Pass this struct to `LSMVecDB::Open()`.
-
-```cpp
-LSMVecDBOptions opts;
-opts.dim = 128;
-opts.metric = DistanceMetric::kL2;
-// ... set other fields as needed ...
-```
-
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `dim` | `int` | `0` | **Required.** Dimensionality of vectors. |
-| `metric` | `DistanceMetric` | `kL2` | Distance metric (`kL2` or `kCosine`). |
-| `m` | `int` | `8` | HNSW: bi-directional links created per node at layer 0. |
-| `m_max` | `int` | `16` | HNSW: max neighbors per node at upper layers. |
-| `ef_construction` | `float` | `32.0` | HNSW: candidate pool size during index construction. |
-| `vec_file_capacity` | `size_t` | `100000` | Initial vector file capacity. Auto-expands with PagedVectorStorage. |
-| `paged_max_cached_pages` | `size_t` | `4096` | Number of 4 KB pages in the user-space page cache. |
-| `vector_storage_type` | `int` | `1` | `0` = BasicVectorStorage (flat file), `1` = PagedVectorStorage (paged + cached). |
-| `db_target_size` | `uint64_t` | `~100 GiB` | Target file size hint for Aster (RocksDB). |
+| `dim` | `int` | `0` | **Required.** Vector dimensionality. |
+| `metric` | `DistanceMetric` | `kL2` | `kL2` or `kCosine`. |
+| `m` | `int` | `8` | HNSW links per node at layer 0. |
+| `m_max` | `int` | `24` | HNSW max neighbors at upper layers. |
+| `m_level` | `int` | `1` | Level multiplier for random level generation. |
+| `ef_construction` | `float` | `32.0` | Candidate pool during construction. |
+| `ef_search` | `int` | `128` | Default candidate pool during search. |
+| `k` | `int` | `1` | Default neighbors for the no-options search overload. |
+| `vec_file_capacity` | `size_t` | `100000` | Initial vector-file capacity (auto-expands when paged). |
+| `paged_max_cached_pages` | `size_t` | `8192` | 4 KB pages in the user-space page cache. |
+| `vector_storage_type` | `int` | `1` | `0` = flat file, `1` = paged + cached. |
+| `edge_cache_size` | `size_t` | `100000` | In-memory graph edge cache entries. |
+| `db_target_size` | `uint64_t` | `~100 GiB` | Aster (RocksDB) target file size hint. |
 | `random_seed` | `int` | `12345` | RNG seed for HNSW level generation. |
 | `enable_stats` | `bool` | `false` | Collect I/O and timing statistics. |
 | `enable_batch_read` | `bool` | `true` | Group vector reads by page during search. |
 | `reinit` | `bool` | `false` | `true` = wipe existing data; `false` = reopen. |
-| `vector_file_path` | `string` | `""` | Path for vector storage file. |
-| `log_file_path` | `string` | `""` | Path for log file (empty = no file logging). |
+| `vector_file_path` | `string` | `""` | Path to the vector data file. |
+| `log_file_path` | `string` | `""` | Path to the log file (empty = no file logging). |
 
-**Tuning tips:**
-
-- Higher `m` and `ef_construction` &rarr; better recall, slower indexing.
-- Higher `ef_search` &rarr; better recall, slower queries.
-- Higher `paged_max_cached_pages` &rarr; more RAM, fewer disk reads.
+**Tuning:** higher `m` / `ef_construction` → better recall, slower build; higher
+`ef_search` → better recall, slower queries; higher `paged_max_cached_pages` → more
+RAM, fewer disk reads.
 
 ---
 
-## 6. Types
-
-### DistanceMetric
+## 8. Types
 
 ```cpp
-enum class DistanceMetric {
-    kL2,      // Euclidean distance
-    kCosine,  // 1 - cosine_similarity
+enum class DistanceMetric { kL2, kCosine };   // Euclidean / 1 - cosine_similarity
+using node_id_t = std::uint64_t;              // 64-bit vector identifier
+
+struct SearchOptions {
+    int k = 1;                    // neighbors to return
+    int ef_search = 128;          // candidate pool (>= k); higher = better recall
+    int max_scan_candidates = 0;  // cap when a filter is set; 0 = auto (k * 50)
 };
+
+struct SearchResult { node_id_t id; float distance; };
 ```
 
-### node_id_t
-
-```cpp
-using node_id_t = std::uint64_t;
-```
-
-Unique 64-bit vector identifier.
-
-### Span\<T\>
-
-A lightweight, non-owning view over contiguous memory (similar to C++20
-`std::span`). You rarely need to construct one explicitly because
-`std::vector<float>` converts to `Span<float>` implicitly.
-
-```cpp
-std::vector<float> vec(128);
-db->Insert(0, vec);  // implicit Span<float>(vec)
-```
+`Span<T>` is a lightweight non-owning view over contiguous memory; a
+`std::vector<float>` converts implicitly, so you rarely construct one by hand.
 
 ---
 
 # Python API
 
-## 7. Installation
+## 9. Installation
 
 ```bash
 git submodule update --init --recursive
 make aster
 python -m pip install .
-```
-
-Verify:
-
-```bash
 python -c "import lsm_vec; print('OK')"
 ```
 
+The Python package is published on PyPI as **`lsm-vec`** and imported as
+`import lsm_vec`. (Distinct from `lsmvec-client`, the HTTP client.)
+
 ---
 
-## 8. Opening and Closing a Database
+## 10. Opening and Closing
 
 ```python
-import os
-import lsm_vec
+import os, lsm_vec
 
 opts = lsm_vec.LSMVecDBOptions()
 opts.dim = 128
@@ -305,148 +272,118 @@ opts.reinit = True
 
 os.makedirs("./db", exist_ok=True)
 db = lsm_vec.LSMVecDB.open("./db", opts)
-
-# ... use the database ...
-
+# ...
 db.close()
 ```
 
-### `LSMVecDB.open`
-
-```python
-db = lsm_vec.LSMVecDB.open(path: str, opts: LSMVecDBOptions) -> LSMVecDB
-```
-
-Opens or creates a database. Raises `ValueError` on invalid arguments,
-`RuntimeError` on I/O errors.
-
-### `db.close`
-
-```python
-db.close() -> None
-```
+`LSMVecDB.open(path: str, opts: LSMVecDBOptions) -> LSMVecDB` — raises `ValueError`
+on invalid arguments, `RuntimeError` on I/O errors.
 
 ---
 
-## 9. Inserting Vectors
-
-Accepts both Python lists and NumPy arrays.
+## 11. Inserting Vectors
 
 ```python
-db.insert(0, [0.1] * 128)
-
-import numpy as np
-db.insert(1, np.random.rand(128).astype(np.float32))
+db.insert(0, [0.1] * 128)                                  # list
+db.insert(1, np.random.rand(128).astype(np.float32))       # numpy
+db.insert(2, [0.1] * 128, metadata={"category": "docs"})   # with metadata
 ```
-
-### `db.insert`
 
 ```python
-db.insert(id: int, vector: list[float] | numpy.ndarray) -> None
+db.insert(id: int, vector: list[float] | np.ndarray, metadata: dict | None = None) -> None
 ```
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `id` | `int` | Unique vector identifier. |
-| `vector` | `list[float]` or `numpy.ndarray` (float32, 1-D) | Must have length `opts.dim`. |
-
-Raises `ValueError` on dimension mismatch.
+`vector` length must equal `opts.dim`. `metadata` is any JSON-serializable object
+(serialized internally). Raises `ValueError` on a dimension mismatch.
 
 ---
 
-## 10. Searching
+## 12. Searching
 
 ```python
-# With SearchOptions
-search_opts = lsm_vec.SearchOptions()
-search_opts.k = 10
-search_opts.ef_search = 128
-results = db.search_knn([0.1] * 128, search_opts)
+# k-NN → list[SearchResult(id, distance)]
+results = db.search_knn([0.1] * 128, k=10, ef_search=128)
+results = db.search_knn([0.1] * 128, search_opts)          # SearchOptions object
+results = db.search_knn([0.1] * 128)                        # uses opts.k / opts.ef_search
 
-# Or with k and ef_search directly
-results = db.search_knn(query_array, k=10, ef_search=128)
-
-for r in results:
-    print(f"id={r.id}  distance={r.distance:.4f}")
+# filtered k-NN → list[dict] of {"id", "distance"}
+hits = db.search([0.1] * 128, k=10, filter={"category": "docs"})
 ```
 
-### `db.search_knn`
-
 ```python
-# Option A: with SearchOptions
 db.search_knn(query, opts: SearchOptions) -> list[SearchResult]
-
-# Option B: with explicit parameters
 db.search_knn(query, k: int, ef_search: int) -> list[SearchResult]
+db.search_knn(query) -> list[SearchResult]
+db.search(query, k=10, ef_search=128, filter=None, max_scan_candidates=0) -> list[dict]
 ```
 
-`query` can be a `list[float]` or a 1-D `numpy.ndarray` of float32.
-
-### SearchOptions
-
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `k` | `int` | `1` | Number of nearest neighbors. |
-| `ef_search` | `int` | `64` | Candidate pool size. Must be >= `k`. |
-
-### SearchResult
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `id` | `int` | Vector identifier (read-only). |
-| `distance` | `float` | Distance from query (read-only). |
+`query` is a list or 1-D float32 numpy array. `search_knn` returns `SearchResult`
+objects; `search` accepts a Mongo-style `filter` dict (see
+[§17](#17-metadata-filter-operators)) and returns plain dicts (convenient for
+pandas). `max_scan_candidates` bounds the filtered scan (`0` = auto, `k * 50`).
 
 ---
 
-## 11. Retrieving, Updating, and Deleting
-
-### `db.get`
+## 13. Retrieving, Updating, Deleting
 
 ```python
-vec = db.get(id: int) -> numpy.ndarray  # float32, 1-D
-```
-
-Raises `KeyError` if the ID does not exist.
-
-### `db.update`
-
-```python
-db.update(id: int, vector: list[float] | numpy.ndarray) -> None
-```
-
-Raises `KeyError` if the ID does not exist.
-
-### `db.delete`
-
-```python
-db.delete(id: int) -> None
+vec = db.get(id)            # -> np.ndarray (float32); raises KeyError if absent
+db.update(id, vector)       # replace vector; raises KeyError if absent
+db.delete(id)               # soft delete
 ```
 
 ---
 
-## 12. Configuration Reference
+## 14. Metadata Payloads
+
+```python
+db.set_payload(1, {"category": "docs", "price": 79})   # full replace
+db.update_payload(1, {"price": 69})                    # merge-patch (RFC 7396)
+db.update_payload(1, {"stale": None})                  # None deletes a field
+db.delete_payload_keys(1, ["temp", "debug"])           # remove specific keys
+md = db.get_payload(1)                                  # -> dict ({} if none)
+```
+
+---
+
+## 15. Bulk Build
+
+```python
+import numpy as np
+report = db.bulk_build(np.random.rand(100_000, 128).astype(np.float32), threads=4)
+# -> {"n": 100000, "elapsed_ms": ..., "vectors_per_sec": ..., "threads": 4}
+```
+
+```python
+db.bulk_build(vectors: np.ndarray, threads: int = 0) -> dict
+```
+
+`vectors` is a 2-D `(n, dim)` float32 array (or a list of equal-length rows).
+**Initial-load only**: the DB must be empty; ids are assigned `0..n-1`. For
+incremental updates afterward use `insert`.
+
+---
+
+## 16. Configuration Reference
 
 ### LSMVecDBOptions
 
 All properties are read-write.
 
-```python
-opts = lsm_vec.LSMVecDBOptions()
-opts.dim = 128
-opts.metric = lsm_vec.DistanceMetric.Cosine
-```
-
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `dim` | `int` | `0` | **Required.** Vector dimensionality. |
-| `metric` | `DistanceMetric` | `L2` | `L2` or `Cosine`. |
-| `m` | `int` | `8` | HNSW connections per node. |
-| `m_max` | `int` | `16` | Max neighbors at upper layers. |
-| `ef_construction` | `float` | `32.0` | Construction-time candidate pool. |
-| `vec_file_capacity` | `int` | `100000` | Initial vector file capacity. |
-| `paged_max_cached_pages` | `int` | `4096` | Page cache size (4 KB pages). |
+| `metric` | `DistanceMetric` | `L2` | `lsm_vec.L2` or `lsm_vec.Cosine`. |
+| `m` | `int` | `8` | HNSW links per node (layer 0). |
+| `m_max` | `int` | `24` | Max neighbors at upper layers. |
+| `m_level` | `int` | `1` | Level multiplier. |
+| `ef_construction` | `float` | `32.0` | Construction candidate pool. |
+| `ef_search` | `int` | `128` | Default search candidate pool. |
+| `k` | `int` | `1` | Default neighbors for the bare `search_knn`. |
+| `vec_file_capacity` | `int` | `100000` | Initial vector-file capacity. |
+| `paged_max_cached_pages` | `int` | `8192` | Page cache size (4 KB pages). |
 | `vector_storage_type` | `int` | `1` | `0` = basic, `1` = paged. |
-| `db_target_size` | `int` | `~100 GiB` | Aster target file size. |
+| `db_target_size` | `int` | `107374182400` | Aster target file size (bytes). |
 | `random_seed` | `int` | `12345` | RNG seed. |
 | `enable_stats` | `bool` | `False` | Collect statistics. |
 | `enable_batch_read` | `bool` | `True` | Batch vector reads by page. |
@@ -454,60 +391,92 @@ opts.metric = lsm_vec.DistanceMetric.Cosine
 | `vector_file_path` | `str` | `""` | Vector storage file path. |
 | `log_file_path` | `str` | `""` | Log file path. |
 
+### SearchOptions
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `k` | `int` | `1` | Number of nearest neighbors. |
+| `ef_search` | `int` | `128` | Candidate pool (>= k). |
+| `max_scan_candidates` | `int` | `0` | Cap when a filter is set; `0` = auto (`k * 50`). |
+
 ### DistanceMetric
 
 ```python
-lsm_vec.DistanceMetric.L2      # Euclidean distance
+lsm_vec.DistanceMetric.L2      # Euclidean (L2) distance
 lsm_vec.DistanceMetric.Cosine  # 1 - cosine similarity
+```
+
+### Other methods
+
+| Method | Description |
+|--------|-------------|
+| `db.flush_vector_writes()` | Flush pending vector writes to disk. |
+| `db.trim_memory()` | Ask the allocator to return idle heap to the OS (glibc `malloc_trim`; no-op elsewhere). |
+| `db.delete_stats() -> dict` | Tombstone/Bloom observability counters. |
+
+---
+
+## 17. Metadata Filter Operators
+
+Filters are JSON predicate trees (passed as a Python dict or JSON string).
+
+| Operator | Meaning |
+|---|---|
+| `$eq`, `$ne` | equals / not equals |
+| `$gt`, `$gte`, `$lt`, `$lte` | numeric comparison |
+| `$in`, `$nin` | value is / isn't in the array |
+| `$exists` | key present — boolean (`{"$exists": false}` = absent) |
+| `$contains_any`, `$contains_all` | array contains any / all of the values |
+| `$and`, `$or` | logical combination (arrays of sub-predicates) |
+
+A bare scalar is an implicit `$eq` (`{"category": "docs"}`). Nested keys use dot
+paths (`{"author.name": {"$eq": "ann"}}`). There is no standalone `$not` — negate
+at the field level (`$ne`, `$nin`, `$exists: false`).
+
+```python
+db.search(query, k=10, filter={
+    "$and": [
+        {"category": {"$eq": "docs"}},
+        {"price": {"$lt": 100}},
+    ],
+})
 ```
 
 ---
 
-## 13. Error Handling
+## 18. Error Handling
 
-| C++ Status | Python Exception | When |
-|------------|-----------------|------|
-| `InvalidArgument` | `ValueError` | Dimension mismatch, bad parameters. |
-| `NotFound` | `KeyError` | Vector ID not found. |
-| Other errors | `RuntimeError` | I/O failures, database errors. |
+| C++ `Status` | Python exception | When |
+|--------------|------------------|------|
+| `InvalidArgument` / `NotSupported` | `ValueError` | dimension mismatch, bad params, unsupported metric |
+| `NotFound` | `KeyError` | vector id not found |
+| other | `RuntimeError` | I/O / storage errors |
 
 ---
 
 # Build and Linking
 
-## Build from Source
-
 ```bash
 git submodule update --init --recursive
-make aster    # build Aster (RocksDB fork)
-make          # build liblsmvec.a, liblsmvec.so/dylib, and test binary
+make aster      # build Aster (RocksDB fork) → lib/aster/librocksdb.a
+make            # build liblsmvec.a, liblsmvec.so/.dylib, and binaries
 ```
 
-## Outputs
-
-| File | Description |
-|------|-------------|
-| `build/lib/liblsmvec.a` | Static library |
-| `build/lib/liblsmvec.so` / `.dylib` | Shared library |
-| `build/bin/lsm_vec` | Test / benchmark binary |
-
-## Linking
+Link against the LSM-Vec library plus Aster's RocksDB and zstd (the only required
+codec — snappy/lz4/bz2/zlib are disabled in the Aster build):
 
 ```bash
 g++ -std=c++17 -O2 -Iinclude my_app.cc \
     -Lbuild/lib -llsmvec \
-    -lrocksdb -lzstd -lsnappy -llz4 -lbz2 -lz -lpthread -ldl \
+    -Llib/aster -lrocksdb -lzstd -lpthread -ldl \
     -o my_app
 ```
 
-On macOS, also add `-ljemalloc` if applicable.
+On macOS, also add `-ljemalloc`.
 
-## Python Package
+### Python package
 
 ```bash
 make aster
-python -m pip install .
+python -m pip install .   # compiles the extension via scikit-build-core
 ```
-
-This compiles the C++ code into a Python extension module via scikit-build-core.
-No separate `make lib` step is needed.

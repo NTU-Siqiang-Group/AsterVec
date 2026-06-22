@@ -1,321 +1,226 @@
 # LSM-Vec Python SDK Guide
 
+This guide covers the **engine** Python module, `import lsm_vec` (pybind11
+bindings) — the embeddable, in-process interface. For the dense per-method
+reference see [API_REFERENCE.md](API_REFERENCE.md); for the optional HTTP/REST
+server see [HTTP_API.md](HTTP_API.md).
+
+> The PyPI package is **`lsm-vec`** (`import lsm_vec`). It is *not* the same as
+> `lsmvec-client`, which is a separate HTTP client for the `lsm_vec_http` server.
+
 ## Prerequisites
 
-- **Conda** (Miniconda or Anaconda)
-- **CMake** >= 3.10
-- **C++17 compiler** (GCC 8+ or Clang 10+)
-- **Aster** (RocksDB fork) built under `lib/aster/`
-- System libraries: `zstd`, `snappy`, `lz4`, `bz2`, `zlib`
-
-### macOS
+- **Python** 3.9+ (a virtualenv or conda environment is recommended)
+- **CMake** ≥ 3.10, **C++17 compiler** (GCC 8+ / Clang 10+), GNU Make
+- **Boost** (headers only) and **zstd** — the only required compression library
+  (Aster is built with snappy / lz4 / bzip / zlib disabled)
+- **Aster** (RocksDB fork) built under `lib/aster/` (see step 1 below)
 
 ```bash
-brew install cmake zstd snappy lz4 bzip2
-```
+# Ubuntu / Debian
+sudo apt-get install -y build-essential cmake libboost-dev libzstd-dev
 
-### Ubuntu / Debian
-
-```bash
-sudo apt-get install -y build-essential cmake \
-  libzstd-dev libsnappy-dev liblz4-dev libbz2-dev zlib1g-dev
+# macOS (Homebrew)
+brew install cmake boost zstd jemalloc
 ```
 
 ## Installation
 
-### 1. Build Aster (required before pip install)
+### 1. Build Aster (required before `pip install`)
 
-`pip install .` runs CMake internally, which requires the Aster RocksDB library
-(`lib/aster/librocksdb.a`) to already exist. You do **not** need `make lib` —
-only `make aster`.
+`pip install .` runs CMake internally, which needs Aster's static library
+(`lib/aster/librocksdb.a`) to already exist. You do **not** need `make lib` — only
+`make aster`.
 
 ```bash
 git submodule update --init --recursive
 make aster
 ```
 
-### 2. Create a conda environment
+### 2. (Optional) create an environment
 
 ```bash
-conda create -n lainn python=3.12 -y
-conda activate lainn
+conda create -n lainn python=3.12 -y && conda activate lainn
+# or: python -m venv .venv && source .venv/bin/activate
 ```
 
-### 3. Install the Python package
+### 3. Install the package
 
 ```bash
-pip install .
-```
-
-This uses `scikit-build-core` + `pybind11` under the hood to compile the C++
-library and Python bindings in one step. The build fetches pybind11 automatically
-via CMake FetchContent. All lsmvec code is compiled and statically linked into
-the Python module, so no separate `liblsmvec.so` is needed at runtime.
-
-To verify the installation:
-
-```bash
+python -m pip install .
 python -c "import lsm_vec; print('OK')"
 ```
+
+`scikit-build-core` + `pybind11` compile the C++ engine into the extension module
+in one step (pybind11 is fetched automatically via CMake). The engine is statically
+linked into the module, so no separate `liblsmvec.so` is needed at runtime.
 
 ## Quick Start
 
 ```python
-import lsm_vec
-import os
+import os, lsm_vec
 
-# Configure the database
 opts = lsm_vec.LSMVecDBOptions()
-opts.dim = 128                              # vector dimensionality (required)
+opts.dim = 128                                  # vector dimensionality (required)
 opts.vector_file_path = "./run/db/vectors.bin"
+opts.reinit = True                              # start fresh
 
-# Ensure the DB directory exists
 os.makedirs("./run/db", exist_ok=True)
-
-# Open (creates a new database if the directory is empty)
 db = lsm_vec.LSMVecDB.open("./run/db/", opts)
 
-# Insert a vector
-db.insert(1, [0.1] * 128)
+db.insert(1, [0.1] * 128, metadata={"category": "docs"})
 
-# Search
-search_opts = lsm_vec.SearchOptions()
-search_opts.k = 10
-results = db.search_knn([0.1] * 128, search_opts)
-for r in results:
-    print(f"id={r.id}  distance={r.distance}")
+for r in db.search_knn([0.1] * 128, k=10, ef_search=128):
+    print(r.id, r.distance)
 
-# Clean up
 db.close()
 ```
 
-## API Reference
+Both Python lists and 1-D NumPy `float32` arrays are accepted everywhere a vector
+is expected.
 
-### `lsm_vec.LSMVecDBOptions`
+## Core API
 
-Configuration object passed to `LSMVecDB.open()`.
+```python
+db = lsm_vec.LSMVecDB.open(path, opts)        # open or create
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `dim` | `int` | `0` | Vector dimensionality (required) |
-| `metric` | `DistanceMetric` | `L2` | Distance metric (`L2` or `Cosine`) |
-| `m` | `int` | `8` | HNSW: number of established connections |
-| `m_max` | `int` | `16` | HNSW: max neighbors per layer |
-| `m_level` | `int` | `1` | HNSW: level normalization factor |
-| `ef_construction` | `float` | `64.0` | HNSW: candidate pool size during construction |
-| `vec_file_capacity` | `int` | `100000` | Initial vector file capacity |
-| `paged_max_cached_pages` | `int` | `256` | Page cache capacity (number of 4KB pages) |
-| `vector_storage_type` | `int` | `1` | `0` = BasicVectorStorage, `1` = PagedVectorStorage |
-| `db_target_size` | `int` | `107374182400` | RocksDB target file size (bytes) |
-| `random_seed` | `int` | `12345` | Seed for HNSW level generation |
-| `enable_stats` | `bool` | `False` | Enable performance statistics |
-| `enable_batch_read` | `bool` | `False` | Enable batched vector reads in search |
-| `reinit` | `bool` | `False` | Reinitialize (wipe) existing database on open |
-| `vector_file_path` | `str` | `""` | Path to the vector storage file |
-| `log_file_path` | `str` | `""` | Path to the log file |
+db.insert(id, vector, metadata=None)          # insert (+ optional dict metadata)
+db.update(id, vector)                          # replace a vector
+db.delete(id)                                  # soft delete
+vec = db.get(id)                               # -> np.ndarray (float32)
 
-### `lsm_vec.SearchOptions`
+db.search_knn(query, k=..., ef_search=...)     # -> list[SearchResult(id, distance)]
+db.search_knn(query, search_opts)              # with a SearchOptions object
+db.search(query, k=10, ef_search=128,          # -> list[dict] {"id","distance"}
+          filter=None, max_scan_candidates=0)  #    with an optional metadata filter
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `k` | `int` | `1` | Number of nearest neighbors to return |
-| `ef_search` | `int` | `64` | Candidate pool size during search (higher = more accurate, slower) |
+db.set_payload(id, metadata)                   # full replace
+db.update_payload(id, partial)                 # RFC 7396 merge (None deletes a field)
+db.delete_payload_keys(id, ["k1", "k2"])       # remove specific keys
+md = db.get_payload(id)                         # -> dict ({} if none)
 
-### `lsm_vec.SearchResult`
+db.bulk_build(vectors_2d, threads=0)           # initial load (empty DB); -> report dict
+db.flush_vector_writes()                        # flush to disk
+db.close()                                      # flush + close
+```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `int` | Node ID of the result |
-| `distance` | `float` | Distance from query vector |
+> **Quantization (SQ8).** Vectors are stored with 8-bit scalar quantization;
+> `get` returns a dequantized vector that differs from the input by up to
+> ~`range/255` per element, and distances/recall use the quantized form.
 
-### `lsm_vec.DistanceMetric`
+### Bulk build (initial load)
 
-| Value | Description |
-|-------|-------------|
-| `lsm_vec.L2` | Euclidean (L2) distance |
-| `lsm_vec.Cosine` | Cosine distance |
-
-### `lsm_vec.LSMVecDB`
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `open` | `LSMVecDB.open(path: str, opts: LSMVecDBOptions) -> LSMVecDB` | Open or create a database at the given directory |
-| `insert` | `db.insert(id: int, vector: list[float] \| np.ndarray)` | Insert a vector with the given ID |
-| `update` | `db.update(id: int, vector: list[float] \| np.ndarray)` | Update vector for an existing ID |
-| `delete` | `db.delete(id: int)` | Delete a vector by ID |
-| `get` | `db.get(id: int) -> np.ndarray` | Retrieve the vector for a given ID |
-| `search_knn` | `db.search_knn(query, opts: SearchOptions) -> list[SearchResult]` | K-nearest-neighbor search |
-| `search_knn` | `db.search_knn(query, k: int, ef_search: int) -> list[SearchResult]` | K-NN search (shorthand) |
-| `close` | `db.close()` | Close the database and flush to disk |
-
-The `query` and `vector` parameters accept either a Python list of floats or a 1-D NumPy `float32` array.
-
-## Usage with NumPy
+The fastest way to populate an **empty** database — builds the whole index in
+memory (RNN-Descent) and writes it in one pass; ids are assigned `0..n-1`.
 
 ```python
 import numpy as np
-import lsm_vec
+report = db.bulk_build(np.random.rand(100_000, 128).astype(np.float32), threads=4)
+print(report)   # {"n": 100000, "elapsed_ms": ..., "vectors_per_sec": ..., "threads": 4}
+```
 
-opts = lsm_vec.LSMVecDBOptions()
-opts.dim = 128
-opts.vector_file_path = "./run/db/vectors.bin"
+For incremental updates on a non-empty DB, use `insert` (single calls, or many
+concurrent calls from a thread pool — the engine is thread-safe).
 
-db = lsm_vec.LSMVecDB.open("./run/db/", opts)
+## Configuration (`LSMVecDBOptions`)
 
-# Insert with NumPy array
-vec = np.random.rand(128).astype(np.float32)
-db.insert(42, vec)
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `dim` | `int` | `0` | **Required.** Vector dimensionality. |
+| `metric` | `DistanceMetric` | `L2` | `lsm_vec.L2` or `lsm_vec.Cosine`. |
+| `m` | `int` | `8` | HNSW links per node (layer 0). |
+| `m_max` | `int` | `24` | Max neighbors at upper layers. |
+| `m_level` | `int` | `1` | Level multiplier. |
+| `ef_construction` | `float` | `32.0` | Construction candidate pool. |
+| `ef_search` | `int` | `128` | Default search candidate pool. |
+| `k` | `int` | `1` | Default neighbors for the bare `search_knn`. |
+| `vec_file_capacity` | `int` | `100000` | Initial vector-file capacity. |
+| `paged_max_cached_pages` | `int` | `8192` | Page cache size (4 KB pages). |
+| `vector_storage_type` | `int` | `1` | `0` = basic, `1` = paged. |
+| `enable_batch_read` | `bool` | `True` | Batch vector reads by page during search. |
+| `reinit` | `bool` | `False` | Wipe existing data on open. |
+| `vector_file_path` | `str` | `""` | Vector storage file path. |
 
-# Search with NumPy array
-query = np.random.rand(128).astype(np.float32)
-results = db.search_knn(query, k=5, ef_search=100)
-for r in results:
-    print(f"id={r.id}  distance={r.distance:.4f}")
+`SearchOptions`: `k` (default `1`), `ef_search` (default `128`),
+`max_scan_candidates` (default `0` = auto, `k * 50` when a filter is set).
+See [API_REFERENCE.md §16](API_REFERENCE.md#16-configuration-reference) for the
+full list.
 
-db.close()
+## Metadata filtering
+
+Each vector can carry a JSON metadata document, and searches can be restricted with
+a Mongo-style filter passed as a Python dict.
+
+```python
+import numpy as np
+emb = np.random.randn(768).astype(np.float32)
+db.insert(1, emb, metadata={"tenant": "acme", "tags": ["ml", "py"], "ts": 1700000000})
+
+results = db.search(
+    emb, k=10,
+    filter={"tenant": "acme", "ts": {"$gt": 1699000000}},
+)   # -> [{"id": int, "distance": float}, ...]
+```
+
+Supported operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`,
+`$exists`, `$contains_any`, `$contains_all`, `$and`, `$or`. A bare scalar is an
+implicit `$eq`; nested keys use dot paths (`"author.name"`); there is no `$not`
+(negate at the field level). Full reference:
+[API_REFERENCE.md §17](API_REFERENCE.md#17-metadata-filter-operators).
+
+`max_scan_candidates` bounds how many neighbors a filtered search visits before
+giving up (default `k * 50`). Raise it for highly selective filters on large
+corpora; lower it for throughput when the filter matches most rows.
+
+```python
+results = db.search(emb, k=10, filter={"tenant": "acme"}, max_scan_candidates=2000)
+```
+
+Results come back as plain dicts (`{"id", "distance"}`), so they drop straight into
+pandas:
+
+```python
+import pandas as pd
+df = pd.DataFrame(db.search(emb, k=50, filter={"tenant": "acme"}))
 ```
 
 ## Troubleshooting
 
-### `ImportError: dlopen ... Library not loaded: @rpath/liblsmvec.dylib`
+### `Aster RocksDB library or headers not found`
 
-This means the Python extension was linked against the shared library instead of the static library. Make sure the CMakeLists.txt has:
-
-```cmake
-target_link_libraries(lsm_vec_python PRIVATE lsmvec_static)
-```
-
-Then reinstall:
-
-```bash
-pip install . --force-reinstall
-```
-
-### `externally-managed-environment` error
-
-Your system Python is managed by the OS package manager (Homebrew/apt). Use a conda environment instead:
-
-```bash
-conda create -n lainn python=3.12 -y
-conda activate lainn
-pip install .
-```
-
-### `pip install .` fails with `TypeVar() got unexpected keyword argument`
-
-Your Python version is too old for `scikit-build-core`. Use Python 3.10 or newer:
-
-```bash
-conda create -n lainn python=3.12 -y
-conda activate lainn
-pip install .
-```
-
-### Build fails with `Aster RocksDB library or headers not found`
-
-Aster hasn't been built yet. Run:
+Aster hasn't been built. Run:
 
 ```bash
 git submodule update --init --recursive
 make aster
 ```
 
-### Build fails with `libsnappy not found` (or lz4, bz2)
+### `libzstd not found`
 
-Install the missing system library:
+Install zstd (the only required codec): `apt-get install libzstd-dev` (Ubuntu) or
+`brew install zstd` (macOS).
 
-- **macOS**: `brew install snappy lz4 bzip2`
-- **Ubuntu**: `sudo apt-get install libsnappy-dev liblz4-dev libbz2-dev`
+### `externally-managed-environment` on `pip install .`
 
-## Metadata Filtering
+Your system Python is managed by the OS package manager. Use a virtualenv or conda
+environment, then `python -m pip install .`.
 
-Each vector can carry an arbitrary JSON metadata document. Searches can be
-restricted with a MongoDB-style filter expression passed as a Python dict.
+### `pip install .` fails with `TypeVar() got unexpected keyword argument`
 
-### Insert with metadata
+Your Python is too old for `scikit-build-core`. Use Python 3.10+.
 
-```python
-import numpy as np
-import lsm_vec
+### `ImportError: ... liblsmvec ... not loaded` / TLS errors (Linux, jemalloc)
 
-opts = lsm_vec.LSMVecDBOptions()
-opts.dim = 768
-db = lsm_vec.LSMVecDB.open("/path/to/db", opts)
+If the extension can't allocate jemalloc's thread-local storage, preload it:
 
-embedding = np.random.randn(768).astype(np.float32)
-db.insert(
-    id=1,
-    vector=embedding,
-    metadata={"tenant": "acme", "tags": ["ml", "py"], "created_at": 1700000000},
-)
+```bash
+LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2 python your_app.py
 ```
 
-Both Python lists and NumPy `float32` arrays are accepted as the vector. The
-`metadata` argument is any JSON-serializable Python value (typically a dict).
+### `GLIBCXX_3.4.30 not found` (Linux, conda)
 
-### Search with a filter
+Conda ships an older libstdc++; update it:
 
-```python
-results = db.search(
-    query=embedding,
-    k=10,
-    filter={"tenant": "acme", "created_at": {"$gt": 1699000000}},
-)
-# results: list[dict] — [{"id": int, "distance": float}, ...]
+```bash
+conda install -c conda-forge "libstdcxx-ng>=12"
 ```
-
-Filter operators supported in v1 (Level 2 set):
-
-- Comparison: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`
-- Membership: `$in`, `$nin`
-- Existence: `$exists: True / False`
-- Array: `$contains_any`, `$contains_all`
-- Logical: `$and`, `$or` (nested composition)
-- Implicit `$eq` for scalar and object values
-- Dot-path keys for nested fields (e.g. `"author.name"`)
-
-### Tuning expansion budget
-
-`max_scan_candidates` bounds how many neighbors the filtered search visits
-before giving up. Default is `k * 50`. Raise for highly selective filters on
-large corpora; lower for throughput when the filter matches most rows.
-
-```python
-results = db.search(
-    query=embedding,
-    k=10,
-    filter={"tenant": "acme"},
-    max_scan_candidates=2000,
-)
-```
-
-### Manage metadata independently
-
-```python
-db.set_payload(1, {"tenant": "acme", "version": 2})     # overwrite
-db.update_payload(1, {"version": 3})                    # merge-patch
-db.update_payload(1, {"old_field": None})               # delete field via merge
-db.delete_payload_keys(1, ["temp", "debug"])            # remove specific keys
-md = db.get_payload(1)                                  # -> dict
-```
-
-`db.delete(id)` removes both the vector and its metadata.
-
-### NumPy compatibility
-
-All vector arguments accept `np.ndarray` with `dtype=np.float32` (preferred) or
-any Python sequence that can be converted. Results come back as plain Python
-dicts with integer `id` and float `distance`, so they are trivial to feed into
-pandas:
-
-```python
-import pandas as pd
-df = pd.DataFrame(db.search(query=embedding, k=50, filter={"tenant": "acme"}))
-```
-
-### Where to look next
-
-See `docs/METADATA_FILTERING_USAGE.md` for the complete operator reference,
-missing-field semantics table, performance guidance, and observability
-counters (`metadata_gets`, `filter_evaluations`, `filter_matches`,
-`filter_scanned`, `filter_cap_hits`).

@@ -1,8 +1,10 @@
 # LSM-Vec HTTP server image.
 #
-# Two-stage build: compile the engine + HTTP server, then ship a slim runtime.
+# Packages the optional standalone REST server (lsm_vec_http). The engine itself
+# is embeddable (a C++ library / Python module); this image is only for running it
+# as a network service. See docs/HTTP_API.md.
 #
-# Build (from repo root):
+# Build (from the repo root):
 #   git submodule update --init --recursive   # populate lib/aster
 #   docker build -t lsmvec:latest .
 #
@@ -17,7 +19,7 @@
 FROM ubuntu:24.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake \
-    libboost-dev libzstd-dev libsnappy-dev liblz4-dev libbz2-dev zlib1g-dev \
+    libboost-dev libzstd-dev \
     libjemalloc-dev pkg-config \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -44,7 +46,7 @@ RUN strip --strip-unneeded build/lib/liblsmvec.so build/bin/lsm_vec_http
 # ---- runtime stage ----
 FROM ubuntu:24.04 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libzstd1 libsnappy1v5 liblz4-1 libbz2-1.0 zlib1g libjemalloc2 \
+    libzstd1 libjemalloc2 \
     ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 # Binary depends on the LSM-Vec shared library; ship both.
@@ -52,7 +54,7 @@ COPY --from=build /src/build/bin/lsm_vec_http /usr/local/bin/
 COPY --from=build /src/build/lib/liblsmvec.so /usr/local/lib/
 RUN ldconfig
 
-# Default config — every value is also overridable by env var.
+# Default config — every value is also overridable by env var (see docs/HTTP_API.md).
 ENV LSMVEC_DATA_DIR=/data \
     LSMVEC_PORT=8000 \
     LSMVEC_HTTP_THREADS=1 \
