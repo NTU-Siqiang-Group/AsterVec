@@ -110,12 +110,15 @@ PYBIND11_MODULE(lsm_vec, m)
             RaiseStatus(status);
             return db;
         })
+        // The sequence (Python list) overload is registered BEFORE the numpy
+        // array_t one so that passing a list never triggers numpy overload
+        // resolution (which would import numpy and fail if it isn't installed).
         .def("insert",
              [](lsm_vec::LSMVecDB& db,
                 lsm_vec::node_id_t id,
-                const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
+                const py::sequence& seq,
                 py::object metadata) {
-                 std::vector<float> data = ToVector(array);
+                 std::vector<float> data = ToVector(seq);
                  if (metadata.is_none()) {
                      RaiseStatus(db.Insert(id, MakeSpan(data)));
                      return;
@@ -129,9 +132,9 @@ PYBIND11_MODULE(lsm_vec, m)
         .def("insert",
              [](lsm_vec::LSMVecDB& db,
                 lsm_vec::node_id_t id,
-                const py::sequence& seq,
+                const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
                 py::object metadata) {
-                 std::vector<float> data = ToVector(seq);
+                 std::vector<float> data = ToVector(array);
                  if (metadata.is_none()) {
                      RaiseStatus(db.Insert(id, MakeSpan(data)));
                      return;
@@ -184,7 +187,7 @@ PYBIND11_MODULE(lsm_vec, m)
             std::vector<lsm_vec::SearchResult> out;
             RaiseStatus(db.SearchKnn(MakeSpan(data), options, &out));
             return out;
-        })
+        }, py::arg("query"), py::arg("k"), py::arg("ef_search"))
         .def("search_knn", [](lsm_vec::LSMVecDB& db,
                               const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
                               const lsm_vec::SearchOptions& options) {
@@ -204,7 +207,7 @@ PYBIND11_MODULE(lsm_vec, m)
             std::vector<lsm_vec::SearchResult> out;
             RaiseStatus(db.SearchKnn(MakeSpan(data), options, &out));
             return out;
-        })
+        }, py::arg("query"), py::arg("k"), py::arg("ef_search"))
         .def("search_knn", [](lsm_vec::LSMVecDB& db,
                               const py::sequence& seq) {
             auto data = ToVector(seq);
@@ -219,9 +222,10 @@ PYBIND11_MODULE(lsm_vec, m)
             RaiseStatus(db.SearchKnn(MakeSpan(data), &out));
             return out;
         })
+        // Sequence (Python list) overload first — see the insert() note above.
         .def("search",
              [](lsm_vec::LSMVecDB& db,
-                const py::array_t<float, py::array::c_style | py::array::forcecast>& query,
+                const py::sequence& query,
                 int k, int ef_search,
                 py::object filter,
                 int max_scan_candidates) -> py::list {
@@ -255,7 +259,7 @@ PYBIND11_MODULE(lsm_vec, m)
              "kNN search with optional metadata filter. Returns list of dicts {id, distance}.")
         .def("search",
              [](lsm_vec::LSMVecDB& db,
-                const py::sequence& query,
+                const py::array_t<float, py::array::c_style | py::array::forcecast>& query,
                 int k, int ef_search,
                 py::object filter,
                 int max_scan_candidates) -> py::list {
