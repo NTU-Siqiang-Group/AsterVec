@@ -1,12 +1,12 @@
-# LSM-Vec Python SDK Guide
+# AsterVec Python SDK Guide
 
-This guide covers the **engine** Python module, `import lsm_vec` (pybind11
+This guide covers the **engine** Python module, `import astervec` (pybind11
 bindings) — the embeddable, in-process interface. For the dense per-method
 reference see [API_REFERENCE.md](API_REFERENCE.md); for the optional HTTP/REST
 server see [HTTP_API.md](HTTP_API.md).
 
-> The PyPI package is **`lsm-vec`** (`import lsm_vec`). It is *not* the same as
-> `lsmvec-client`, which is a separate HTTP client for the `lsm_vec_http` server.
+> The PyPI package is **`aster-vec`** (`import astervec`). It is *not* the same as
+> `lsmvec-client`, which is a separate HTTP client for the `astervec_http` server.
 
 ## Prerequisites
 
@@ -48,25 +48,25 @@ conda create -n lainn python=3.12 -y && conda activate lainn
 
 ```bash
 python -m pip install .
-python -c "import lsm_vec; print('OK')"
+python -c "import astervec; print('OK')"
 ```
 
 `scikit-build-core` + `pybind11` compile the C++ engine into the extension module
 in one step (pybind11 is fetched automatically via CMake). The engine is statically
-linked into the module, so no separate `liblsmvec.so` is needed at runtime.
+linked into the module, so no separate `libastervec.so` is needed at runtime.
 
 ## Quick Start
 
 ```python
-import os, lsm_vec
+import os, astervec
 
-opts = lsm_vec.LSMVecDBOptions()
+opts = astervec.AsterVecDBOptions()
 opts.dim = 128                                  # vector dimensionality (required)
 opts.vector_file_path = "./run/db/vectors.bin"
 opts.reinit = True                              # start fresh
 
 os.makedirs("./run/db", exist_ok=True)
-db = lsm_vec.LSMVecDB.open("./run/db/", opts)
+db = astervec.AsterVecDB.open("./run/db/", opts)
 
 db.insert(1, [0.1] * 128, metadata={"category": "docs"})
 
@@ -82,7 +82,7 @@ is expected.
 ## Core API
 
 ```python
-db = lsm_vec.LSMVecDB.open(path, opts)        # open or create
+db = astervec.AsterVecDB.open(path, opts)        # open or create
 
 db.insert(id, vector, metadata=None)          # insert (+ optional dict metadata)
 db.update(id, vector)                          # replace a vector
@@ -122,12 +122,12 @@ print(report)   # {"n": 100000, "elapsed_ms": ..., "vectors_per_sec": ..., "thre
 For incremental updates on a non-empty DB, use `insert` (single calls, or many
 concurrent calls from a thread pool — the engine is thread-safe).
 
-## Configuration (`LSMVecDBOptions`)
+## Configuration (`AsterVecDBOptions`)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `dim` | `int` | `0` | **Required.** Vector dimensionality. |
-| `metric` | `DistanceMetric` | `L2` | `lsm_vec.L2` or `lsm_vec.Cosine`. |
+| `metric` | `DistanceMetric` | `L2` | `astervec.L2` or `astervec.Cosine`. |
 | `m` | `int` | `8` | HNSW links per node (layer 0). |
 | `m_max` | `int` | `24` | Max neighbors at upper layers. |
 | `m_level` | `int` | `1` | Level multiplier. |
@@ -209,7 +209,7 @@ environment, then `python -m pip install .`.
 
 Your Python is too old for `scikit-build-core`. Use Python 3.10+.
 
-### `ImportError: ... liblsmvec ... not loaded` / TLS errors (Linux, jemalloc)
+### `ImportError: ... libastervec ... not loaded` / TLS errors (Linux, jemalloc)
 
 If the extension can't allocate jemalloc's thread-local storage, preload it:
 

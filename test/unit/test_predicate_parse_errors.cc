@@ -1,7 +1,7 @@
 #include "doctest.h"
 #include "metadata.h"
 #include <string>
-using namespace lsm_vec::metadata;
+using namespace astervec::metadata;
 
 static void expectError(std::string_view s) {
     Predicate p;

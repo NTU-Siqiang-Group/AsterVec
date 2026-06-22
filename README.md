@@ -1,7 +1,7 @@
-# LSM-Vec — the open-source core of Asteroid
+# AsterVec — memory-friendly vector storage engine
 
 <p align="center">
-  <img src="docs/assets/lsm-vec-poster.jpg" alt="LSM-Vec" width="350">
+  <img src="docs/assets/aster-vec-poster.jpg" alt="AsterVec" width="350">
 </p>
 
 <p align="center">
@@ -16,28 +16,34 @@
   <a href="docs/HTTP_API.md">HTTP API</a>
 </p>
 
-LSM-Vec is an embeddable vector engine for AI applications that need persistent
+AsterVec is an embeddable vector engine for AI applications that need persistent
 retrieval close to the app. It keeps large vector indexes mostly on disk using
 **[Aster](https://github.com/NTU-Siqiang-Group/Aster)**, a graph-oriented LSM-tree storage engine,
 so agents and desktop RAG systems can run vector search without assuming a large always-on database server.
 
-Use LSM-Vec as local retrieval infrastructure in two modes:
+Use AsterVec as local retrieval infrastructure in two modes:
 
 - **Embed it** *(primary)* — run the engine in-process for local agent memory,
   RAG indexes, and app-owned vector storage.
-- **Serve it** *(optional)* — run `lsm_vec_http` when an app needs a local REST
+- **Serve it** *(optional)* — run `astervec_http` when an app needs a local REST
   boundary.
 
-> **Naming.** Asteroid is the product; LSM-Vec is the open-source engine in this
-> repo. The Python module is `lsm_vec`; Asteroid Cloud is the managed service.
+> **Naming.** Asteroid is the product; AsterVec is the open-source engine in this
+> repo. The Python module is `astervec`; Asteroid Cloud is the managed service.
 
-## Why LSM-Vec?
+> **Rename note.** AsterVec was previously named **LSM-Vec** (version `0.1.0`). The
+> latest version uses `astervec` for the Python package/import, C++ API, binaries,
+> Docker image, and HTTP config. The old `lsm-vec` PyPI package stays as a deprecated
+> alias, and the server still accepts the legacy `LSMVEC_*` env vars and `X-LSMVec-*`
+> headers, so existing deployments keep working.
+
+## Why AsterVec?
 
 - **Minimal memory footprint.** Unlike vector databases that hold the whole index
-  in RAM, LSM-Vec is disk-oriented — memory stays small and predictable at scale.
+  in RAM, AsterVec is disk-oriented — memory stays small and predictable at scale.
 - **Built for on-device retrieval.** Disk-backed indexing keeps persistent vector
   search practical for agents, desktop RAG, and small servers.
-- **Graph-in-LSM storage.** LSM-Vec persists the largest HNSW layer in Aster
+- **Graph-in-LSM storage.** AsterVec persists the largest HNSW layer in Aster
   `RocksGraph`, keeping only the upper navigation layers in memory.
 - **Designed as an engine.** Embed it into your app when retrieval state should stay
   local, private, and application-owned.
@@ -54,31 +60,31 @@ Use LSM-Vec as local retrieval infrastructure in two modes:
   memory pressure.
 - **Ingestion paths** — insert/upsert, batch insert, and in-memory bulk build for
   initial retrieval indexes.
-- **Optional service mode** — expose the same engine through `lsm_vec_http` when a
+- **Optional service mode** — expose the same engine through `astervec_http` when a
   REST boundary is useful.
 
 ## Quick Start
 
-LSM-Vec is embedded directly in your application. (Prefer a network service? See
+AsterVec is embedded directly in your application. (Prefer a network service? See
 [Run as an HTTP service](#run-as-an-http-service-optional).)
 
-### Python (`import lsm_vec`)
+### Python (`import astervec`)
 
 ```bash
 git submodule update --init --recursive
 make aster
-python -m pip install .          # builds + installs the lsm_vec module
+python -m pip install .          # builds + installs the astervec module
 ```
 
 ```python
-import lsm_vec
+import astervec
 
-opts = lsm_vec.LSMVecDBOptions()
+opts = astervec.AsterVecDBOptions()
 opts.dim = 128
 opts.vector_file_path = "./db/vectors.bin"
 opts.reinit = True               # start fresh
 
-db = lsm_vec.LSMVecDB.open("./db", opts)
+db = astervec.AsterVecDB.open("./db", opts)
 
 db.insert(1, [0.1] * 128, metadata={"source": "notes", "type": "memory"})
 
@@ -98,21 +104,21 @@ Both Python lists and NumPy `float32` arrays are accepted. See the
 
 ### C++
 
-Include headers from `include/` and link `liblsmvec.a` (static) or
-`liblsmvec.so`/`.dylib`. Transitive deps: `rocksdb` (Aster), `zstd`, `pthread`,
+Include headers from `include/` and link `libastervec.a` (static) or
+`libastervec.so`/`.dylib`. Transitive deps: `rocksdb` (Aster), `zstd`, `pthread`,
 `dl` (plus `jemalloc` on macOS).
 
 ```cpp
-#include "lsm_vec_db.h"
-using namespace lsm_vec;
+#include "astervec_db.h"
+using namespace astervec;
 
-LSMVecDBOptions opts;
+AsterVecDBOptions opts;
 opts.dim = 128;
 opts.vector_file_path = "./db/vectors.bin";
 opts.reinit = true;
 
-std::unique_ptr<LSMVecDB> db;
-LSMVecDB::Open("./db", opts, &db);
+std::unique_ptr<AsterVecDB> db;
+AsterVecDB::Open("./db", opts, &db);
 
 std::vector<float> v(128, 0.1f);
 db->Insert(1, v);
@@ -127,14 +133,14 @@ db->Close();
 ## How it works
 
 ```
-LSMVecDB (public API — lsm_vec_db.h)
-  └─ LSMVec (HNSW index)
+AsterVecDB (public API — astervec_db.h)
+  └─ AsterVec (HNSW index)
        ├─ RocksGraph (Aster)  — layer-0 graph edges on disk (LSM-tree)
        ├─ nodes_ map          — upper-layer edges in memory
        └─ IVectorStorage      — raw vectors on disk (paged + cached)
 ```
 
-LSM-Vec keeps the hot navigation path small. Upper HNSW layers stay in memory,
+AsterVec keeps the hot navigation path small. Upper HNSW layers stay in memory,
 while layer-0 edges and vector data are stored on disk. `PagedVectorStorage` stores
 vectors in 4 KB pages and caches recently used pages during search.
 
@@ -164,31 +170,31 @@ brew install cmake boost zstd jemalloc
 ```bash
 git submodule update --init --recursive   # fetch the Aster submodule
 make aster                                 # build lib/aster/librocksdb.a (required first)
-make                                       # build build/lib/liblsmvec.{a,so} + the test binary (build/bin/lsm_vec)
+make                                       # build build/lib/libastervec.{a,so} + the test binary (build/bin/astervec)
 python -m pip install .                    # (optional) build + install the Python module
 make unit_test                             # (optional) run the test suite
 ```
 
-`make` produces the static/shared libraries and the `lsm_vec` test/benchmark binary.
+`make` produces the static/shared libraries and the `astervec` test/benchmark binary.
 To build the optional HTTP server, see
 [Run as an HTTP service](#run-as-an-http-service-optional). `python -m pip install .`
 compiles the bindings via scikit-build-core (no separate `make lib` needed).
 
 ## Run as an HTTP service (optional)
 
-`lsm_vec_http` exposes the same local engine over REST. Use it when an agent,
+`astervec_http` exposes the same local engine over REST. Use it when an agent,
 desktop app, or local service needs a process boundary instead of embedding directly.
 It does **not** authenticate requests itself; run it behind your own reverse proxy if
 you need TLS or an API key.
 
 ```bash
 # Build the server target (configured by default after `make`):
-cmake --build build --target lsm_vec_http -j
-LSMVEC_DATA_DIR=./data ./build/bin/lsm_vec_http        # serves on :8000
+cmake --build build --target astervec_http -j
+ASTERVEC_DATA_DIR=./data ./build/bin/astervec_http        # serves on :8000
 
 # Or with Docker:
-docker build -t lsmvec:latest .                        # needs lib/aster populated first
-docker run -d --name lsmvec -p 8000:8000 -v "$(pwd)/data:/data" lsmvec:latest
+docker build -t astervec:latest .                        # needs lib/aster populated first
+docker run -d --name astervec -p 8000:8000 -v "$(pwd)/data:/data" astervec:latest
 ```
 
 ```bash
@@ -205,7 +211,7 @@ metadata-filter language, and configuration.
 
 ## Configuration
 
-Pass an `LSMVecDBOptions` to `open`. Common fields:
+Pass an `AsterVecDBOptions` to `open`. Common fields:
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -224,7 +230,7 @@ Higher `m` / `ef_construction` → better recall, slower build. Higher `ef_searc
 better recall, slower queries. See [API_REFERENCE.md](docs/API_REFERENCE.md) for
 the complete list.
 
-For service mode, use `LSMVEC_*` environment variables; see
+For service mode, use `ASTERVEC_*` environment variables; see
 [HTTP_API.md](docs/HTTP_API.md).
 
 ## Storage & quantization
@@ -238,17 +244,17 @@ For service mode, use `LSMVEC_*` environment variables; see
 
 ## Test binary / benchmarking
 
-`make` also builds `build/bin/lsm_vec`, a CLI harness that loads a dataset, builds
+`make` also builds `build/bin/astervec`, a CLI harness that loads a dataset, builds
 the index, runs k-NN queries, and compares against ground truth — useful for
 benchmarking (not the way you'd use the engine in an app).
 
 ```bash
 cd data && python prepare_sift_100k.py && cd ..
-./build/bin/lsm_vec --db ./run/db --data-dir ./data/sift_100k_ \
+./build/bin/astervec --db ./run/db --data-dir ./data/sift_100k_ \
   --M 8 --Mmax 24 --efc 32 --k 10 --efs 128 --stats --out ./run/output.txt
 ```
 
-Run `./build/bin/lsm_vec --help` for all flags (HNSW params, storage backend,
+Run `./build/bin/astervec --help` for all flags (HNSW params, storage backend,
 batch read, etc.).
 
 ## Troubleshooting
@@ -264,7 +270,7 @@ batch read, etc.).
   environment.
 - **`cannot allocate memory in static TLS block` (Linux, jemalloc)** — preload
   jemalloc: `LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2 python your_app.py`.
-- **`liblsmvec.so: cannot open shared object file`** — add the build dir to the
+- **`libastervec.so: cannot open shared object file`** — add the build dir to the
   loader path: `export LD_LIBRARY_PATH=$PWD/build/lib:$LD_LIBRARY_PATH`.
 
 ## Contributing

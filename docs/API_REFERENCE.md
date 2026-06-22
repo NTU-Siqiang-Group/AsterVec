@@ -1,16 +1,16 @@
-# LSM-Vec API Reference
+# AsterVec API Reference
 
-This document covers the **engine library** API of LSM-Vec for both **C++** and
-**Python** (`import lsm_vec`) — the embeddable, in-process interface.
+This document covers the **engine library** API of AsterVec for both **C++** and
+**Python** (`import astervec`) — the embeddable, in-process interface.
 
 ```cpp
-#include "lsm_vec_db.h"   // C++: the only header you need
+#include "astervec_db.h"   // C++: the only header you need
 ```
 ```python
-import lsm_vec            # Python (pybind11 bindings)
+import astervec            # Python (pybind11 bindings)
 ```
 
-> For the optional HTTP/REST server (`lsm_vec_http`), see
+> For the optional HTTP/REST server (`astervec_http`), see
 > [HTTP_API.md](HTTP_API.md) instead.
 
 ---
@@ -48,40 +48,40 @@ import lsm_vec            # Python (pybind11 bindings)
 
 # C++ API
 
-All types live in the `lsm_vec` namespace. Mutating/querying methods return a
+All types live in the `astervec` namespace. Mutating/querying methods return a
 `Status` (aliased from RocksDB); call `.ok()` and `.ToString()`.
 
 ## 1. Opening and Closing
 
 ```cpp
-#include "lsm_vec_db.h"
-using namespace lsm_vec;
+#include "astervec_db.h"
+using namespace astervec;
 
-LSMVecDBOptions opts;
+AsterVecDBOptions opts;
 opts.dim = 128;                              // required
 opts.vector_file_path = "./db/vectors.bin";
 opts.reinit = true;                          // true = start fresh
 
-std::unique_ptr<LSMVecDB> db;
-Status s = LSMVecDB::Open("./db", opts, &db);
+std::unique_ptr<AsterVecDB> db;
+Status s = AsterVecDB::Open("./db", opts, &db);
 if (!s.ok()) { /* handle s.ToString() */ }
 
 // ... use the database ...
 db->Close();
 ```
 
-### `LSMVecDB::Open`
+### `AsterVecDB::Open`
 
 ```cpp
 static Status Open(const std::string& path,
-                   const LSMVecDBOptions& opts,
-                   std::unique_ptr<LSMVecDB>* db);
+                   const AsterVecDBOptions& opts,
+                   std::unique_ptr<AsterVecDB>* db);
 ```
 
 Creates or opens a database directory. `opts.dim` must be > 0. On success `*db`
 holds the handle.
 
-### `LSMVecDB::Close`
+### `AsterVecDB::Close`
 
 ```cpp
 Status Close();
@@ -133,7 +133,7 @@ Status SearchKnn(Span<float> query, std::vector<SearchResult>* out);  // uses op
 
 Results are sorted by ascending distance, up to `k` entries. `filter_json` is a
 Mongo-style predicate (see [§17](#17-metadata-filter-operators)). The last overload
-uses the `k` and `ef_search` set on `LSMVecDBOptions` at open time.
+uses the `k` and `ef_search` set on `AsterVecDBOptions` at open time.
 
 ---
 
@@ -194,7 +194,7 @@ thread-safe).
 
 ## 7. Configuration Reference
 
-### LSMVecDBOptions
+### AsterVecDBOptions
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -252,31 +252,31 @@ struct SearchResult { node_id_t id; float distance; };
 git submodule update --init --recursive
 make aster
 python -m pip install .
-python -c "import lsm_vec; print('OK')"
+python -c "import astervec; print('OK')"
 ```
 
-The Python package is published on PyPI as **`lsm-vec`** and imported as
-`import lsm_vec`. (Distinct from `lsmvec-client`, the HTTP client.)
+The Python package is published on PyPI as **`aster-vec`** and imported as
+`import astervec`. (Distinct from `lsmvec-client`, the HTTP client.)
 
 ---
 
 ## 10. Opening and Closing
 
 ```python
-import os, lsm_vec
+import os, astervec
 
-opts = lsm_vec.LSMVecDBOptions()
+opts = astervec.AsterVecDBOptions()
 opts.dim = 128
 opts.vector_file_path = "./db/vectors.bin"
 opts.reinit = True
 
 os.makedirs("./db", exist_ok=True)
-db = lsm_vec.LSMVecDB.open("./db", opts)
+db = astervec.AsterVecDB.open("./db", opts)
 # ...
 db.close()
 ```
 
-`LSMVecDB.open(path: str, opts: LSMVecDBOptions) -> LSMVecDB` — raises `ValueError`
+`AsterVecDB.open(path: str, opts: AsterVecDBOptions) -> AsterVecDB` — raises `ValueError`
 on invalid arguments, `RuntimeError` on I/O errors.
 
 ---
@@ -366,14 +366,14 @@ incremental updates afterward use `insert`.
 
 ## 16. Configuration Reference
 
-### LSMVecDBOptions
+### AsterVecDBOptions
 
 All properties are read-write.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `dim` | `int` | `0` | **Required.** Vector dimensionality. |
-| `metric` | `DistanceMetric` | `L2` | `lsm_vec.L2` or `lsm_vec.Cosine`. |
+| `metric` | `DistanceMetric` | `L2` | `astervec.L2` or `astervec.Cosine`. |
 | `m` | `int` | `8` | HNSW links per node (layer 0). |
 | `m_max` | `int` | `24` | Max neighbors at upper layers. |
 | `m_level` | `int` | `1` | Level multiplier. |
@@ -402,8 +402,8 @@ All properties are read-write.
 ### DistanceMetric
 
 ```python
-lsm_vec.DistanceMetric.L2      # Euclidean (L2) distance
-lsm_vec.DistanceMetric.Cosine  # 1 - cosine similarity
+astervec.DistanceMetric.L2      # Euclidean (L2) distance
+astervec.DistanceMetric.Cosine  # 1 - cosine similarity
 ```
 
 ### Other methods
@@ -459,15 +459,15 @@ db.search(query, k=10, filter={
 ```bash
 git submodule update --init --recursive
 make aster      # build Aster (RocksDB fork) → lib/aster/librocksdb.a
-make            # build liblsmvec.a, liblsmvec.so/.dylib, and binaries
+make            # build libastervec.a, libastervec.so/.dylib, and binaries
 ```
 
-Link against the LSM-Vec library plus Aster's RocksDB and zstd (the only required
+Link against the AsterVec library plus Aster's RocksDB and zstd (the only required
 codec — snappy/lz4/bz2/zlib are disabled in the Aster build):
 
 ```bash
 g++ -std=c++17 -O2 -Iinclude my_app.cc \
-    -Lbuild/lib -llsmvec \
+    -Lbuild/lib -lastervec \
     -Llib/aster -lrocksdb -lzstd -lpthread -ldl \
     -o my_app
 ```

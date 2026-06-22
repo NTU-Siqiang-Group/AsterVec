@@ -1,4 +1,4 @@
-// LSMVecDB::BulkBuild end-to-end test.
+// AsterVecDB::BulkBuild end-to-end test.
 //
 // Validates the in-memory bulk-build path (RNN-Descent layer 0 +
 // MIRAGE-style upper-layer stitch + bulk-write to AsterDB) against
@@ -6,7 +6,7 @@
 // index accepts streaming INSERT/SEARCH like a normal index.
 
 #include "doctest.h"
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -28,17 +28,17 @@ std::string NewTempDir(const char* prefix) {
     return std::string(dir);
 }
 
-std::unique_ptr<lsm_vec::LSMVecDB>
+std::unique_ptr<astervec::AsterVecDB>
 OpenFresh(const std::string& path, int dim, std::size_t capacity) {
-    lsm_vec::LSMVecDBOptions opts;
+    astervec::AsterVecDBOptions opts;
     opts.dim = dim;
     opts.m = 8;
     opts.m_max = 24;
     opts.ef_construction = 64;
     opts.vec_file_capacity = capacity;
     opts.vector_file_path = path + "/vecs.bin";
-    std::unique_ptr<lsm_vec::LSMVecDB> db;
-    REQUIRE(lsm_vec::LSMVecDB::Open(path, opts, &db).ok());
+    std::unique_ptr<astervec::AsterVecDB> db;
+    REQUIRE(astervec::AsterVecDB::Open(path, opts, &db).ok());
     return db;
 }
 
@@ -98,14 +98,14 @@ TEST_CASE("bulk_build: empty index, n=1000, recall@10 close to streaming") {
     constexpr int kK   = 10;
     constexpr int kEf  = 64;
 
-    std::string path = NewTempDir("lsmvec_bulkbuild");
+    std::string path = NewTempDir("astervec_bulkbuild");
     auto db = OpenFresh(path, kDim, kN * 2);
 
     auto data = ClusteredDataset(kN, kDim, /*seed=*/42);
 
-    lsm_vec::BulkBuildOptions bopts;
+    astervec::BulkBuildOptions bopts;
     bopts.num_threads = 4;
-    REQUIRE(db->BulkBuild(lsm_vec::Span<const float>(data.data(),
+    REQUIRE(db->BulkBuild(astervec::Span<const float>(data.data(),
                                                      data.size()),
                           kN, bopts)
                 .ok());
@@ -116,7 +116,7 @@ TEST_CASE("bulk_build: empty index, n=1000, recall@10 close to streaming") {
     std::vector<float> queries(static_cast<size_t>(kQ) * kDim);
     for (auto& v : queries) v = qjit(qrng);
 
-    lsm_vec::SearchOptions opts;
+    astervec::SearchOptions opts;
     opts.k         = kK;
     opts.ef_search = kEf;
 
@@ -127,9 +127,9 @@ TEST_CASE("bulk_build: empty index, n=1000, recall@10 close to streaming") {
         auto gt = BruteForceTopK(data.data(), kN, kDim, qv, kK);
         std::unordered_set<std::uint64_t> gt_set(gt.begin(), gt.end());
 
-        std::vector<lsm_vec::SearchResult> out;
+        std::vector<astervec::SearchResult> out;
         REQUIRE(db->SearchKnn(
-                    lsm_vec::Span<float>(const_cast<float*>(qv), kDim),
+                    astervec::Span<float>(const_cast<float*>(qv), kDim),
                     opts, &out).ok());
         for (auto& r : out) {
             if (gt_set.count(r.id)) ++matched;
@@ -149,14 +149,14 @@ TEST_CASE("bulk_build: streaming inserts work after bulk-build") {
     constexpr int kBulkN  = 200;
     constexpr int kExtraN = 50;
 
-    std::string path = NewTempDir("lsmvec_bulkbuild_then_insert");
+    std::string path = NewTempDir("astervec_bulkbuild_then_insert");
     auto db = OpenFresh(path, kDim, (kBulkN + kExtraN) * 2);
 
     auto data = ClusteredDataset(kBulkN, kDim, /*seed=*/7);
 
-    lsm_vec::BulkBuildOptions bopts;
+    astervec::BulkBuildOptions bopts;
     bopts.num_threads = 2;
-    REQUIRE(db->BulkBuild(lsm_vec::Span<const float>(data), kBulkN, bopts)
+    REQUIRE(db->BulkBuild(astervec::Span<const float>(data), kBulkN, bopts)
                 .ok());
 
     // Insert 50 more nodes through the streaming path.
@@ -166,7 +166,7 @@ TEST_CASE("bulk_build: streaming inserts work after bulk-build") {
         std::vector<float> v(kDim);
         for (auto& x : v) x = u(rng);
         auto st = db->Insert(static_cast<std::uint64_t>(kBulkN + i),
-                             lsm_vec::Span<float>(v));
+                             astervec::Span<float>(v));
         REQUIRE(st.ok());
     }
     db->flushVectorWrites();
@@ -188,7 +188,7 @@ TEST_CASE("bulk_build: post-symmetrize cap holds even for hub nodes") {
     constexpr int kDim    = 8;
     constexpr int kN      = 200;
 
-    std::string path = NewTempDir("lsmvec_bulkbuild_hub");
+    std::string path = NewTempDir("astervec_bulkbuild_hub");
     auto db = OpenFresh(path, kDim, kN * 2);  // m=8, m_max=24
 
     // Hub at origin; the rest within a small radius.
@@ -201,35 +201,35 @@ TEST_CASE("bulk_build: post-symmetrize cap holds even for hub nodes") {
         }
     }
 
-    lsm_vec::BulkBuildOptions bopts;
+    astervec::BulkBuildOptions bopts;
     bopts.num_threads = 2;
-    REQUIRE(db->BulkBuild(lsm_vec::Span<const float>(data), kN, bopts).ok());
+    REQUIRE(db->BulkBuild(astervec::Span<const float>(data), kN, bopts).ok());
 
     // SEARCH must still return something sensible. The actual degree
     // check is enforced inside bulkLoadLayer0; here we sanity-check
     // that a query near the hub returns the hub.
     std::vector<float> q(kDim, 0.001f);   // near the hub
-    lsm_vec::SearchOptions sopts;
+    astervec::SearchOptions sopts;
     sopts.k         = 1;
     sopts.ef_search = 32;
-    std::vector<lsm_vec::SearchResult> out;
-    REQUIRE(db->SearchKnn(lsm_vec::Span<float>(q), sopts, &out).ok());
+    std::vector<astervec::SearchResult> out;
+    REQUIRE(db->SearchKnn(astervec::Span<float>(q), sopts, &out).ok());
     REQUIRE(out.size() == 1);
     CHECK(out[0].id == 0u);   // hub is the closest
 }
 
 TEST_CASE("bulk_build: rejects non-empty index") {
     constexpr int kDim = 8;
-    std::string path = NewTempDir("lsmvec_bulkbuild_reject");
+    std::string path = NewTempDir("astervec_bulkbuild_reject");
     auto db = OpenFresh(path, kDim, 100);
 
     // Populate via streaming Insert first.
     std::vector<float> v(kDim, 0.1f);
-    REQUIRE(db->Insert(0, lsm_vec::Span<float>(v)).ok());
+    REQUIRE(db->Insert(0, astervec::Span<float>(v)).ok());
     db->flushVectorWrites();
 
     std::vector<float> bulk(static_cast<size_t>(10) * kDim, 0.5f);
-    lsm_vec::BulkBuildOptions bopts;
-    auto st = db->BulkBuild(lsm_vec::Span<const float>(bulk), 10, bopts);
+    astervec::BulkBuildOptions bopts;
+    auto st = db->BulkBuild(astervec::Span<const float>(bulk), 10, bopts);
     CHECK_FALSE(st.ok());
 }

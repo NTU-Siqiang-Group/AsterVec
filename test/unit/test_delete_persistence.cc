@@ -10,34 +10,34 @@
 
 #include "doctest.h"
 #include "id_types.h"
-#include "lsm_vec_db.h"
-#include "lsm_vec_index.h"
+#include "astervec_db.h"
+#include "astervec_index.h"
 
-using lsm_vec::internal_id_t;
-using lsm_vec::kFirstUpdateId;
-using lsm_vec::LSMVecDB;
-using lsm_vec::LSMVecDBOptions;
-using lsm_vec::real_id_t;
-using lsm_vec::Span;
+using astervec::internal_id_t;
+using astervec::kFirstUpdateId;
+using astervec::AsterVecDB;
+using astervec::AsterVecDBOptions;
+using astervec::real_id_t;
+using astervec::Span;
 
 namespace {
 
 std::string make_path() {
-    char tmpl[] = "/tmp/lsmvec_C7_XXXXXX";
+    char tmpl[] = "/tmp/astervec_C7_XXXXXX";
     char* dir = mkdtemp(tmpl);
     REQUIRE(dir != nullptr);
     return dir;
 }
 
-std::unique_ptr<LSMVecDB> open_db(const std::string& path, int dim, uint64_t cap,
+std::unique_ptr<AsterVecDB> open_db(const std::string& path, int dim, uint64_t cap,
                                    uint64_t seed = 1) {
-    LSMVecDBOptions opts;
+    AsterVecDBOptions opts;
     opts.dim                  = dim;
     opts.vec_file_capacity    = cap;
     opts.vector_file_path     = path + "/vecs.bin";
     opts.random_seed          = seed;
-    std::unique_ptr<LSMVecDB> db;
-    REQUIRE(LSMVecDB::Open(path, opts, &db).ok());
+    std::unique_ptr<AsterVecDB> db;
+    REQUIRE(AsterVecDB::Open(path, opts, &db).ok());
     return db;
 }
 

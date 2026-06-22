@@ -5,12 +5,12 @@
 #include <utility>
 #include <vector>
 
-#include "disk_vector.h"  // provides lsm_vec::node_id_t
+#include "disk_vector.h"  // provides astervec::node_id_t
 #include "json.hpp"
 #include "rocksdb/db.h"
 #include "rocksdb/status.h"
 
-namespace lsm_vec {
+namespace astervec {
 
 class MetadataStore {
 public:
@@ -19,7 +19,7 @@ public:
     using DB     = ROCKSDB_NAMESPACE::DB;
     using ColumnFamilyHandle = ROCKSDB_NAMESPACE::ColumnFamilyHandle;
 
-    // Caller owns db. MetadataStore does not own the CF handle (the LSMVecDB
+    // Caller owns db. MetadataStore does not own the CF handle (the AsterVecDB
     // that created the CF does), it only borrows both.
     MetadataStore(DB* db, ColumnFamilyHandle* cf);
 
@@ -64,4 +64,4 @@ private:
     static std::string EncodeKey(node_id_t id);  // big-endian uint64
 };
 
-}  // namespace lsm_vec
+}  // namespace astervec

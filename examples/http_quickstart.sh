@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Drive the optional HTTP server (lsm_vec_http) over curl: create an index,
+# Drive the optional HTTP server (astervec_http) over curl: create an index,
 # insert, search, inspect. See docs/HTTP_API.md for the full reference.
 #
 # Start the server first, e.g.:
-#   LSMVEC_DATA_DIR=./data ./build/bin/lsm_vec_http
-#   # or: docker run -d -p 8000:8000 -v "$(pwd)/data:/data" lsmvec:latest
+#   ASTERVEC_DATA_DIR=./data ./build/bin/astervec_http
+#   # or: docker run -d -p 8000:8000 -v "$(pwd)/data:/data" astervec:latest
 #
 # Then run:  ./examples/http_quickstart.sh
 set -euo pipefail

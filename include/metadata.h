@@ -7,7 +7,7 @@
 #include "json.hpp"
 #include "rocksdb/status.h"
 
-namespace lsm_vec::metadata {
+namespace astervec::metadata {
 
 using Json      = nlohmann::json;
 using FieldPath = std::vector<std::string>;
@@ -37,4 +37,4 @@ public:
 // Empty string or "{}" yields an empty PredAnd that matches everything.
 Status ParsePredicate(std::string_view json_str, Predicate* out);
 
-}  // namespace lsm_vec::metadata
+}  // namespace astervec::metadata

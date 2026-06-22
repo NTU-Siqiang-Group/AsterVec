@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace lsm_vec {
+namespace astervec {
 
 // User-facing identifier. Must satisfy real_id <= kMaxRealId.
 using real_id_t = uint64_t;
@@ -39,4 +39,4 @@ static_assert(update_id_index(kFirstUpdateId) == 0);
 static_assert(update_id_index(kFirstUpdateId + 42) == 42);
 static_assert(kMaxRealId + 1 == kFirstUpdateId);
 
-}  // namespace lsm_vec
+}  // namespace astervec

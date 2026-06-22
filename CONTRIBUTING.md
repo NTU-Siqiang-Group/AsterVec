@@ -1,6 +1,6 @@
-# Contributing to LSM-Vec
+# Contributing to AsterVec
 
-Thanks for your interest in LSM-Vec, an embeddable vector engine for local retrieval
+Thanks for your interest in AsterVec, an embeddable vector engine for local retrieval
 workloads. This guide covers building from source, running tests, and submitting
 changes.
 
@@ -8,13 +8,13 @@ changes.
 
 ```bash
 git clone --recurse-submodules https://github.com/NTU-Siqiang-Group/LSM-Vec.git
-cd LSM-Vec
+cd AsterVec
 
 # If you cloned without --recurse-submodules:
 git submodule update --init --recursive
 
 make aster        # build the Aster (RocksDB fork) static lib — required first
-make              # build liblsmvec.{a,so}, the test binary, and lsm_vec_http
+make              # build libastervec.{a,so}, the test binary, and astervec_http
 make unit_test    # build + run the test suite
 ```
 
@@ -29,7 +29,7 @@ To work on the Python bindings: `python -m pip install .` (after `make aster`).
 
 ```
 include/   public C++ headers + internals      python/    pybind11 bindings
-src/       C++ sources (engine + lsm_vec_http)  test/      test binary + unit tests
+src/       C++ sources (engine + astervec_http)  test/      test binary + unit tests
 lib/aster/ Aster submodule (RocksDB fork)       docs/      user-facing docs
 examples/  runnable quickstarts                 data/      dataset prep scripts
 ```
@@ -48,7 +48,7 @@ tests for new behavior where practical.
 
 ## Coding conventions
 
-- C++17; keep code in the `lsm_vec` namespace (Aster types via `ROCKSDB_NAMESPACE`).
+- C++17; keep code in the `astervec` namespace (Aster types via `ROCKSDB_NAMESPACE`).
 - Match the style of the surrounding code (naming, comment density, idioms).
 - Error handling uses `Status` (aliased from RocksDB); return descriptive statuses.
 

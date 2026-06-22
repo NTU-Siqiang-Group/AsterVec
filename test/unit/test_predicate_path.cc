@@ -1,6 +1,6 @@
 #include "doctest.h"
 #include "metadata.h"
-using namespace lsm_vec::metadata;
+using namespace astervec::metadata;
 
 TEST_CASE("Dot-path: nested object") {
     Predicate p;

@@ -10,7 +10,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 
-namespace lsm_vec::test {
+namespace astervec::test {
 
 // Opens a RocksDB at a unique temp directory with a "metadata" CF.
 // Destructor closes the DB and removes the directory.
@@ -21,7 +21,7 @@ struct TempDB {
     ROCKSDB_NAMESPACE::ColumnFamilyHandle* cf_metadata = nullptr;
 
     TempDB() {
-        char tmpl[] = "/tmp/lsmvec_mdstore_XXXXXX";
+        char tmpl[] = "/tmp/astervec_mdstore_XXXXXX";
         char* dir = mkdtemp(tmpl);
         path = dir ? dir : "";
 
@@ -54,4 +54,4 @@ struct TempDB {
     }
 };
 
-}  // namespace lsm_vec::test
+}  // namespace astervec::test

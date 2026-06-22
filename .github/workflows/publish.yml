@@ -55,7 +55,7 @@ jobs:
           CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=10.14"
 
           # Pass both Python build and static linking flags
-          CIBW_CONFIG_SETTINGS: "cmake.args=-DLSMVEC_BUILD_PYTHON=ON;-DLSMVEC_PYTHON_STATIC=ON"
+          CIBW_CONFIG_SETTINGS: "cmake.args=-DASTERVEC_BUILD_PYTHON=ON;-DASTERVEC_PYTHON_STATIC=ON"
 
           # Repair wheels (bundle shared libs)
           # Linux: auditwheel bundles any dynamically linked libs

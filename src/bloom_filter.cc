@@ -5,7 +5,7 @@
 #include <ostream>
 #include <stdexcept>
 
-namespace lsm_vec {
+namespace astervec {
 
 namespace {
 
@@ -146,4 +146,4 @@ void BloomFilter::read(std::istream& in) {
     }
 }
 
-}  // namespace lsm_vec
+}  // namespace astervec

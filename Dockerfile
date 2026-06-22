@@ -1,19 +1,19 @@
-# LSM-Vec HTTP server image.
+# AsterVec HTTP server image.
 #
-# Packages the optional standalone REST server (lsm_vec_http). The engine itself
+# Packages the optional standalone REST server (astervec_http). The engine itself
 # is embeddable (a C++ library / Python module); this image is only for running it
 # as a network service. See docs/HTTP_API.md.
 #
 # Build (from the repo root):
 #   git submodule update --init --recursive   # populate lib/aster
-#   docker build -t lsmvec:latest .
+#   docker build -t astervec:latest .
 #
 # Run:
-#   docker run -d --name lsmvec \
+#   docker run -d --name astervec \
 #     -p 8000:8000 \
 #     -v "$(pwd)/data:/data" \
-#     -e LSMVEC_DIM=128 -e LSMVEC_METRIC=l2 \
-#     lsmvec:latest
+#     -e ASTERVEC_DIM=128 -e ASTERVEC_METRIC=l2 \
+#     astervec:latest
 
 # ---- build stage ----
 FROM ubuntu:24.04 AS build
@@ -38,10 +38,10 @@ RUN test -f lib/aster/CMakeLists.txt \
 RUN make aster
 RUN cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
-        -DLSMVEC_BUILD_HTTP=ON
-RUN cmake --build build --target lsm_vec_http -j
+        -DASTERVEC_BUILD_HTTP=ON
+RUN cmake --build build --target astervec_http -j
 # Strip symbols to keep the runtime image small.
-RUN strip --strip-unneeded build/lib/liblsmvec.so build/bin/lsm_vec_http
+RUN strip --strip-unneeded build/lib/libastervec.so build/bin/astervec_http
 
 # ---- runtime stage ----
 FROM ubuntu:24.04 AS runtime
@@ -49,16 +49,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libzstd1 libjemalloc2 \
     ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
-# Binary depends on the LSM-Vec shared library; ship both.
-COPY --from=build /src/build/bin/lsm_vec_http /usr/local/bin/
-COPY --from=build /src/build/lib/liblsmvec.so /usr/local/lib/
+# Binary depends on the AsterVec shared library; ship both.
+COPY --from=build /src/build/bin/astervec_http /usr/local/bin/
+COPY --from=build /src/build/lib/libastervec.so /usr/local/lib/
 RUN ldconfig
 
 # Default config — every value is also overridable by env var (see docs/HTTP_API.md).
-ENV LSMVEC_DATA_DIR=/data \
-    LSMVEC_PORT=8000 \
-    LSMVEC_HTTP_THREADS=1 \
-    LSMVEC_METRIC=l2
+ENV ASTERVEC_DATA_DIR=/data \
+    ASTERVEC_PORT=8000 \
+    ASTERVEC_HTTP_THREADS=1 \
+    ASTERVEC_METRIC=l2
 
 EXPOSE 8000
 VOLUME ["/data"]
@@ -73,4 +73,4 @@ RUN mkdir -p /data
 HEALTHCHECK --interval=15s --timeout=3s --retries=3 --start-period=10s \
   CMD curl -fsS http://localhost:8000/ready || exit 1
 
-ENTRYPOINT ["/usr/local/bin/lsm_vec_http"]
+ENTRYPOINT ["/usr/local/bin/astervec_http"]

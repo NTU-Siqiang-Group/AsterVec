@@ -1,7 +1,7 @@
 #include "doctest.h"
 #include "metadata.h"
 
-using namespace lsm_vec::metadata;
+using namespace astervec::metadata;
 
 TEST_CASE("$eq: matches equal scalar") {
     Predicate p;

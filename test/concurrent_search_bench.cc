@@ -1,6 +1,6 @@
 // Concurrent search throughput benchmark.
 //
-// Builds a LSM-Vec DB from .fvecs, then runs N-thread concurrent
+// Builds a AsterVec DB from .fvecs, then runs N-thread concurrent
 // search at each requested thread count against the in-memory index
 // (same process — avoids reopen quirks).
 //
@@ -12,7 +12,7 @@
 //       --ground data/sift_100k_groundtruth.ivecs \
 //       --threads 1,2,4,8 --k 10 --efs 128
 
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 #include "utils.h"
 
 #include <atomic>
@@ -47,7 +47,7 @@ struct Args {
     std::vector<int> build_threads_list = {1};  // sequential build by default
     bool skip_search = false;
     bool skip_build = false;
-    bool use_bulk_build = false;  // when true, use LSMVecDB::BulkBuild instead of per-Insert loop
+    bool use_bulk_build = false;  // when true, use AsterVecDB::BulkBuild instead of per-Insert loop
 };
 
 std::vector<int> parseThreadsList(const std::string& s) {
@@ -93,7 +93,7 @@ Args parseArgs(int argc, char* argv[]) {
     return a;
 }
 
-double recallAtK(const std::vector<std::vector<lsm_vec::SearchResult>>& results,
+double recallAtK(const std::vector<std::vector<astervec::SearchResult>>& results,
                  const std::vector<std::vector<int>>& ground, int k)
 {
     if (ground.empty()) return -1.0;
@@ -138,9 +138,9 @@ int main(int argc, char* argv[]) {
     std::cout << "edge_cache_size=" << args.edge_cache_size << "\n";
 
     auto make_opts = [&](const std::string& db_path) {
-        lsm_vec::LSMVecDBOptions o;
+        astervec::AsterVecDBOptions o;
         o.dim = dim;
-        o.metric = lsm_vec::DistanceMetric::kL2;
+        o.metric = astervec::DistanceMetric::kL2;
         o.m = args.M;
         o.m_max = args.Mmax;
         o.ef_construction = static_cast<float>(args.efc);
@@ -158,7 +158,7 @@ int main(int argc, char* argv[]) {
 
     // ---- Build (one or more thread counts, each on a fresh DB) ----
     // Last build's DB is kept open for the search benchmark below.
-    std::unique_ptr<lsm_vec::LSMVecDB> db;
+    std::unique_ptr<astervec::AsterVecDB> db;
     if (!args.skip_build) {
         std::cout << "\n--- Build (concurrent insert on fresh DB) ---\n";
         double first_build_s = -1.0;
@@ -172,8 +172,8 @@ int main(int argc, char* argv[]) {
             std::filesystem::remove_all(subdir, ec);
             std::filesystem::create_directories(subdir, ec);
 
-            std::unique_ptr<lsm_vec::LSMVecDB> local_db;
-            auto st = lsm_vec::LSMVecDB::Open(subdir, make_opts(subdir), &local_db);
+            std::unique_ptr<astervec::AsterVecDB> local_db;
+            auto st = astervec::AsterVecDB::Open(subdir, make_opts(subdir), &local_db);
             if (!st.ok()) { std::cerr << "Open: " << st.ToString() << "\n"; return 1; }
 
             std::atomic<size_t> failed{0};
@@ -190,10 +190,10 @@ int main(int argc, char* argv[]) {
                                     dim * sizeof(float));
                     }
                 }
-                lsm_vec::BulkBuildOptions bopts;
+                astervec::BulkBuildOptions bopts;
                 bopts.num_threads = bt;
                 auto s = local_db->BulkBuild(
-                    lsm_vec::Span<const float>(flat.data(), flat.size()),
+                    astervec::Span<const float>(flat.data(), flat.size()),
                     static_cast<int>(inputs.size()), bopts);
                 if (!s.ok()) {
                     std::cerr << "BulkBuild failed: " << s.ToString() << "\n";
@@ -208,7 +208,7 @@ int main(int argc, char* argv[]) {
                     for (size_t i = lo; i < hi; ++i) {
                         auto s = local_db->Insert(
                             static_cast<uint64_t>(i),
-                            lsm_vec::Span<float>(const_cast<std::vector<float>&>(inputs[i])));
+                            astervec::Span<float>(const_cast<std::vector<float>&>(inputs[i])));
                         if (!s.ok()) failed.fetch_add(1, std::memory_order_relaxed);
                     }
                 };
@@ -240,19 +240,19 @@ int main(int argc, char* argv[]) {
         // Open existing DB without rebuilding.
         auto o = make_opts(args.db_path);
         o.reinit = false;
-        auto st = lsm_vec::LSMVecDB::Open(args.db_path, o, &db);
+        auto st = astervec::AsterVecDB::Open(args.db_path, o, &db);
         if (!st.ok()) { std::cerr << "Open: " << st.ToString() << "\n"; return 1; }
     }
 
     if (args.skip_search || !db) return 0;
 
     // ---- Probe ----
-    lsm_vec::SearchOptions sopts;
+    astervec::SearchOptions sopts;
     sopts.k = args.k;
     sopts.ef_search = args.efs;
     {
-        std::vector<lsm_vec::SearchResult> probe;
-        auto s = db->SearchKnn(lsm_vec::Span<float>(queries[0]), sopts, &probe);
+        std::vector<astervec::SearchResult> probe;
+        auto s = db->SearchKnn(astervec::Span<float>(queries[0]), sopts, &probe);
         std::cout << "[probe] status=" << s.ToString() << " results=" << probe.size() << "\n";
     }
 
@@ -261,7 +261,7 @@ int main(int argc, char* argv[]) {
     for (int nthreads : args.threads_list) {
         if (nthreads < 1) continue;
 
-        std::vector<std::vector<lsm_vec::SearchResult>> results(queries.size());
+        std::vector<std::vector<astervec::SearchResult>> results(queries.size());
         std::atomic<size_t> bad{0};
 
         std::atomic<size_t> next_q{0};
@@ -273,8 +273,8 @@ int main(int argc, char* argv[]) {
             while (true) {
                 size_t q = next_q.fetch_add(1, std::memory_order_relaxed);
                 if (q >= total) break;
-                std::vector<lsm_vec::SearchResult> out;
-                auto s = db->SearchKnn(lsm_vec::Span<float>(queries[q]), sopts, &out);
+                std::vector<astervec::SearchResult> out;
+                auto s = db->SearchKnn(astervec::Span<float>(queries[q]), sopts, &out);
                 if (!s.ok()) { bad.fetch_add(1, std::memory_order_relaxed); continue; }
                 results[q] = std::move(out);
             }

@@ -7,8 +7,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "lsm_vec_db.h"
-#include "lsm_vec_index.h"
+#include "astervec_db.h"
+#include "astervec_index.h"
 
 namespace py = pybind11;
 
@@ -37,7 +37,7 @@ std::vector<float> ToVector(const py::sequence& seq)
     return data;
 }
 
-void RaiseStatus(const lsm_vec::Status& status)
+void RaiseStatus(const astervec::Status& status)
 {
     if (status.ok()) {
         return;
@@ -56,57 +56,57 @@ void RaiseStatus(const lsm_vec::Status& status)
     throw std::runtime_error(message);
 }
 
-lsm_vec::Span<float> MakeSpan(std::vector<float>& data)
+astervec::Span<float> MakeSpan(std::vector<float>& data)
 {
-    return lsm_vec::Span<float>(data.data(), data.size());
+    return astervec::Span<float>(data.data(), data.size());
 }
 
 } // namespace
 
-PYBIND11_MODULE(lsm_vec, m)
+PYBIND11_MODULE(astervec, m)
 {
-    m.doc() = "LSM-Vec Python SDK";
+    m.doc() = "AsterVec Python SDK";
 
-    py::enum_<lsm_vec::DistanceMetric>(m, "DistanceMetric")
-        .value("L2", lsm_vec::DistanceMetric::kL2)
-        .value("Cosine", lsm_vec::DistanceMetric::kCosine)
+    py::enum_<astervec::DistanceMetric>(m, "DistanceMetric")
+        .value("L2", astervec::DistanceMetric::kL2)
+        .value("Cosine", astervec::DistanceMetric::kCosine)
         .export_values();
 
-    py::class_<lsm_vec::LSMVecDBOptions>(m, "LSMVecDBOptions")
+    py::class_<astervec::AsterVecDBOptions>(m, "AsterVecDBOptions")
         .def(py::init<>())
-        .def_readwrite("dim", &lsm_vec::LSMVecDBOptions::dim)
-        .def_readwrite("metric", &lsm_vec::LSMVecDBOptions::metric)
-        .def_readwrite("m", &lsm_vec::LSMVecDBOptions::m)
-        .def_readwrite("m_max", &lsm_vec::LSMVecDBOptions::m_max)
-        .def_readwrite("m_level", &lsm_vec::LSMVecDBOptions::m_level)
-        .def_readwrite("ef_construction", &lsm_vec::LSMVecDBOptions::ef_construction)
-        .def_readwrite("vec_file_capacity", &lsm_vec::LSMVecDBOptions::vec_file_capacity)
-        .def_readwrite("paged_max_cached_pages", &lsm_vec::LSMVecDBOptions::paged_max_cached_pages)
-        .def_readwrite("vector_storage_type", &lsm_vec::LSMVecDBOptions::vector_storage_type)
-        .def_readwrite("db_target_size", &lsm_vec::LSMVecDBOptions::db_target_size)
-        .def_readwrite("random_seed", &lsm_vec::LSMVecDBOptions::random_seed)
-        .def_readwrite("enable_stats", &lsm_vec::LSMVecDBOptions::enable_stats)
-        .def_readwrite("reinit", &lsm_vec::LSMVecDBOptions::reinit)
-        .def_readwrite("enable_batch_read", &lsm_vec::LSMVecDBOptions::enable_batch_read)
-        .def_readwrite("k", &lsm_vec::LSMVecDBOptions::k)
-        .def_readwrite("ef_search", &lsm_vec::LSMVecDBOptions::ef_search)
-        .def_readwrite("vector_file_path", &lsm_vec::LSMVecDBOptions::vector_file_path)
-        .def_readwrite("log_file_path", &lsm_vec::LSMVecDBOptions::log_file_path);
+        .def_readwrite("dim", &astervec::AsterVecDBOptions::dim)
+        .def_readwrite("metric", &astervec::AsterVecDBOptions::metric)
+        .def_readwrite("m", &astervec::AsterVecDBOptions::m)
+        .def_readwrite("m_max", &astervec::AsterVecDBOptions::m_max)
+        .def_readwrite("m_level", &astervec::AsterVecDBOptions::m_level)
+        .def_readwrite("ef_construction", &astervec::AsterVecDBOptions::ef_construction)
+        .def_readwrite("vec_file_capacity", &astervec::AsterVecDBOptions::vec_file_capacity)
+        .def_readwrite("paged_max_cached_pages", &astervec::AsterVecDBOptions::paged_max_cached_pages)
+        .def_readwrite("vector_storage_type", &astervec::AsterVecDBOptions::vector_storage_type)
+        .def_readwrite("db_target_size", &astervec::AsterVecDBOptions::db_target_size)
+        .def_readwrite("random_seed", &astervec::AsterVecDBOptions::random_seed)
+        .def_readwrite("enable_stats", &astervec::AsterVecDBOptions::enable_stats)
+        .def_readwrite("reinit", &astervec::AsterVecDBOptions::reinit)
+        .def_readwrite("enable_batch_read", &astervec::AsterVecDBOptions::enable_batch_read)
+        .def_readwrite("k", &astervec::AsterVecDBOptions::k)
+        .def_readwrite("ef_search", &astervec::AsterVecDBOptions::ef_search)
+        .def_readwrite("vector_file_path", &astervec::AsterVecDBOptions::vector_file_path)
+        .def_readwrite("log_file_path", &astervec::AsterVecDBOptions::log_file_path);
 
-    py::class_<lsm_vec::SearchOptions>(m, "SearchOptions")
+    py::class_<astervec::SearchOptions>(m, "SearchOptions")
         .def(py::init<>())
-        .def_readwrite("k", &lsm_vec::SearchOptions::k)
-        .def_readwrite("ef_search", &lsm_vec::SearchOptions::ef_search)
-        .def_readwrite("max_scan_candidates", &lsm_vec::SearchOptions::max_scan_candidates);
+        .def_readwrite("k", &astervec::SearchOptions::k)
+        .def_readwrite("ef_search", &astervec::SearchOptions::ef_search)
+        .def_readwrite("max_scan_candidates", &astervec::SearchOptions::max_scan_candidates);
 
-    py::class_<lsm_vec::SearchResult>(m, "SearchResult")
-        .def_readonly("id", &lsm_vec::SearchResult::id)
-        .def_readonly("distance", &lsm_vec::SearchResult::distance);
+    py::class_<astervec::SearchResult>(m, "SearchResult")
+        .def_readonly("id", &astervec::SearchResult::id)
+        .def_readonly("distance", &astervec::SearchResult::distance);
 
-    py::class_<lsm_vec::LSMVecDB, std::unique_ptr<lsm_vec::LSMVecDB>>(m, "LSMVecDB")
-        .def_static("open", [](const std::string& path, const lsm_vec::LSMVecDBOptions& options) {
-            std::unique_ptr<lsm_vec::LSMVecDB> db;
-            lsm_vec::Status status = lsm_vec::LSMVecDB::Open(path, options, &db);
+    py::class_<astervec::AsterVecDB, std::unique_ptr<astervec::AsterVecDB>>(m, "AsterVecDB")
+        .def_static("open", [](const std::string& path, const astervec::AsterVecDBOptions& options) {
+            std::unique_ptr<astervec::AsterVecDB> db;
+            astervec::Status status = astervec::AsterVecDB::Open(path, options, &db);
             RaiseStatus(status);
             return db;
         })
@@ -114,8 +114,8 @@ PYBIND11_MODULE(lsm_vec, m)
         // array_t one so that passing a list never triggers numpy overload
         // resolution (which would import numpy and fail if it isn't installed).
         .def("insert",
-             [](lsm_vec::LSMVecDB& db,
-                lsm_vec::node_id_t id,
+             [](astervec::AsterVecDB& db,
+                astervec::node_id_t id,
                 const py::sequence& seq,
                 py::object metadata) {
                  std::vector<float> data = ToVector(seq);
@@ -130,8 +130,8 @@ PYBIND11_MODULE(lsm_vec, m)
              py::arg("id"), py::arg("vector"), py::arg("metadata") = py::none(),
              "Insert a vector with optional metadata (Python dict serialized to JSON).")
         .def("insert",
-             [](lsm_vec::LSMVecDB& db,
-                lsm_vec::node_id_t id,
+             [](astervec::AsterVecDB& db,
+                astervec::node_id_t id,
                 const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
                 py::object metadata) {
                  std::vector<float> data = ToVector(array);
@@ -145,20 +145,20 @@ PYBIND11_MODULE(lsm_vec, m)
              },
              py::arg("id"), py::arg("vector"), py::arg("metadata") = py::none(),
              "Insert a vector with optional metadata (Python dict serialized to JSON).")
-        .def("update", [](lsm_vec::LSMVecDB& db, int id, const py::sequence& seq) {
+        .def("update", [](astervec::AsterVecDB& db, int id, const py::sequence& seq) {
             auto data = ToVector(seq);
             RaiseStatus(db.Update(id, MakeSpan(data)));
         })
-        .def("update", [](lsm_vec::LSMVecDB& db,
+        .def("update", [](astervec::AsterVecDB& db,
                            int id,
                            const py::array_t<float, py::array::c_style | py::array::forcecast>& array) {
             auto data = ToVector(array);
             RaiseStatus(db.Update(id, MakeSpan(data)));
         })
-        .def("delete", [](lsm_vec::LSMVecDB& db, int id) {
+        .def("delete", [](astervec::AsterVecDB& db, int id) {
             RaiseStatus(db.Delete(id));
         })
-        .def("get", [](lsm_vec::LSMVecDB& db, int id) {
+        .def("get", [](astervec::AsterVecDB& db, int id) {
             std::vector<float> out;
             RaiseStatus(db.Get(id, &out));
             py::array_t<float> result(out.size());
@@ -168,73 +168,73 @@ PYBIND11_MODULE(lsm_vec, m)
             }
             return result;
         })
-        .def("search_knn", [](lsm_vec::LSMVecDB& db,
+        .def("search_knn", [](astervec::AsterVecDB& db,
                               const py::sequence& seq,
-                              const lsm_vec::SearchOptions& options) {
+                              const astervec::SearchOptions& options) {
             auto data = ToVector(seq);
-            std::vector<lsm_vec::SearchResult> out;
+            std::vector<astervec::SearchResult> out;
             RaiseStatus(db.SearchKnn(MakeSpan(data), options, &out));
             return out;
         })
-        .def("search_knn", [](lsm_vec::LSMVecDB& db,
+        .def("search_knn", [](astervec::AsterVecDB& db,
                               const py::sequence& seq,
                               int k,
                               int ef_search) {
             auto data = ToVector(seq);
-            lsm_vec::SearchOptions options;
+            astervec::SearchOptions options;
             options.k = k;
             options.ef_search = ef_search;
-            std::vector<lsm_vec::SearchResult> out;
+            std::vector<astervec::SearchResult> out;
             RaiseStatus(db.SearchKnn(MakeSpan(data), options, &out));
             return out;
         }, py::arg("query"), py::arg("k"), py::arg("ef_search"))
-        .def("search_knn", [](lsm_vec::LSMVecDB& db,
+        .def("search_knn", [](astervec::AsterVecDB& db,
                               const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
-                              const lsm_vec::SearchOptions& options) {
+                              const astervec::SearchOptions& options) {
             auto data = ToVector(array);
-            std::vector<lsm_vec::SearchResult> out;
+            std::vector<astervec::SearchResult> out;
             RaiseStatus(db.SearchKnn(MakeSpan(data), options, &out));
             return out;
         })
-        .def("search_knn", [](lsm_vec::LSMVecDB& db,
+        .def("search_knn", [](astervec::AsterVecDB& db,
                               const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
                               int k,
                               int ef_search) {
             auto data = ToVector(array);
-            lsm_vec::SearchOptions options;
+            astervec::SearchOptions options;
             options.k = k;
             options.ef_search = ef_search;
-            std::vector<lsm_vec::SearchResult> out;
+            std::vector<astervec::SearchResult> out;
             RaiseStatus(db.SearchKnn(MakeSpan(data), options, &out));
             return out;
         }, py::arg("query"), py::arg("k"), py::arg("ef_search"))
-        .def("search_knn", [](lsm_vec::LSMVecDB& db,
+        .def("search_knn", [](astervec::AsterVecDB& db,
                               const py::sequence& seq) {
             auto data = ToVector(seq);
-            std::vector<lsm_vec::SearchResult> out;
+            std::vector<astervec::SearchResult> out;
             RaiseStatus(db.SearchKnn(MakeSpan(data), &out));
             return out;
         })
-        .def("search_knn", [](lsm_vec::LSMVecDB& db,
+        .def("search_knn", [](astervec::AsterVecDB& db,
                               const py::array_t<float, py::array::c_style | py::array::forcecast>& array) {
             auto data = ToVector(array);
-            std::vector<lsm_vec::SearchResult> out;
+            std::vector<astervec::SearchResult> out;
             RaiseStatus(db.SearchKnn(MakeSpan(data), &out));
             return out;
         })
         // Sequence (Python list) overload first — see the insert() note above.
         .def("search",
-             [](lsm_vec::LSMVecDB& db,
+             [](astervec::AsterVecDB& db,
                 const py::sequence& query,
                 int k, int ef_search,
                 py::object filter,
                 int max_scan_candidates) -> py::list {
                  std::vector<float> qdata = ToVector(query);
-                 lsm_vec::SearchOptions opts;
+                 astervec::SearchOptions opts;
                  opts.k = k;
                  opts.ef_search = ef_search;
                  opts.max_scan_candidates = max_scan_candidates;
-                 std::vector<lsm_vec::SearchResult> out;
+                 std::vector<astervec::SearchResult> out;
                  if (filter.is_none()) {
                      RaiseStatus(db.SearchKnn(MakeSpan(qdata), opts, &out));
                  } else {
@@ -258,17 +258,17 @@ PYBIND11_MODULE(lsm_vec, m)
              py::arg("max_scan_candidates") = 0,
              "kNN search with optional metadata filter. Returns list of dicts {id, distance}.")
         .def("search",
-             [](lsm_vec::LSMVecDB& db,
+             [](astervec::AsterVecDB& db,
                 const py::array_t<float, py::array::c_style | py::array::forcecast>& query,
                 int k, int ef_search,
                 py::object filter,
                 int max_scan_candidates) -> py::list {
                  std::vector<float> qdata = ToVector(query);
-                 lsm_vec::SearchOptions opts;
+                 astervec::SearchOptions opts;
                  opts.k = k;
                  opts.ef_search = ef_search;
                  opts.max_scan_candidates = max_scan_candidates;
-                 std::vector<lsm_vec::SearchResult> out;
+                 std::vector<astervec::SearchResult> out;
                  if (filter.is_none()) {
                      RaiseStatus(db.SearchKnn(MakeSpan(qdata), opts, &out));
                  } else {
@@ -292,7 +292,7 @@ PYBIND11_MODULE(lsm_vec, m)
              py::arg("max_scan_candidates") = 0,
              "kNN search with optional metadata filter. Returns list of dicts {id, distance}.")
         .def("set_payload",
-             [](lsm_vec::LSMVecDB& db, lsm_vec::node_id_t id, py::object metadata) {
+             [](astervec::AsterVecDB& db, astervec::node_id_t id, py::object metadata) {
                  py::object json_mod = py::module_::import("json");
                  std::string s = json_mod.attr("dumps")(metadata).cast<std::string>();
                  RaiseStatus(db.SetPayload(id, s));
@@ -300,7 +300,7 @@ PYBIND11_MODULE(lsm_vec, m)
              py::arg("id"), py::arg("metadata"),
              "Replace the metadata associated with id.")
         .def("update_payload",
-             [](lsm_vec::LSMVecDB& db, lsm_vec::node_id_t id, py::object partial) {
+             [](astervec::AsterVecDB& db, astervec::node_id_t id, py::object partial) {
                  py::object json_mod = py::module_::import("json");
                  std::string s = json_mod.attr("dumps")(partial).cast<std::string>();
                  RaiseStatus(db.UpdatePayload(id, s));
@@ -308,15 +308,15 @@ PYBIND11_MODULE(lsm_vec, m)
              py::arg("id"), py::arg("metadata"),
              "Merge-patch (RFC 7396) metadata for id; None values delete fields.")
         .def("delete_payload_keys",
-             [](lsm_vec::LSMVecDB& db, lsm_vec::node_id_t id,
+             [](astervec::AsterVecDB& db, astervec::node_id_t id,
                 const std::vector<std::string>& keys) {
-                 lsm_vec::Span<const std::string> span(keys);
+                 astervec::Span<const std::string> span(keys);
                  RaiseStatus(db.DeletePayloadKeys(id, span));
              },
              py::arg("id"), py::arg("keys"),
              "Remove the specified keys from the metadata object for id.")
         .def("get_payload",
-             [](lsm_vec::LSMVecDB& db, lsm_vec::node_id_t id) -> py::object {
+             [](astervec::AsterVecDB& db, astervec::node_id_t id) -> py::object {
                  std::string s;
                  RaiseStatus(db.GetPayload(id, &s));
                  py::object json_mod = py::module_::import("json");
@@ -325,10 +325,10 @@ PYBIND11_MODULE(lsm_vec, m)
              py::arg("id"),
              "Return the metadata dict for id (empty dict if no metadata row).")
         .def("flush_vector_writes",
-             [](lsm_vec::LSMVecDB& db) { db.flushVectorWrites(); },
+             [](astervec::AsterVecDB& db) { db.flushVectorWrites(); },
              "Flush any pending vector writes to the on-disk vector storage.")
         .def("bulk_build",
-             [](lsm_vec::LSMVecDB& db,
+             [](astervec::AsterVecDB& db,
                 const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
                 int threads) -> py::dict {
                  if (array.ndim() != 2) {
@@ -339,14 +339,14 @@ PYBIND11_MODULE(lsm_vec, m)
                  if (n <= 0 || dim <= 0) {
                      throw py::value_error("vectors must be a non-empty (n, dim) array");
                  }
-                 lsm_vec::BulkBuildOptions bopts;
+                 astervec::BulkBuildOptions bopts;
                  if (threads > 0) bopts.num_threads = threads;  // 0 -> engine auto
 
                  // c_style|forcecast guarantees a C-contiguous float32 buffer.
                  const float* ptr = array.data();
                  auto t0 = std::chrono::high_resolution_clock::now();
                  RaiseStatus(db.BulkBuild(
-                     lsm_vec::Span<const float>(
+                     astervec::Span<const float>(
                          ptr, static_cast<size_t>(n) * static_cast<size_t>(dim)),
                      static_cast<int>(n), bopts));
                  auto t1 = std::chrono::high_resolution_clock::now();
@@ -369,12 +369,12 @@ PYBIND11_MODULE(lsm_vec, m)
              "empty; ids are assigned 0..n-1. Returns a report dict "
              "{n, elapsed_ms, vectors_per_sec, threads}.")
         .def("trim_memory",
-             [](lsm_vec::LSMVecDB& db) { db.trimMemory(); },
+             [](astervec::AsterVecDB& db) { db.trimMemory(); },
              "Ask the allocator to return idle heap memory to the OS "
              "(glibc malloc_trim; no-op elsewhere).")
         .def("delete_stats",
-             [](const lsm_vec::LSMVecDB& db) -> py::dict {
-                 lsm_vec::LSMVecDB::DeleteStats s = db.GetDeleteStats();
+             [](const astervec::AsterVecDB& db) -> py::dict {
+                 astervec::AsterVecDB::DeleteStats s = db.GetDeleteStats();
                  py::dict d;
                  d["tombstones"]          = s.tombstones;
                  d["updated_real_ids"]    = s.updated_real_ids;
@@ -386,7 +386,7 @@ PYBIND11_MODULE(lsm_vec, m)
                  return d;
              },
              "Snapshot of delete/tombstone observability counters as a dict.")
-        .def("close", [](lsm_vec::LSMVecDB& db) {
+        .def("close", [](astervec::AsterVecDB& db) {
             RaiseStatus(db.Close());
         });
 }

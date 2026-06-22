@@ -1,4 +1,4 @@
-#include "lsm_vec_rnn_descent.h"
+#include "astervec_rnn_descent.h"
 
 #include <algorithm>
 #include <atomic>
@@ -7,7 +7,7 @@
 
 #include "distance.h"
 
-namespace lsm_vec::rnn_descent {
+namespace astervec::rnn_descent {
 
 namespace {
 
@@ -81,7 +81,7 @@ FlatStorageDistance::FlatStorageDistance(const float* data, int n, int dim,
     if (metric_ == DistanceMetric::kCosine) {
         norms_.resize(static_cast<size_t>(n_));
         for (int i = 0; i < n_; ++i) {
-            norms_[i] = lsm_vec::distance::L2Norm(
+            norms_[i] = astervec::distance::L2Norm(
                 data_ + static_cast<size_t>(i) * dim_, dim_);
         }
     }
@@ -91,13 +91,13 @@ float FlatStorageDistance::operator()(int i, int j) const {
     const float* a = data_ + static_cast<size_t>(i) * dim_;
     const float* b = data_ + static_cast<size_t>(j) * dim_;
     if (metric_ == DistanceMetric::kCosine) {
-        return lsm_vec::distance::CosineDistance(a, b, dim_, norms_[i],
+        return astervec::distance::CosineDistance(a, b, dim_, norms_[i],
                                                  norms_[j]);
     }
     // RNND only uses these distances for ordering (sort, top-k,
     // RNG-prune compare). Squared L2 preserves the ordering and skips
     // the per-call sqrt — ~30-40% speed-up of the build's hottest loop.
-    return lsm_vec::distance::L2SquaredDistance(a, b, dim_);
+    return astervec::distance::L2SquaredDistance(a, b, dim_);
 }
 
 // ---------------------------------------------------------------------
@@ -314,4 +314,4 @@ void RNNDescentBuilder::build(FlatStorageDistance& dist, int n) {
     std::vector<Nhood>().swap(graph_);
 }
 
-}  // namespace lsm_vec::rnn_descent
+}  // namespace astervec::rnn_descent

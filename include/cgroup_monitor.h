@@ -6,7 +6,7 @@
 //
 // Background thread samples a few small sysfs files every `poll_ms` and sets a
 // one-way "escalate" latch when the container is genuinely thrashing the OS
-// page cache under its memory cap. Consumed by LSMVec to escalate the
+// page cache under its memory cap. Consumed by AsterVec to escalate the
 // RocksGraph store from buffered to Direct I/O during an incremental build.
 //
 // Trigger (both must hold, sustained for `debounce_s`):
@@ -31,7 +31,7 @@
 
 #include "logger.h"
 
-namespace lsm_vec {
+namespace astervec {
 
 class CgroupMemoryMonitor {
 public:
@@ -239,6 +239,6 @@ private:
     uint64_t mem_max_ = 0;
 };
 
-} // namespace lsm_vec
+} // namespace astervec
 
 #endif // LSM_VEC_CGROUP_MONITOR_H_

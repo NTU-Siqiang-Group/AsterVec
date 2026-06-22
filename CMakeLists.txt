@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Project name and version
-project(LSMVEC)
+project(ASTERVEC)
 
 # Set C++ standard to C++17 and build type
 set(CMAKE_CXX_STANDARD 17)
@@ -14,32 +14,32 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wall -Wextra -O2")
 
 # Sanitizer build target — concurrent-writer-refactor-plan §6 Phase 0.
-# LSMVEC_SANITIZER=OFF | asan | tsan | ubsan
-# Use as: cmake -B build-tsan -DLSMVEC_SANITIZER=tsan
+# ASTERVEC_SANITIZER=OFF | asan | tsan | ubsan
+# Use as: cmake -B build-tsan -DASTERVEC_SANITIZER=tsan
 # Implies -O1 -g and frame pointers; intended for the unit-test target only.
 # Aster (lib/aster) is built separately via its own Makefile and does NOT
 # pick up these flags — that's deliberate (Aster has known bad-free in its
 # write_stall_stats static initializer that ASan/TSan flags as a false
 # positive on the prebuilt static archive; see test_concurrent_search.cc
 # header note).
-set(LSMVEC_SANITIZER "OFF" CACHE STRING "Enable a sanitizer build: OFF|asan|tsan|ubsan")
-set_property(CACHE LSMVEC_SANITIZER PROPERTY STRINGS OFF asan tsan ubsan)
-if(NOT LSMVEC_SANITIZER STREQUAL "OFF")
-    set(_lsmvec_san_flags "-fno-omit-frame-pointer -g -O1")
-    if(LSMVEC_SANITIZER STREQUAL "asan")
-        set(_lsmvec_san_flags "${_lsmvec_san_flags} -fsanitize=address")
-    elseif(LSMVEC_SANITIZER STREQUAL "tsan")
-        set(_lsmvec_san_flags "${_lsmvec_san_flags} -fsanitize=thread")
-    elseif(LSMVEC_SANITIZER STREQUAL "ubsan")
-        set(_lsmvec_san_flags "${_lsmvec_san_flags} -fsanitize=undefined")
+set(ASTERVEC_SANITIZER "OFF" CACHE STRING "Enable a sanitizer build: OFF|asan|tsan|ubsan")
+set_property(CACHE ASTERVEC_SANITIZER PROPERTY STRINGS OFF asan tsan ubsan)
+if(NOT ASTERVEC_SANITIZER STREQUAL "OFF")
+    set(_astervec_san_flags "-fno-omit-frame-pointer -g -O1")
+    if(ASTERVEC_SANITIZER STREQUAL "asan")
+        set(_astervec_san_flags "${_astervec_san_flags} -fsanitize=address")
+    elseif(ASTERVEC_SANITIZER STREQUAL "tsan")
+        set(_astervec_san_flags "${_astervec_san_flags} -fsanitize=thread")
+    elseif(ASTERVEC_SANITIZER STREQUAL "ubsan")
+        set(_astervec_san_flags "${_astervec_san_flags} -fsanitize=undefined")
     else()
-        message(FATAL_ERROR "LSMVEC_SANITIZER must be one of OFF|asan|tsan|ubsan, got: ${LSMVEC_SANITIZER}")
+        message(FATAL_ERROR "ASTERVEC_SANITIZER must be one of OFF|asan|tsan|ubsan, got: ${ASTERVEC_SANITIZER}")
     endif()
-    message(STATUS "Sanitizer enabled: ${LSMVEC_SANITIZER} (${_lsmvec_san_flags})")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${_lsmvec_san_flags}")
-    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} ${_lsmvec_san_flags}")
-    set(CMAKE_EXE_LINKER_FLAGS    "${CMAKE_EXE_LINKER_FLAGS} ${_lsmvec_san_flags}")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${_lsmvec_san_flags}")
+    message(STATUS "Sanitizer enabled: ${ASTERVEC_SANITIZER} (${_astervec_san_flags})")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${_astervec_san_flags}")
+    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} ${_astervec_san_flags}")
+    set(CMAKE_EXE_LINKER_FLAGS    "${CMAKE_EXE_LINKER_FLAGS} ${_astervec_san_flags}")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${_astervec_san_flags}")
 endif()
 
 # SIMD flags: AVX2/FMA on x86_64 only (ARM uses scalar fallback in distance.h)
@@ -129,14 +129,14 @@ include_directories(${ROCKSDB_INCLUDE_DIR})
 
 # Specify the source files
 set(LIB_SOURCES
-    src/lsm_vec_index.cc
-    src/lsm_vec_db.cc
+    src/astervec_index.cc
+    src/astervec_db.cc
     src/utils.cc
     src/metadata.cc
     src/metadata_store.cc
     src/bloom_filter.cc
-    src/lsm_vec_rnn_descent.cc
-    src/lsm_vec_bulk_build.cc
+    src/astervec_rnn_descent.cc
+    src/astervec_bulk_build.cc
 )
 
 find_library(ZSTD_LIB zstd
@@ -157,7 +157,7 @@ message(STATUS "Using ZSTD library at ${ZSTD_LIB}")
 # kNoCompression. Keeping the build to a single compression dependency (zstd)
 # makes it far simpler to set up.
 
-set(LSMVEC_LINK_LIBS
+set(ASTERVEC_LINK_LIBS
     ${ROCKSDB_LIB}
     ${ZSTD_LIB}
     pthread
@@ -165,17 +165,17 @@ set(LSMVEC_LINK_LIBS
 )
 
 # Add the library targets
-add_library(lsmvec_obj OBJECT ${LIB_SOURCES})
-target_include_directories(lsmvec_obj PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_library(astervec_obj OBJECT ${LIB_SOURCES})
+target_include_directories(astervec_obj PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-add_library(lsmvec_static STATIC $<TARGET_OBJECTS:lsmvec_obj>)
-add_library(lsmvec_shared SHARED $<TARGET_OBJECTS:lsmvec_obj>)
+add_library(astervec_static STATIC $<TARGET_OBJECTS:astervec_obj>)
+add_library(astervec_shared SHARED $<TARGET_OBJECTS:astervec_obj>)
 
-target_include_directories(lsmvec_static PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_include_directories(lsmvec_shared PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(astervec_static PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(astervec_shared PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
-target_link_libraries(lsmvec_static PUBLIC ${LSMVEC_LINK_LIBS})
-target_link_libraries(lsmvec_shared PUBLIC ${LSMVEC_LINK_LIBS})
+target_link_libraries(astervec_static PUBLIC ${ASTERVEC_LINK_LIBS})
+target_link_libraries(astervec_shared PUBLIC ${ASTERVEC_LINK_LIBS})
 if(APPLE)
     find_library(JEMALLOC_LIB NAMES jemalloc
         HINTS /usr/local/lib /opt/homebrew/lib /opt/homebrew/opt/jemalloc/lib
@@ -183,66 +183,66 @@ if(APPLE)
 
     if(JEMALLOC_LIB)
         message(STATUS "Found jemalloc at: ${JEMALLOC_LIB}")
-        target_link_libraries(lsmvec_shared PRIVATE ${JEMALLOC_LIB})
+        target_link_libraries(astervec_shared PRIVATE ${JEMALLOC_LIB})
     else()
         message(STATUS "jemalloc not found, skipping (optional)")
     endif()
 endif()
 
-set_target_properties(lsmvec_static PROPERTIES
-    OUTPUT_NAME lsmvec
+set_target_properties(astervec_static PROPERTIES
+    OUTPUT_NAME astervec
     ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
 )
 
-set_target_properties(lsmvec_shared PROPERTIES
-    OUTPUT_NAME lsmvec
+set_target_properties(astervec_shared PROPERTIES
+    OUTPUT_NAME astervec
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
 )
 
 # Add the executable target
-add_executable(lsm_vec test/test.cc)
-target_include_directories(lsm_vec PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(lsm_vec PRIVATE lsmvec_shared)
+add_executable(astervec test/test.cc)
+target_include_directories(astervec PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(astervec PRIVATE astervec_shared)
 
 # Set output directory for the executable
-set_target_properties(lsm_vec PROPERTIES
+set_target_properties(astervec PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
 # Concurrent search benchmark tool — for Phase A multi-thread perf testing.
 add_executable(concurrent_search_bench test/concurrent_search_bench.cc)
 target_include_directories(concurrent_search_bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(concurrent_search_bench PRIVATE lsmvec_shared)
+target_link_libraries(concurrent_search_bench PRIVATE astervec_shared)
 set_target_properties(concurrent_search_bench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
-option(LSMVEC_BUILD_HTTP "Build the HTTP/REST server (lsm_vec_http)" ON)
+option(ASTERVEC_BUILD_HTTP "Build the HTTP/REST server (astervec_http)" ON)
 
-if(LSMVEC_BUILD_HTTP)
+if(ASTERVEC_BUILD_HTTP)
     # cpp-httplib is header-only, vendored at third_party/httplib/.
-    add_executable(lsm_vec_http
-        src/lsm_vec_http_main.cc
-        src/lsm_vec_http.cc
+    add_executable(astervec_http
+        src/astervec_http_main.cc
+        src/astervec_http.cc
     )
-    target_include_directories(lsm_vec_http PRIVATE
+    target_include_directories(astervec_http PRIVATE
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/third_party/httplib
         ${CMAKE_SOURCE_DIR}/third_party/json
     )
-    target_link_libraries(lsm_vec_http PRIVATE lsmvec_shared)
+    target_link_libraries(astervec_http PRIVATE astervec_shared)
     # httplib requires threads.
     find_package(Threads REQUIRED)
-    target_link_libraries(lsm_vec_http PRIVATE Threads::Threads)
-    set_target_properties(lsm_vec_http PROPERTIES
+    target_link_libraries(astervec_http PRIVATE Threads::Threads)
+    set_target_properties(astervec_http PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 endif()
 
-option(LSMVEC_BUILD_PYTHON "Build Python bindings" OFF)
-option(LSMVEC_PYTHON_STATIC "Link Python module against static lib (for wheel builds)" OFF)
+option(ASTERVEC_BUILD_PYTHON "Build Python bindings" OFF)
+option(ASTERVEC_PYTHON_STATIC "Link Python module against static lib (for wheel builds)" OFF)
 
-if(LSMVEC_BUILD_PYTHON)
+if(ASTERVEC_BUILD_PYTHON)
     include(FetchContent)
     FetchContent_Declare(
         pybind11
@@ -251,21 +251,21 @@ if(LSMVEC_BUILD_PYTHON)
     )
     FetchContent_MakeAvailable(pybind11)
 
-    pybind11_add_module(lsm_vec_python MODULE python/lsm_vec_pybind.cc)
-    target_include_directories(lsm_vec_python PRIVATE ${CMAKE_SOURCE_DIR}/include)
-    if(LSMVEC_PYTHON_STATIC)
-        target_link_libraries(lsm_vec_python PRIVATE lsmvec_static)
+    pybind11_add_module(astervec_python MODULE python/astervec_pybind.cc)
+    target_include_directories(astervec_python PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(ASTERVEC_PYTHON_STATIC)
+        target_link_libraries(astervec_python PRIVATE astervec_static)
     else()
-        target_link_libraries(lsm_vec_python PRIVATE lsmvec_shared)
+        target_link_libraries(astervec_python PRIVATE astervec_shared)
     endif()
-    set_target_properties(lsm_vec_python PROPERTIES
-        OUTPUT_NAME lsm_vec
+    set_target_properties(astervec_python PROPERTIES
+        OUTPUT_NAME astervec
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python
     )
-    install(TARGETS lsm_vec_python LIBRARY DESTINATION .)
+    install(TARGETS astervec_python LIBRARY DESTINATION .)
 endif()
 
-option(LSMVEC_BUILD_UNIT_TESTS "Build doctest-based unit tests" ON)
-if(LSMVEC_BUILD_UNIT_TESTS)
+option(ASTERVEC_BUILD_UNIT_TESTS "Build doctest-based unit tests" ON)
+if(ASTERVEC_BUILD_UNIT_TESTS)
     add_subdirectory(test/unit)
 endif()

@@ -12,15 +12,15 @@ configure:
 	$(CMAKE) -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
 
 static: configure
-	$(CMAKE) --build $(BUILD_DIR) --target lsmvec_static -j
+	$(CMAKE) --build $(BUILD_DIR) --target astervec_static -j
 
 shared: configure
-	$(CMAKE) --build $(BUILD_DIR) --target lsmvec_shared -j
+	$(CMAKE) --build $(BUILD_DIR) --target astervec_shared -j
 
 lib: static shared
 
 bin: configure
-	$(CMAKE) --build $(BUILD_DIR) --target lsm_vec -j
+	$(CMAKE) --build $(BUILD_DIR) --target astervec -j
 
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
@@ -37,24 +37,24 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 unit_test: configure
-	$(CMAKE) --build $(BUILD_DIR) --target lsmvec_unit_tests -- -j
-	$(BUILD_DIR)/test/unit/lsmvec_unit_tests $(DOCTEST_TAGS)
+	$(CMAKE) --build $(BUILD_DIR) --target astervec_unit_tests -- -j
+	$(BUILD_DIR)/test/unit/astervec_unit_tests $(DOCTEST_TAGS)
 
 # Sanitizer-instrumented unit-test runs. Each uses a separate build dir
 # so it doesn't clobber the Release build. Concurrent-writer-refactor
-# Phase 0 deliverable: pure-LSM-Vec sanitizer target (Aster is built
+# Phase 0 deliverable: pure-AsterVec sanitizer target (Aster is built
 # via its own Makefile and is not instrumented — by design).
 unit_test_asan:
-	$(CMAKE) -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DLSMVEC_SANITIZER=asan
-	$(CMAKE) --build build-asan --target lsmvec_unit_tests -- -j
-	build-asan/test/unit/lsmvec_unit_tests $(DOCTEST_TAGS)
+	$(CMAKE) -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DASTERVEC_SANITIZER=asan
+	$(CMAKE) --build build-asan --target astervec_unit_tests -- -j
+	build-asan/test/unit/astervec_unit_tests $(DOCTEST_TAGS)
 
 unit_test_tsan:
-	$(CMAKE) -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DLSMVEC_SANITIZER=tsan
-	$(CMAKE) --build build-tsan --target lsmvec_unit_tests -- -j
-	build-tsan/test/unit/lsmvec_unit_tests $(DOCTEST_TAGS)
+	$(CMAKE) -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DASTERVEC_SANITIZER=tsan
+	$(CMAKE) --build build-tsan --target astervec_unit_tests -- -j
+	build-tsan/test/unit/astervec_unit_tests $(DOCTEST_TAGS)
 
 unit_test_ubsan:
-	$(CMAKE) -S . -B build-ubsan -DCMAKE_BUILD_TYPE=Debug -DLSMVEC_SANITIZER=ubsan
-	$(CMAKE) --build build-ubsan --target lsmvec_unit_tests -- -j
-	build-ubsan/test/unit/lsmvec_unit_tests $(DOCTEST_TAGS)
+	$(CMAKE) -S . -B build-ubsan -DCMAKE_BUILD_TYPE=Debug -DASTERVEC_SANITIZER=ubsan
+	$(CMAKE) --build build-ubsan --target astervec_unit_tests -- -j
+	build-ubsan/test/unit/astervec_unit_tests $(DOCTEST_TAGS)

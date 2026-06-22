@@ -3,7 +3,7 @@
 #include "bloom_filter.h"
 #include "doctest.h"
 
-using lsm_vec::BloomFilter;
+using astervec::BloomFilter;
 
 TEST_CASE("BloomFilter: empty filter reports nothing contained") {
     BloomFilter bf;  // default-constructed (capacity 0)

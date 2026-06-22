@@ -1,31 +1,31 @@
-// LSM-Vec HTTP/REST server.
+// AsterVec HTTP/REST server.
 //
 // One-binary, single-tenant HTTP server. Used inside a per-user
 // container at trial deployment; see the design docs §5.
 //
 // Configuration from environment variables (see http_main.cc).
-// REST API surface in lsm_vec_http.cc.
+// REST API surface in astervec_http.cc.
 //
-// All endpoints serve directly from LSMVecDB; Phase A made the
+// All endpoints serve directly from AsterVecDB; Phase A made the
 // underlying engine thread-safe for HTTP-pool concurrency, so the
 // handlers do not take any global mutex on the read path.
 
 #pragma once
 
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
 
-namespace lsm_vec {
+namespace astervec {
 
 struct HttpServerConfig {
     // ---- HTTP listener ----
     int port = 8000;
     // Server defaults to single-threaded request handling: one user
-    // per container, no internal contention. Set LSMVEC_HTTP_THREADS=N
+    // per container, no internal contention. Set ASTERVEC_HTTP_THREADS=N
     // to enable parallel request handling on dedicated hardware.
     int http_threads = 1;
     int read_timeout_sec = 30;
@@ -33,7 +33,7 @@ struct HttpServerConfig {
     std::size_t payload_max_length = 16 * 1024 * 1024;   // 16 MB (normal endpoints)
     std::size_t bulk_build_max_length = 4ULL * 1024 * 1024 * 1024;  // 4 GB ceiling for /v1/build/bulk
 
-    // ---- LSM-Vec engine ----
+    // ---- AsterVec engine ----
     std::string data_dir = "/data";
     int dim = 0;                     // required on first boot
     DistanceMetric metric = DistanceMetric::kL2;
@@ -60,4 +60,4 @@ bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err);
 // on the underlying DB during graceful shutdown.
 int RunHttpServer(const HttpServerConfig& cfg);
 
-}  // namespace lsm_vec
+}  // namespace astervec

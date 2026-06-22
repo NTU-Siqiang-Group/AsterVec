@@ -58,7 +58,7 @@
 //   * expandCapacity / deserializeMetadata take pages_alloc_mu_
 //     because they grow the dense location arrays.
 //   * flushWrites runs under the engine's exclusive lifecycle gate
-//     (FLUSH op in pglsmvec/csrc/lsmvec_worker_pool.cpp) and therefore
+//     (FLUSH op in pgastervec/csrc/astervec_worker_pool.cpp) and therefore
 //     does not need to coordinate with concurrent storeVectorToDisk
 //     callers.
 //
@@ -67,7 +67,7 @@
 // are added now so that Phase 6 of the plan can drop the engine's
 // exclusive without breaking storage thread-safety.
 
-namespace lsm_vec
+namespace astervec
 {
 using node_id_t = std::uint64_t;
 static constexpr node_id_t k_invalid_node_id =
@@ -421,7 +421,7 @@ private:
     // idToSlotInPage_ arrays above. The on-disk data file is shared across
     // both ranges so allocateSlotForSection can co-locate a direct vector
     // and an update vector on the same 4 KB page (E3 — locality).
-    // Update-id deletion is tracked by LSMVec::tombstoned_internal_ids_,
+    // Update-id deletion is tracked by AsterVec::tombstoned_internal_ids_,
     // not here, so no per-update-id deleted_flag is stored.
     struct UpdateLoc {
         int64_t  page = -1;
@@ -567,7 +567,7 @@ private:
             if (static_cast<size_t>(id) >= totalVectors_) return false;
             return deletedFlags_[static_cast<size_t>(id)] != 0;
         }
-        return false;  // LSMVec owns tombstone state for update ids
+        return false;  // AsterVec owns tombstone state for update ids
     }
 
     // For write paths: ensure dense storage is large enough for direct ids.
@@ -612,7 +612,7 @@ private:
             && (deletedFlags_[static_cast<size_t>(id)] != 0) != deleted) {
             writeDeleteFlag(id, deleted);
         }
-        // update ids: no-op (LSMVec owns the canonical tombstone state)
+        // update ids: no-op (AsterVec owns the canonical tombstone state)
     }
 
     // Page cache (FIFO) in units of full pages (4KB each).
@@ -622,7 +622,7 @@ private:
     // and evictions take unique_lock. Disk I/O (pread) is performed
     // outside any lock — concurrent readers may pread the same page on
     // miss, but only one wins the insertion (double-check after taking
-    // unique_lock). Writers from the LSMVec write path are protected by
+    // unique_lock). Writers from the AsterVec write path are protected by
     // the external per-index RWLock, so they cannot race with readers
     // here.
     size_t maxCachedPages_;
@@ -1395,11 +1395,11 @@ public:
     void deleteVector(node_id_t id) override
     {
         // C6 / C5a: Delete is a no-op at the storage layer. Tombstoning lives
-        // in LSMVec::tombstoned_internal_ids_; the slot stays bound so
+        // in AsterVec::tombstoned_internal_ids_; the slot stays bound so
         // tombstoned nodes can still be read for routing (tombstone-as-router).
         // The pre-C5a slot-freelist (sectionFreeSlots_) and the deletedFlags_
         // bit-write are intentionally dropped: V1 has no slot reuse and the
-        // canonical "is this id deleted?" state is owned by LSMVec.
+        // canonical "is this id deleted?" state is owned by AsterVec.
         (void)id;
     }
 

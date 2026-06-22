@@ -1,8 +1,8 @@
 #include "doctest.h"
 #include "metadata_store.h"
 #include "metadata_store_fixture.h"
-using namespace lsm_vec;
-using namespace lsm_vec::test;
+using namespace astervec;
+using namespace astervec::test;
 
 TEST_CASE("Update: merge-patch adds new fields") {
     TempDB t;

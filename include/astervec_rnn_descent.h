@@ -4,9 +4,9 @@
 #include <mutex>
 #include <vector>
 
-#include "lsm_vec_db.h"  // DistanceMetric
+#include "astervec_db.h"  // DistanceMetric
 
-namespace lsm_vec::rnn_descent {
+namespace astervec::rnn_descent {
 
 struct Neighbor {
     int id;
@@ -36,7 +36,7 @@ struct Nhood {
 };
 
 // Distance computer over a flat contiguous float* blob of n * dim
-// values, indexed by int in [0, n). Wraps lsm_vec::distance kernels
+// values, indexed by int in [0, n). Wraps astervec::distance kernels
 // (SIMD-accelerated). For cosine, norms are precomputed on construction.
 class FlatStorageDistance {
 public:
@@ -97,4 +97,4 @@ private:
     void insert_nn(int id, int nn_id, float distance, bool flag);
 };
 
-}  // namespace lsm_vec::rnn_descent
+}  // namespace astervec::rnn_descent

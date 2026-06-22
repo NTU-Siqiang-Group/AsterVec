@@ -1,6 +1,6 @@
 #include "doctest.h"
 #include "metadata.h"
-using namespace lsm_vec::metadata;
+using namespace astervec::metadata;
 
 static Predicate inLeaf(Predicate::Kind k, FieldPath path, std::vector<Json> vals) {
     Predicate p;

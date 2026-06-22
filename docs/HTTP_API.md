@@ -1,12 +1,12 @@
-# LSM-Vec HTTP API
+# AsterVec HTTP API
 
-LSM-Vec is primarily an **embeddable** vector storage engine (see the
+AsterVec is primarily an **embeddable** vector storage engine (see the
 [README](../README.md) and [API_REFERENCE.md](API_REFERENCE.md)). For cases
 where you'd rather talk to it over the network, the repo also builds a small
-standalone REST server, **`lsm_vec_http`** — a thin service wrapper around the
+standalone REST server, **`astervec_http`** — a thin service wrapper around the
 same engine. This document is its reference.
 
-> **Auth & deployment.** `lsm_vec_http` is a **single-tenant, single-process**
+> **Auth & deployment.** `astervec_http` is a **single-tenant, single-process**
 > server and does **not** authenticate requests itself. Run it behind your own
 > reverse proxy (e.g. nginx/Caddy) if you need TLS, an API key, or rate limiting.
 > The examples below talk to a local server directly. `/health` and `/ready` are
@@ -16,14 +16,14 @@ same engine. This document is its reference.
 
 ```bash
 # From a source build (after `make aster && make`; the HTTP target is on by default):
-cmake --build build --target lsm_vec_http -j
-LSMVEC_DATA_DIR=./data LSMVEC_PORT=8000 ./build/bin/lsm_vec_http
+cmake --build build --target astervec_http -j
+ASTERVEC_DATA_DIR=./data ASTERVEC_PORT=8000 ./build/bin/astervec_http
 
 # Or via Docker:
-docker run -d --name lsmvec -p 8000:8000 -v "$(pwd)/data:/data" lsmvec:latest
+docker run -d --name astervec -p 8000:8000 -v "$(pwd)/data:/data" astervec:latest
 ```
 
-The dimension can be fixed at startup with `LSMVEC_DIM`, or left unset and
+The dimension can be fixed at startup with `ASTERVEC_DIM`, or left unset and
 created later over the API with `PUT /v1/index`. See
 [Configuration](#configuration) for all knobs.
 
@@ -66,7 +66,7 @@ curl -s http://localhost:8000/health   # {"status":"ok"}  (always 200)
 curl -s http://localhost:8000/ready    # 200 once an index exists; 503 before
 ```
 
-`/ready` returns `503` until an index has been created (via `LSMVEC_DIM` at
+`/ready` returns `503` until an index has been created (via `ASTERVEC_DIM` at
 startup or `PUT /v1/index`). This is what a container healthcheck / load balancer
 should poll.
 
@@ -148,7 +148,7 @@ curl -s http://localhost:8000/v1/search \
 
 - `k` (default 10): neighbors to return.
 - `ef_search` (optional): search breadth; higher = better recall, slower
-  (default = the server's `LSMVEC_EFS_DEFAULT`, 128).
+  (default = the server's `ASTERVEC_EFS_DEFAULT`, 128).
 - `filter` (optional): metadata predicate (see [Filters](#metadata-filters)).
 - `max_scan_candidates` (optional): cap on candidates visited when a filter is
   set; `0` = auto (`k * 50`).
@@ -184,9 +184,9 @@ The body is a raw little-endian **float32** blob (not JSON); shape goes in heade
 ```
 POST /v1/build/bulk
 Content-Type: application/octet-stream
-X-LSMVec-N: 100000
-X-LSMVec-Dim: 128
-X-LSMVec-Threads: 4        (optional; default 1)
+X-AsterVec-N: 100000
+X-AsterVec-Dim: 128
+X-AsterVec-Threads: 4        (optional; default 1)
 
 <N * Dim * 4 bytes of float32>
 [optional JSON tail: an array of N payload objects/nulls, mapped to ids 0..n-1]
@@ -228,20 +228,20 @@ All server settings come from environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LSMVEC_PORT` | `8000` | HTTP listen port |
-| `LSMVEC_DATA_DIR` | `/data` | Data directory |
-| `LSMVEC_HTTP_THREADS` | `1` | Request worker threads |
-| `LSMVEC_DIM` | `0` | Index dimension (`0` = set later via `PUT /v1/index`) |
-| `LSMVEC_METRIC` | `l2` | `l2` or `cosine` |
-| `LSMVEC_M` | `8` | HNSW M (links per node, layer 0) |
-| `LSMVEC_MMAX` | `24` | HNSW max neighbors, upper layers |
-| `LSMVEC_EFC` | `32` | HNSW ef_construction (build quality) |
-| `LSMVEC_EFS_DEFAULT` | `128` | Default ef_search for queries |
-| `LSMVEC_EDGE_CACHE_SIZE` | `100000` | In-memory graph edge cache |
-| `LSMVEC_VEC_FILE_CAPACITY` | `1000000` | Initial vector-file capacity (auto-expands) |
-| `LSMVEC_PAGED_MAX_CACHED_PAGES` | `8192` | Page cache size (4 KB pages) |
-| `LSMVEC_ENABLE_STATS` | `false` | Collect internal timing/IO stats |
-| `LSMVEC_LOG_LEVEL` | `info` | `trace`/`debug`/`info`/`warn`/`error` |
+| `ASTERVEC_PORT` | `8000` | HTTP listen port |
+| `ASTERVEC_DATA_DIR` | `/data` | Data directory |
+| `ASTERVEC_HTTP_THREADS` | `1` | Request worker threads |
+| `ASTERVEC_DIM` | `0` | Index dimension (`0` = set later via `PUT /v1/index`) |
+| `ASTERVEC_METRIC` | `l2` | `l2` or `cosine` |
+| `ASTERVEC_M` | `8` | HNSW M (links per node, layer 0) |
+| `ASTERVEC_MMAX` | `24` | HNSW max neighbors, upper layers |
+| `ASTERVEC_EFC` | `32` | HNSW ef_construction (build quality) |
+| `ASTERVEC_EFS_DEFAULT` | `128` | Default ef_search for queries |
+| `ASTERVEC_EDGE_CACHE_SIZE` | `100000` | In-memory graph edge cache |
+| `ASTERVEC_VEC_FILE_CAPACITY` | `1000000` | Initial vector-file capacity (auto-expands) |
+| `ASTERVEC_PAGED_MAX_CACHED_PAGES` | `8192` | Page cache size (4 KB pages) |
+| `ASTERVEC_ENABLE_STATS` | `false` | Collect internal timing/IO stats |
+| `ASTERVEC_LOG_LEVEL` | `info` | `trace`/`debug`/`info`/`warn`/`error` |
 
 ## Error codes
 

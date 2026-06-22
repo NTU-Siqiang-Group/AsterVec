@@ -63,9 +63,9 @@ __pycache__/
 .venv/
 
 # Pre-built static libs lying around
-lib/liblsmvec.a
+lib/libastervec.a
 libmalloc_shim.*
 malloc_shim.*
 
 # Test binary scratch
-test/lsm_vec_test
+test/astervec_test

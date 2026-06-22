@@ -5,7 +5,7 @@
 #include <iosfwd>
 #include <vector>
 
-namespace lsm_vec {
+namespace astervec {
 
 // Minimal additive Bloom filter sized for an expected item count and a target
 // false-positive rate. Does not support removal. On overflow, call reset() with
@@ -53,4 +53,4 @@ class BloomFilter {
     void allocate_for(std::size_t bit_count);
 };
 
-}  // namespace lsm_vec
+}  // namespace astervec

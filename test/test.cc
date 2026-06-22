@@ -2,7 +2,7 @@
 #include <vector>
 #include <string>
 #include "utils.h"
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 #include "config.h"
 
 
@@ -20,7 +20,7 @@ int main(int argc, char* argv[])
     int vectorDim = getdim(config.input_file_path);
     std::cout << "Vector dimension: " << vectorDim << "\n";
 
-    lsm_vec::LSMVecDBOptions options;
+    astervec::AsterVecDBOptions options;
     options.dim = vectorDim;
     options.m = config.M;
     options.m_max = config.Mmax;
@@ -37,10 +37,10 @@ int main(int argc, char* argv[])
     options.edge_cache_size = config.edge_cache_size;
     options.vector_file_path = config.vector_file_path;
 
-    std::unique_ptr<lsm_vec::LSMVecDB> db;
-    auto open_status = lsm_vec::LSMVecDB::Open(config.db_path, options, &db);
+    std::unique_ptr<astervec::AsterVecDB> db;
+    auto open_status = astervec::AsterVecDB::Open(config.db_path, options, &db);
     if (!open_status.ok()) {
-        std::cerr << "Failed to open LSMVecDB: " << open_status.ToString() << "\n";
+        std::cerr << "Failed to open AsterVecDB: " << open_status.ToString() << "\n";
         return 1;
     }
 
@@ -65,13 +65,13 @@ int main(int argc, char* argv[])
 
     return 0;
     
-    // This part is for testing close and reopen of LSMVecDB 
+    // This part is for testing close and reopen of AsterVecDB 
     db->Close();
     db.reset();
     options.reinit = false;
-    open_status = lsm_vec::LSMVecDB::Open(config.db_path, options, &db);
+    open_status = astervec::AsterVecDB::Open(config.db_path, options, &db);
     if (!open_status.ok()) {
-        std::cerr << "Failed to open LSMVecDB: " << open_status.ToString() << "\n";
+        std::cerr << "Failed to open AsterVecDB: " << open_status.ToString() << "\n";
         return 1;
     }
     std::cout << "Querying and comparing with ground truth after reopen " << config.query_file_path << std::endl;

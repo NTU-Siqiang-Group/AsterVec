@@ -19,19 +19,19 @@
 #include "cgroup_monitor.h"
 #include "disk_vector.h"
 #include "id_types.h"
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 #include "metadata.h"
 #include "statistics.h"
 #include "logger.h"
 
-namespace lsm_vec
+namespace astervec
 {
 using namespace ROCKSDB_NAMESPACE;
 
-// Thread-safety contract for LSMVec
+// Thread-safety contract for AsterVec
 // =================================
 //
-// LSMVec assumes the caller serializes read-vs-write coordination
+// AsterVec assumes the caller serializes read-vs-write coordination
 // through an external reader-writer lock (e.g. a per-index
 // std::shared_mutex held by the embedding application). State that
 // must remain consistent between concurrent SHARED-lock holders
@@ -60,7 +60,7 @@ using namespace ROCKSDB_NAMESPACE;
 //     - close
 //
 // LSMSearchIterator is special: its constructor (called via
-// LSMVecDB::NewSearchIterator) and Next() method each acquire the
+// AsterVecDB::NewSearchIterator) and Next() method each acquire the
 // SHARED lock for the duration of one call. The lock is NOT held
 // across calls, so iterator-private state (visited_, candidates_,
 // yield_queue_) may observe a graph that has changed between calls.
@@ -182,7 +182,7 @@ using namespace ROCKSDB_NAMESPACE;
         std::atomic<size_t> invalidations_{0};
     };
 
-    // Per-search scratch state. Previously these were members of LSMVec
+    // Per-search scratch state. Previously these were members of AsterVec
     // and reused across calls; that prevents two concurrent searches on
     // the same index from running safely. The caller owns one instance
     // (typically as a thread_local in the worker thread) and passes it
@@ -198,7 +198,7 @@ using namespace ROCKSDB_NAMESPACE;
         uint32_t visited_version = 0;
     };
 
-    class LSMVec
+    class AsterVec
     {
     public:
         // 20260516_compact_neighbors: per-Node layer→neighbors store.
@@ -273,15 +273,15 @@ using namespace ROCKSDB_NAMESPACE;
             use_heuristic_neighbor_selection_ = useHeuristic;
         }
 
-        LSMVec(const std::string& db_path,
-               const LSMVecDBOptions& options,
+        AsterVec(const std::string& db_path,
+               const AsterVecDBOptions& options,
                std::ostream &outFile);
 
         Status SerializeMetadata(std::ostream& out) const;
         Status DeserializeMetadata(std::istream& in);
         // Backward-compatible accessors: now backed by tombstoned_internal_ids_.
         // node_id_t and internal_id_t are both aliases for uint64_t, so callers
-        // (LSMVecDB, persistence) compile unchanged.
+        // (AsterVecDB, persistence) compile unchanged.
         // Phase 3: returning a reference to a mutex-protected set is unsafe
         // for concurrent callers; persistence layer (the only caller) runs
         // under the engine's lifecycle exclusive gate so the reference is
@@ -313,7 +313,7 @@ using namespace ROCKSDB_NAMESPACE;
                        const BulkBuildOptions& opts);
 
         // True iff the index has never had a node published (no
-        // Insert / BulkBuild has succeeded). Used by LSMVecDB::BulkBuild
+        // Insert / BulkBuild has succeeded). Used by AsterVecDB::BulkBuild
         // to enforce the initial-load-only precondition.
         bool isEmpty() const {
             return entry_point_.load(std::memory_order_acquire)
@@ -337,11 +337,11 @@ using namespace ROCKSDB_NAMESPACE;
         std::string vector_file_path_;
         int vector_dim_ = 0;
         std::unique_ptr<IVectorStorage> vector_storage_;
-        LSMVecDBOptions db_options_;
+        AsterVecDBOptions db_options_;
 
         // ----------------------------------------------------------------
         // Delete / update primitives (V1; see docs/DELETE_DESIGN.md §4-§5).
-        // Public so LSMVecDB can drive the lifecycle and tests can verify
+        // Public so AsterVecDB can drive the lifecycle and tests can verify
         // the resolvers in isolation. Read-only accessors below for stats.
         // ----------------------------------------------------------------
         internal_id_t resolve_internal(real_id_t r) const;
@@ -364,7 +364,7 @@ using namespace ROCKSDB_NAMESPACE;
         void          record_update_mapping(real_id_t r, internal_id_t i);
 
         // A4: Drop both forward and reverse sparse-map entries for real_id.
-        // Used by LSMVecDB::Delete so future resolve_internal(r) returns
+        // Used by AsterVecDB::Delete so future resolve_internal(r) returns
         // identity. Bloom-filter bit stays set (FP falls through harmlessly).
         void          forget_update_mapping(real_id_t r);
 
@@ -567,10 +567,10 @@ using namespace ROCKSDB_NAMESPACE;
         }
 
         // RNG removed — Phase 4a (§5.1.5) replaced shared mt19937 with
-        // thread_local in LSMVec::randomLevel().
+        // thread_local in AsterVec::randomLevel().
         //
         // Phase 4b (§5.1.3): independent atomics on entry_point_ and
-        // max_layer_. Greedy descent at src/lsm_vec_index.cc is graceful
+        // max_layer_. Greedy descent at src/astervec_index.cc is graceful
         // (breaks on missing node or missing layer), so transient
         // (NEW, OLD) / (OLD, NEW) observations are absorbed without a
         // paired-publish primitive. First-insert + promotion use CAS.
@@ -611,9 +611,9 @@ using namespace ROCKSDB_NAMESPACE;
         bool enable_batch_read_ = true;
 
         // Per-search scratch (visited map, batch read buffer, version
-        // counter) used to live as members of LSMVec and was reused across
+        // counter) used to live as members of AsterVec and was reused across
         // calls. That made the search path racy under concurrent callers.
-        // Scratch now lives in SearchScratch (defined above the LSMVec
+        // Scratch now lives in SearchScratch (defined above the AsterVec
         // class) and is passed by reference into searchLayer; callers own
         // it (worker threads typically declare it as thread_local).
 

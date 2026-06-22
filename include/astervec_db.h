@@ -22,7 +22,7 @@ class DB;
 class ColumnFamilyHandle;
 }  // namespace ROCKSDB_NAMESPACE
 
-namespace lsm_vec
+namespace astervec
 {
 class MetadataStore;  // forward declaration
 using Status = ROCKSDB_NAMESPACE::Status;
@@ -66,7 +66,7 @@ private:
     size_t size_;
 };
 
-struct LSMVecDBOptions {
+struct AsterVecDBOptions {
     int dim = 0;
     DistanceMetric metric = DistanceMetric::kL2;
     int m = 8;
@@ -99,13 +99,13 @@ struct SearchResult {
     float distance;
 };
 
-class LSMVecDB {
+class AsterVecDB {
 public:
-    ~LSMVecDB();
+    ~AsterVecDB();
 
     static Status Open(const std::string& path,
-                       const LSMVecDBOptions& opts,
-                       std::unique_ptr<LSMVecDB>* db);
+                       const AsterVecDBOptions& opts,
+                       std::unique_ptr<AsterVecDB>* db);
     Status Close();
 
     Status Insert(node_id_t id, Span<float> vec);
@@ -189,15 +189,15 @@ public:
     // approximate count / Postgres reltuples). 0 on a fresh or wiped index.
     std::size_t VectorCount() const;
 
-    // Test-only accessor: exposes the underlying LSMVec so unit tests can
+    // Test-only accessor: exposes the underlying AsterVec so unit tests can
     // exercise low-level resolvers (resolve_internal / resolve_real / is_alive).
     // Not intended for production use.
-    class LSMVec* index_for_test() { return index_.get(); }
+    class AsterVec* index_for_test() { return index_.get(); }
 
 private:
-    LSMVecDB(const std::string& db_path,
-             const LSMVecDBOptions& options,
-             std::unique_ptr<class LSMVec> index,
+    AsterVecDB(const std::string& db_path,
+             const AsterVecDBOptions& options,
+             std::unique_ptr<class AsterVec> index,
              std::unique_ptr<std::ostream> log_stream);
 
     Status ValidateVector(Span<float> vec) const;
@@ -213,9 +213,9 @@ private:
                           std::string_view metadata_json);
 
     std::string db_path_;
-    LSMVecDBOptions options_;
+    AsterVecDBOptions options_;
     std::unique_ptr<std::ostream> log_stream_;
-    std::unique_ptr<class LSMVec> index_;
+    std::unique_ptr<class AsterVec> index_;
 
     std::unique_ptr<ROCKSDB_NAMESPACE::DB>  metadata_db_;
     ROCKSDB_NAMESPACE::ColumnFamilyHandle*  metadata_cf_ = nullptr;
@@ -250,4 +250,4 @@ private:
         return real_id_locks_[h % kRealIdLockShards];
     }
 };
-} // namespace lsm_vec
+} // namespace astervec

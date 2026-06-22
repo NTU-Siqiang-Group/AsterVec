@@ -5,20 +5,20 @@ import tempfile
 import numpy as np
 import pytest
 
-import lsm_vec
+import astervec
 
 
 @pytest.fixture
 def fresh_db():
-    path = tempfile.mkdtemp(prefix="lsmvec_py_md_")
-    opts = lsm_vec.LSMVecDBOptions()
+    path = tempfile.mkdtemp(prefix="astervec_py_md_")
+    opts = astervec.AsterVecDBOptions()
     opts.dim = 8
     opts.m = 8
     opts.m_max = 16
     opts.ef_construction = 32
     opts.vec_file_capacity = 1000
     opts.vector_file_path = os.path.join(path, "vecs.bin")
-    db = lsm_vec.LSMVecDB.open(path, opts)
+    db = astervec.AsterVecDB.open(path, opts)
     try:
         yield db, path
     finally:

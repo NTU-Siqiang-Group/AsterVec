@@ -17,7 +17,7 @@
 #include <string_view>
 #include <type_traits>
 
-namespace lsm_vec {
+namespace astervec {
 
 enum class LogSeverity : uint8_t {
     DEBUG = 0,
@@ -409,12 +409,12 @@ inline void initializeLogger(LogChoice choice = LogChoice::STDERR,
     }
 }
 
-} // namespace lsm_vec
+} // namespace astervec
 
-// Logging macros: allow LOG(INFO) instead of LOG(lsm_vec::LogSeverity::INFO).
+// Logging macros: allow LOG(INFO) instead of LOG(astervec::LogSeverity::INFO).
 #define LOG(severity) \
-    if (!::lsm_vec::isLogEnabled(::lsm_vec::LogSeverity::severity)) ; \
-    else ::lsm_vec::LogItem(::lsm_vec::LogSeverity::severity, __FILE__, __LINE__, __func__, ::lsm_vec::getGlobalLogger())
+    if (!::astervec::isLogEnabled(::astervec::LogSeverity::severity)) ; \
+    else ::astervec::LogItem(::astervec::LogSeverity::severity, __FILE__, __LINE__, __func__, ::astervec::getGlobalLogger())
 
 #define CHECK(condition) \
     do { \
@@ -446,7 +446,7 @@ Usage example:
 #include "Logger.h"
 
 int main() {
-    lsm_vec::initializeLogger(lsm_vec::LogChoice::STDERR, nullptr, lsm_vec::LogSeverity::INFO);
+    astervec::initializeLogger(astervec::LogChoice::STDERR, nullptr, astervec::LogSeverity::INFO);
 
     LOG(INFO) << "Hello";
     DLOG(DEBUG) << "Debug only in non-release build";

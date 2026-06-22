@@ -3,7 +3,7 @@
 #include <cctype>
 #include <string>
 
-namespace lsm_vec::metadata {
+namespace astervec::metadata {
 
 namespace {
 
@@ -300,4 +300,4 @@ Status ParsePredicate(std::string_view json_str, Predicate* out) {
     return ParseObject(parsed, out, 0);
 }
 
-}  // namespace lsm_vec::metadata
+}  // namespace astervec::metadata

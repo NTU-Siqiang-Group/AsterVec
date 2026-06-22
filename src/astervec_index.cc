@@ -1,4 +1,4 @@
-#include "lsm_vec_index.h"
+#include "astervec_index.h"
 #include "disk_vector.h"
 #include "distance.h"
 #include "metadata_store.h"
@@ -81,12 +81,12 @@ float gaussian(  // r.v. from Gaussian(mean, sigma)
     return x;
 }
 
-namespace lsm_vec
+namespace astervec
 {
 using namespace ROCKSDB_NAMESPACE;
 
-    LSMVec::LSMVec(const std::string& db_path,
-                   const LSMVecDBOptions& options,
+    AsterVec::AsterVec(const std::string& db_path,
+                   const AsterVecDBOptions& options,
                    std::ostream &outFile)
         : vector_dim_(options.dim),
           db_options_(options),
@@ -106,7 +106,7 @@ using namespace ROCKSDB_NAMESPACE;
         }
 
         // db_options_.random_seed is now consumed by the thread_local
-        // gen inside LSMVec::randomLevel() on first use per thread.
+        // gen inside AsterVec::randomLevel() on first use per thread.
 
         if (db_options_.vector_file_path.empty()) {
             db_options_.vector_file_path = db_path + "/vector.log";
@@ -131,13 +131,13 @@ using namespace ROCKSDB_NAMESPACE;
         // Optional: open directly in Direct I/O mode (skip the buffered phase
         // and the adaptive escalation). For known-tight-memory deployments and
         // as the full-direct baseline. Default is buffered + adaptive escalation.
-        if (std::getenv("LSMVEC_DIO_FROM_START")) {
+        if (std::getenv("ASTERVEC_DIO_FROM_START")) {
             options_.use_direct_reads = true;
             options_.use_direct_io_for_flush_and_compaction = true;
         }
 
         // Aster minimal_mode=true disables MorrisCounter degree-tracking and
-        // in-neighbor maintenance. LSM-Vec doesn't use either, and minimal_mode
+        // in-neighbor maintenance. AsterVec doesn't use either, and minimal_mode
         // also makes the graph tolerate u64 ids with bit 63 set (our update_id
         // namespace) without the counter array trying to allocate ~exabytes.
         // Requires Aster's feature/minimal-mode branch.
@@ -218,7 +218,7 @@ using namespace ROCKSDB_NAMESPACE;
     }
     } // namespace
 
-    Status LSMVec::SerializeMetadata(std::ostream& out) const
+    Status AsterVec::SerializeMetadata(std::ostream& out) const
     {
         if (!out) {
             return Status::IOError("metadata output stream is not ready");
@@ -333,7 +333,7 @@ using namespace ROCKSDB_NAMESPACE;
         return Status::OK();
     }
 
-    Status LSMVec::DeserializeMetadata(std::istream& in)
+    Status AsterVec::DeserializeMetadata(std::istream& in)
     {
         if (!in) {
             return Status::IOError("metadata input stream is not ready");
@@ -487,7 +487,7 @@ using namespace ROCKSDB_NAMESPACE;
     // 20260516_upper_layer_sq8: scalar quantize the float point to a (min, max,
     // uint8[dim]) form. Destructive — writes q8_data/q_min/q_max and clears
     // point. Idempotent: no-op if point is already empty.
-    void LSMVec::quantizeNodePoint(Node& n)
+    void AsterVec::quantizeNodePoint(Node& n)
     {
         if (n.point.empty()) return;
         const size_t d = n.point.size();
@@ -510,7 +510,7 @@ using namespace ROCKSDB_NAMESPACE;
         std::vector<float>{}.swap(n.point);   // free the float buffer
     }
 
-    bool LSMVec::dequantizeNodePoint(const Node& n, std::vector<float>& out) const
+    bool AsterVec::dequantizeNodePoint(const Node& n, std::vector<float>& out) const
     {
         if (n.q8_data.empty()) return false;
         const size_t d = n.q8_data.size();
@@ -522,7 +522,7 @@ using namespace ROCKSDB_NAMESPACE;
         return true;
     }
 
-    Span<const float> LSMVec::nodePointView(const Node& n,
+    Span<const float> AsterVec::nodePointView(const Node& n,
                                               std::vector<float>& scratch) const
     {
         if (!n.point.empty()) {
@@ -547,13 +547,13 @@ using namespace ROCKSDB_NAMESPACE;
     // Seeded once per thread from std::random_device. The pre-refactor
     // db_options_.random_seed feature (used by some single-threaded
     // tests for deterministic levels) is preserved on the FIRST thread
-    // that calls randomLevel for this LSMVec instance: that thread's
+    // that calls randomLevel for this AsterVec instance: that thread's
     // gen is reseeded with the configured value. Subsequent threads use
     // independent random seeds. For multi-threaded tests, determinism
     // of HNSW levels is no longer guaranteed by random_seed; recall is
     // robust to small RNG variation and the metric the tests track is
     // recall@k, not exact graph topology.
-    int LSMVec::randomLevel()
+    int AsterVec::randomLevel()
     {
         thread_local std::mt19937 gen{std::random_device{}()};
         thread_local bool seeded_from_opts = false;
@@ -568,7 +568,7 @@ using namespace ROCKSDB_NAMESPACE;
         return (int)r;
     }
 
-    float LSMVec::computeDistance(Span<const float> vectorA,
+    float AsterVec::computeDistance(Span<const float> vectorA,
                                   Span<const float> vectorB) const
     {
         if (vectorA.size() != vectorB.size())
@@ -583,7 +583,7 @@ using namespace ROCKSDB_NAMESPACE;
             vectorA.size());
     }
 
-    void LSMVec::storeVectorWithStats(node_id_t id,
+    void AsterVec::storeVectorWithStats(node_id_t id,
                                       const std::vector<float>& vec,
                                       node_id_t sectionKey)
     {
@@ -599,7 +599,7 @@ using namespace ROCKSDB_NAMESPACE;
         stats.addCount(1, stats.vec_write_count);
     }
 
-    void LSMVec::readVectorWithStats(node_id_t id,
+    void AsterVec::readVectorWithStats(node_id_t id,
                                      std::vector<float>& vec)
     {
         auto timer = stats.startTimer();
@@ -614,10 +614,10 @@ using namespace ROCKSDB_NAMESPACE;
         stats.addCount(1, stats.vec_read_count);
     }
 
-    void LSMVec::insertNode(node_id_t nodeId, const std::vector<float> &vector)
+    void AsterVec::insertNode(node_id_t nodeId, const std::vector<float> &vector)
     {
         // C5a: removed deleted_ids_.erase(nodeId). Re-insert of a tombstoned id
-        // is now routed by LSMVecDB::Insert (C5b) to allocate a fresh
+        // is now routed by AsterVecDB::Insert (C5b) to allocate a fresh
         // internal_id via Update semantics; this function never sees a
         // tombstoned nodeId in the new design.
         //
@@ -907,17 +907,17 @@ using namespace ROCKSDB_NAMESPACE;
     // vector_storage_->deleteVector call); deleted nodes remain valid routing
     // infrastructure per docs/DELETE_DESIGN.md §1.3. Search filters them out
     // at the result-emission step (see knnSearchK below).
-    Status LSMVec::deleteNode(node_id_t id)
+    Status AsterVec::deleteNode(node_id_t id)
     {
         tombstone(id);
         return Status::OK();
     }
 
-    // updateNode was removed in C5a. Update is now composed at the LSMVecDB
+    // updateNode was removed in C5a. Update is now composed at the AsterVecDB
     // layer (C5b): allocate a fresh internal_id, insertNode at it, tombstone
     // the old internal_id. See docs/DELETE_DESIGN.md §5.2.
 
-    Status LSMVec::getNodeVector(node_id_t id, std::vector<float>* out)
+    Status AsterVec::getNodeVector(node_id_t id, std::vector<float>* out)
     {
         if (!out) {
             return Status::InvalidArgument("output vector must not be null");
@@ -938,7 +938,7 @@ using namespace ROCKSDB_NAMESPACE;
         return Status::OK();
     }
 
-    std::vector<SearchResult> LSMVec::knnSearchK(const std::vector<float>& query, int k, int ef_search)
+    std::vector<SearchResult> AsterVec::knnSearchK(const std::vector<float>& query, int k, int ef_search)
     {
         // Phase 4b: load entry_point_ once with acquire. If invalid
         // (no first node yet), return empty.
@@ -988,7 +988,7 @@ using namespace ROCKSDB_NAMESPACE;
         return filtered;
     }
 
-    std::vector<SearchResult> LSMVec::knnSearchKFiltered(
+    std::vector<SearchResult> AsterVec::knnSearchKFiltered(
         const std::vector<float>& query,
         int k,
         int ef_search,
@@ -1016,7 +1016,7 @@ using namespace ROCKSDB_NAMESPACE;
     }
 
     // Links neighbors for upper layers stored in memory
-    void LSMVec::linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer)
+    void AsterVec::linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer)
     {
         // Phase 4d: hold nodes_mu_ shared while we hold iterators
         // into nodes_; the iterators are stable as long as no writer
@@ -1058,7 +1058,7 @@ using namespace ROCKSDB_NAMESPACE;
         }
     }
 
-    void LSMVec::linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds)
+    void AsterVec::linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds)
     {
         // All forward + reverse edges go through a single AddEdgeBatch:
         // ONE db_->Write, ONE WAL flush, ONE RocksDB WriteThread acquisition
@@ -1091,7 +1091,7 @@ using namespace ROCKSDB_NAMESPACE;
         }
     }
 
-    std::vector<node_id_t> LSMVec::getEdgesCached(node_id_t id) {
+    std::vector<node_id_t> AsterVec::getEdgesCached(node_id_t id) {
         if (edge_cache_) {
             std::vector<node_id_t> cached;
             if (edge_cache_->get(id, &cached)) return cached;
@@ -1112,7 +1112,7 @@ using namespace ROCKSDB_NAMESPACE;
         return result;
     }
 
-    std::vector<node_id_t> LSMVec::selectNeighbors(
+    std::vector<node_id_t> AsterVec::selectNeighbors(
         const std::vector<float> &vector,
         const std::vector<node_id_t> &candidateIds,
         int maxNeighbors,
@@ -1126,7 +1126,7 @@ using namespace ROCKSDB_NAMESPACE;
     }
 
     // Selects neighbors based on distance and pruning logic
-    std::vector<node_id_t> LSMVec::selectNeighborsSimple(const std::vector<float> &vector, const std::vector<node_id_t> &candidateIds, int maxNeighbors, int layer)
+    std::vector<node_id_t> AsterVec::selectNeighborsSimple(const std::vector<float> &vector, const std::vector<node_id_t> &candidateIds, int maxNeighbors, int layer)
     {
         if (candidateIds.size() <= static_cast<size_t>(maxNeighbors))
         {
@@ -1185,7 +1185,7 @@ using namespace ROCKSDB_NAMESPACE;
         }
     }
 
-    std::vector<node_id_t> LSMVec::selectNeighborsHeuristic1(
+    std::vector<node_id_t> AsterVec::selectNeighborsHeuristic1(
         const std::vector<float> &vector,
         const std::vector<node_id_t> &candidateIds,
         int maxNeighbors,
@@ -1302,7 +1302,7 @@ using namespace ROCKSDB_NAMESPACE;
         return selected;
     }
 
-    std::vector<node_id_t> LSMVec::selectNeighborsHeuristic2(
+    std::vector<node_id_t> AsterVec::selectNeighborsHeuristic2(
         const std::vector<float> &vector,
         const std::vector<node_id_t> &candidateIds,
         int maxNeighbors,
@@ -1411,7 +1411,7 @@ using namespace ROCKSDB_NAMESPACE;
 
     // --- SearchResult overloads (fast path: skip redundant distance computation) ---
 
-    std::vector<node_id_t> LSMVec::selectNeighbors(
+    std::vector<node_id_t> AsterVec::selectNeighbors(
         const std::vector<float>& vector,
         const std::vector<SearchResult>& candidates,
         int maxNeighbors,
@@ -1433,7 +1433,7 @@ using namespace ROCKSDB_NAMESPACE;
         return selectNeighborsHeuristic2(vector, candidates, maxNeighbors, layer);
     }
 
-    std::vector<node_id_t> LSMVec::selectNeighborsHeuristic2(
+    std::vector<node_id_t> AsterVec::selectNeighborsHeuristic2(
         const std::vector<float>& vector,
         const std::vector<SearchResult>& candidates,
         int maxNeighbors,
@@ -1527,7 +1527,7 @@ using namespace ROCKSDB_NAMESPACE;
         return selected;
     }
 
-    node_id_t LSMVec::greedySearchUpperLayer(const std::vector<float>& query,
+    node_id_t AsterVec::greedySearchUpperLayer(const std::vector<float>& query,
                                                node_id_t entryPoint, int layer)
     {
         // R2.b / internal review: locks held only briefly to fetch a Node*
@@ -1594,7 +1594,7 @@ using namespace ROCKSDB_NAMESPACE;
         return current;
     }
 
-    std::vector<SearchResult> LSMVec::searchLayer(const std::vector<float>& queryVector,
+    std::vector<SearchResult> AsterVec::searchLayer(const std::vector<float>& queryVector,
                                                   node_id_t entryPointId,
                                                   int efSearch,
                                                   int layer,
@@ -1822,7 +1822,7 @@ using namespace ROCKSDB_NAMESPACE;
         return result;
     }
 
-    std::vector<SearchResult> LSMVec::searchLayer(
+    std::vector<SearchResult> AsterVec::searchLayer(
         const std::vector<float>& queryVector,
         node_id_t entryPointId,
         int efSearch,
@@ -1967,7 +1967,7 @@ using namespace ROCKSDB_NAMESPACE;
     }
 
 
-    // std::vector<node_id_t> LSMVec::searchLayer(const std::vector<float> &queryPoint, node_id_t entryPoint, int ef, int layer)
+    // std::vector<node_id_t> AsterVec::searchLayer(const std::vector<float> &queryPoint, node_id_t entryPoint, int ef, int layer)
     // {
     //     // set of visited elements
     //     std::unordered_set<node_id_t> visited;
@@ -2125,7 +2125,7 @@ using namespace ROCKSDB_NAMESPACE;
     // }
 
     // Performs a greedy search to find the closest neighbor at a specific layer
-    node_id_t LSMVec::knnSearch(const std::vector<float> &queryVector)
+    node_id_t AsterVec::knnSearch(const std::vector<float> &queryVector)
     {
         thread_local SearchScratch scratch;
         auto search_timer = stats.startTimer();
@@ -2151,7 +2151,7 @@ using namespace ROCKSDB_NAMESPACE;
         return nearestNeighbors[0].id;
     }
 
-    void LSMVec::printState() const
+    void AsterVec::printState() const
     {
         const int top_layer = max_layer_.load(std::memory_order_acquire);
         // We do not print layer 0 by request.
@@ -2198,7 +2198,7 @@ using namespace ROCKSDB_NAMESPACE;
         LOG(INFO) << oss.str();
     }
 
-    void LSMVec::printStatistics() const
+    void AsterVec::printStatistics() const
     {
         auto cache_stats = vector_storage_->getPageCacheStats();
         stats.page_cache_hits.store(cache_stats.hits,
@@ -2211,7 +2211,7 @@ using namespace ROCKSDB_NAMESPACE;
         LOG(INFO) << oss.str();
     }
 
-    void LSMVec::close()
+    void AsterVec::close()
     {
         if (mem_monitor_) mem_monitor_->stop();
         vector_storage_->flushWrites();
@@ -2239,17 +2239,17 @@ using namespace ROCKSDB_NAMESPACE;
     }
     } // namespace
 
-    void LSMVec::startAdaptiveDirectIO()
+    void AsterVec::startAdaptiveDirectIO()
     {
-        if (!env_bool("LSMVEC_ADAPTIVE_DIO", true)) {
-            LOG(INFO) << "[adaptive-dio] disabled (LSMVEC_ADAPTIVE_DIO=0)";
+        if (!env_bool("ASTERVEC_ADAPTIVE_DIO", true)) {
+            LOG(INFO) << "[adaptive-dio] disabled (ASTERVEC_ADAPTIVE_DIO=0)";
             return;
         }
         CgroupMemoryMonitor::Config cfg;
-        cfg.high_fraction    = env_double("LSMVEC_DIO_HIGH_FRACTION", 0.90);
-        cfg.refault_min_rate = env_double("LSMVEC_DIO_REFAULT_MIN", 1000.0);
-        cfg.debounce_s       = static_cast<int>(env_u64("LSMVEC_DIO_DEBOUNCE_S", 4));
-        cfg.poll_ms          = static_cast<int>(env_u64("LSMVEC_DIO_POLL_MS", 1000));
+        cfg.high_fraction    = env_double("ASTERVEC_DIO_HIGH_FRACTION", 0.90);
+        cfg.refault_min_rate = env_double("ASTERVEC_DIO_REFAULT_MIN", 1000.0);
+        cfg.debounce_s       = static_cast<int>(env_u64("ASTERVEC_DIO_DEBOUNCE_S", 4));
+        cfg.poll_ms          = static_cast<int>(env_u64("ASTERVEC_DIO_POLL_MS", 1000));
         cfg.enabled          = true;
 
         mem_monitor_ = std::make_unique<CgroupMemoryMonitor>(
@@ -2258,7 +2258,7 @@ using namespace ROCKSDB_NAMESPACE;
         mem_monitor_->start();
     }
 
-    void LSMVec::maybeEscalateDirectIO()
+    void AsterVec::maybeEscalateDirectIO()
     {
         if (direct_io_active_.load(std::memory_order_acquire)) return;
         if (mem_monitor_ && mem_monitor_->should_escalate()) {
@@ -2266,7 +2266,7 @@ using namespace ROCKSDB_NAMESPACE;
         }
     }
 
-    void LSMVec::performDirectIOSwitch()
+    void AsterVec::performDirectIOSwitch()
     {
         std::lock_guard<std::mutex> g(dio_switch_mu_);
         if (direct_io_active_.load(std::memory_order_acquire)) return;  // double-check
@@ -2340,10 +2340,10 @@ using namespace ROCKSDB_NAMESPACE;
                   << "ms | sst_cache_dropped=" << (dropped >> 20) << "MiB";
     }
 
-    bool LSMVec::directIOSupported()
+    bool AsterVec::directIOSupported()
     {
 #if defined(__linux__) && defined(O_DIRECT)
-        const std::string probe = db_path_ + "/.lsmvec_dio_probe";
+        const std::string probe = db_path_ + "/.astervec_dio_probe";
         int fd = ::open(probe.c_str(), O_WRONLY | O_CREAT | O_DIRECT, 0644);
         const bool ok = (fd >= 0);
         if (fd >= 0) ::close(fd);
@@ -2354,7 +2354,7 @@ using namespace ROCKSDB_NAMESPACE;
 #endif
     }
 
-    size_t LSMVec::dropSSTPageCache()
+    size_t AsterVec::dropSSTPageCache()
     {
         size_t total = 0;
         DIR* d = ::opendir(db_path_.c_str());
@@ -2378,7 +2378,7 @@ using namespace ROCKSDB_NAMESPACE;
         return total;
     }
 
-    // void LSMVec::printStatistics() const
+    // void AsterVec::printStatistics() const
     // {
     //     std::cout << "Indexing Time: " << indexingTime << " seconds" << std::endl;
 
@@ -2398,7 +2398,7 @@ using namespace ROCKSDB_NAMESPACE;
 
     // ----------------------------------------------------------------------
     // Delete / update primitives — see docs/DELETE_DESIGN.md §4 and §5.6.
-    // Wired into LSMVecDB in chunk C5b; defined here so resolver tests in
+    // Wired into AsterVecDB in chunk C5b; defined here so resolver tests in
     // C3 can exercise them in isolation.
     // ----------------------------------------------------------------------
 
@@ -2408,10 +2408,10 @@ using namespace ROCKSDB_NAMESPACE;
     // takes tombstone_mu_ shared (via the inline is_tombstoned helper) and
     // sequences the two reads — a stale (post-mapping, pre-tombstone)
     // observation can return "alive" briefly for a transactionally-deleted
-    // key; the per-real-id transaction lock at LSMVecDB serialises the
+    // key; the per-real-id transaction lock at AsterVecDB serialises the
     // whole upsert/update/delete flow so that brief inconsistency is bounded.
 
-    internal_id_t LSMVec::resolve_internal(real_id_t r) const {
+    internal_id_t AsterVec::resolve_internal(real_id_t r) const {
         std::shared_lock<std::shared_mutex> g(mapping_mu_);
         if (!update_bloom_.might_contain(r)) {
             return static_cast<internal_id_t>(r);                  // 99% case
@@ -2422,7 +2422,7 @@ using namespace ROCKSDB_NAMESPACE;
              : it->second;
     }
 
-    real_id_t LSMVec::resolve_real(internal_id_t i) const {
+    real_id_t AsterVec::resolve_real(internal_id_t i) const {
         if (is_direct_id(i)) return static_cast<real_id_t>(i);     // bit-test fast path
         std::shared_lock<std::shared_mutex> g(mapping_mu_);
         auto it = updated_internal_to_real_.find(i);
@@ -2431,13 +2431,13 @@ using namespace ROCKSDB_NAMESPACE;
              : it->second;
     }
 
-    bool LSMVec::is_alive(real_id_t r) const {
+    bool AsterVec::is_alive(real_id_t r) const {
         internal_id_t i = resolve_internal(r);  // takes mapping_mu_ shared
         if (is_tombstoned(i)) return false;     // takes tombstone_mu_ shared
         return vector_storage_ && vector_storage_->exists(i);
     }
 
-    void LSMVec::record_update_mapping(real_id_t r, internal_id_t new_i) {
+    void AsterVec::record_update_mapping(real_id_t r, internal_id_t new_i) {
         std::unique_lock<std::shared_mutex> g(mapping_mu_);
         // A4: if r already has an update mapping, drop the stale reverse entry.
         auto prev = updated_real_to_internal_.find(r);
@@ -2452,12 +2452,12 @@ using namespace ROCKSDB_NAMESPACE;
         }
     }
 
-    void LSMVec::rebuild_bloom_to(std::size_t new_capacity) {
+    void AsterVec::rebuild_bloom_to(std::size_t new_capacity) {
         std::unique_lock<std::shared_mutex> g(mapping_mu_);
         rebuild_bloom_to_locked(new_capacity);
     }
 
-    void LSMVec::rebuild_bloom_to_locked(std::size_t new_capacity) {
+    void AsterVec::rebuild_bloom_to_locked(std::size_t new_capacity) {
         // Caller holds mapping_mu_ exclusive.
         update_bloom_.reset(new_capacity, 0.01);
         for (const auto& kv : updated_real_to_internal_) {
@@ -2466,7 +2466,7 @@ using namespace ROCKSDB_NAMESPACE;
         ++bloom_rebuild_count_;  // C8: stats
     }
 
-    void LSMVec::forget_update_mapping(real_id_t r) {
+    void AsterVec::forget_update_mapping(real_id_t r) {
         std::unique_lock<std::shared_mutex> g(mapping_mu_);
         auto it = updated_real_to_internal_.find(r);
         if (it != updated_real_to_internal_.end()) {

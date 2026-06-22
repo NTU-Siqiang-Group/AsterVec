@@ -69,12 +69,12 @@ std::vector<std::vector<int>> readIvecsFile(const std::string &filename)
 }
 
 // Function to insert vectors from a bvecs file into the HNSW graph
-void insertFromBigANNFile(lsm_vec::LSMVecDB &db, const std::string &filename)
+void insertFromBigANNFile(astervec::AsterVecDB &db, const std::string &filename)
 {
     auto data = readBvecsFile(filename);
     for (size_t i = 0; i < data.size(); ++i)
     {
-        auto status = db.Insert(static_cast<lsm_vec::node_id_t>(i), lsm_vec::Span<float>(data[i]));
+        auto status = db.Insert(static_cast<astervec::node_id_t>(i), astervec::Span<float>(data[i]));
         if (!status.ok())
         {
             std::cerr << "Insert failed for node " << i << ": " << status.ToString() << std::endl;
@@ -84,7 +84,7 @@ void insertFromBigANNFile(lsm_vec::LSMVecDB &db, const std::string &filename)
 }
 
 // Function to perform queries from a file and compare results with ground truth
-void queryBigANN(lsm_vec::LSMVecDB &db, const std::string &queryFile, const std::string &groundTruthFile)
+void queryBigANN(astervec::AsterVecDB &db, const std::string &queryFile, const std::string &groundTruthFile)
 {
     auto queries = readBvecsFile(queryFile);
     auto groundTruth = readIvecsFile(groundTruthFile);
@@ -97,13 +97,13 @@ void queryBigANN(lsm_vec::LSMVecDB &db, const std::string &queryFile, const std:
 
     int correctMatches = 0;
     int totalQueries = static_cast<int>(queries.size());
-    lsm_vec::SearchOptions search_options;
+    astervec::SearchOptions search_options;
     search_options.k = 1;
 
     for (size_t i = 0; i < queries.size(); ++i)
     {
-        std::vector<lsm_vec::SearchResult> results;
-        auto status = db.SearchKnn(lsm_vec::Span<float>(queries[i]), search_options, &results);
+        std::vector<astervec::SearchResult> results;
+        auto status = db.SearchKnn(astervec::Span<float>(queries[i]), search_options, &results);
         if (!status.ok() || results.empty())
         {
             std::cerr << "Search failed for query " << i << ": " << status.ToString() << std::endl;
@@ -178,7 +178,7 @@ int getdim(const std::string &filename)
 }
 
 // Function to insert vectors from an fvecs file into the HNSW graph
-void insertFromFile(lsm_vec::LSMVecDB &db, const std::string &filename)
+void insertFromFile(astervec::AsterVecDB &db, const std::string &filename)
 {
     std::ifstream input(filename, std::ios::binary);
     if (!input.is_open())
@@ -241,7 +241,7 @@ void insertFromFile(lsm_vec::LSMVecDB &db, const std::string &filename)
             }
         }
 
-        auto status = db.Insert(static_cast<lsm_vec::node_id_t>(node_count), lsm_vec::Span<float>(finalVec));
+        auto status = db.Insert(static_cast<astervec::node_id_t>(node_count), astervec::Span<float>(finalVec));
         if (!status.ok())
         {
             std::cerr << "Insert failed for node " << node_count << ": " << status.ToString() << std::endl;
@@ -277,7 +277,7 @@ void insertFromFile(lsm_vec::LSMVecDB &db, const std::string &filename)
 }
 
 // Function to perform queries from a file and compare results with ground truth
-void queryAndCompareWithGroundTruth(lsm_vec::LSMVecDB &db,
+void queryAndCompareWithGroundTruth(astervec::AsterVecDB &db,
                                     const std::string &queryFile,
                                     const std::string &groundTruthFile,
                                     int k,
@@ -295,7 +295,7 @@ void queryAndCompareWithGroundTruth(lsm_vec::LSMVecDB &db,
     int correctMatches = 0;
     int totalQueries = static_cast<int>(queries.size());
     double totalQueryTime = 0.0;
-    lsm_vec::SearchOptions search_options;
+    astervec::SearchOptions search_options;
     search_options.k = k;
     search_options.ef_search = ef_search;
 
@@ -305,8 +305,8 @@ void queryAndCompareWithGroundTruth(lsm_vec::LSMVecDB &db,
         auto start = std::chrono::high_resolution_clock::now();
 
         // Perform the HNSW query
-        std::vector<lsm_vec::SearchResult> results;
-        auto status = db.SearchKnn(lsm_vec::Span<float>(queries[i]), search_options, &results);
+        std::vector<astervec::SearchResult> results;
+        auto status = db.SearchKnn(astervec::Span<float>(queries[i]), search_options, &results);
 
         // Stop measuring query time
         auto end = std::chrono::high_resolution_clock::now();

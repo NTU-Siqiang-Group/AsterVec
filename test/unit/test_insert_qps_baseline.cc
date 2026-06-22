@@ -10,7 +10,7 @@
 // BENCHMARK.md.
 
 #include "doctest.h"
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 
 #include <chrono>
 #include <cstdint>
@@ -34,17 +34,17 @@ std::string NewTempDir(const char* prefix) {
     return std::string(dir);
 }
 
-std::unique_ptr<lsm_vec::LSMVecDB>
+std::unique_ptr<astervec::AsterVecDB>
 OpenFresh(const std::string& path, int dim, std::size_t capacity) {
-    lsm_vec::LSMVecDBOptions opts;
+    astervec::AsterVecDBOptions opts;
     opts.dim = dim;
     opts.m = 8;
     opts.m_max = 24;
     opts.ef_construction = 32;
     opts.vec_file_capacity = capacity;
     opts.vector_file_path = path + "/vecs.bin";
-    std::unique_ptr<lsm_vec::LSMVecDB> db;
-    REQUIRE(lsm_vec::LSMVecDB::Open(path, opts, &db).ok());
+    std::unique_ptr<astervec::AsterVecDB> db;
+    REQUIRE(astervec::AsterVecDB::Open(path, opts, &db).ok());
     return db;
 }
 
@@ -63,7 +63,7 @@ TEST_CASE("Phase-0 baseline: single-thread INSERT QPS"
     constexpr int kNumVectors  = 5000;
     constexpr std::uint64_t kSeed = 0x9B5UL;  // "QPS-ish"
 
-    std::string path = NewTempDir("lsmvec_qps_baseline");
+    std::string path = NewTempDir("astervec_qps_baseline");
     auto db = OpenFresh(path, kDim, kNumVectors * 2);
 
     std::mt19937 rng(kSeed);
@@ -78,7 +78,7 @@ TEST_CASE("Phase-0 baseline: single-thread INSERT QPS"
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kNumVectors; ++i) {
         REQUIRE(db->Insert(static_cast<std::uint64_t>(i),
-                           lsm_vec::Span<float>(base[i]))
+                           astervec::Span<float>(base[i]))
                     .ok());
     }
     db->flushVectorWrites();

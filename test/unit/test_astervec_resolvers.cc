@@ -6,35 +6,35 @@
 
 #include "doctest.h"
 #include "id_types.h"
-#include "lsm_vec_db.h"
-#include "lsm_vec_index.h"
+#include "astervec_db.h"
+#include "astervec_index.h"
 
-using lsm_vec::internal_id_t;
-using lsm_vec::kFirstUpdateId;
-using lsm_vec::kMaxRealId;
-using lsm_vec::LSMVec;
-using lsm_vec::LSMVecDB;
-using lsm_vec::LSMVecDBOptions;
-using lsm_vec::real_id_t;
+using astervec::internal_id_t;
+using astervec::kFirstUpdateId;
+using astervec::kMaxRealId;
+using astervec::AsterVec;
+using astervec::AsterVecDB;
+using astervec::AsterVecDBOptions;
+using astervec::real_id_t;
 
 namespace {
-// Minimal disposable LSMVecDB for resolver tests. Constructs a fresh
-// temp-dir DB; cleans up on destruction. Exposes the inner LSMVec.
+// Minimal disposable AsterVecDB for resolver tests. Constructs a fresh
+// temp-dir DB; cleans up on destruction. Exposes the inner AsterVec.
 struct TempEnv {
     std::string                path;
-    std::unique_ptr<LSMVecDB>  db;
+    std::unique_ptr<AsterVecDB>  db;
 
     explicit TempEnv(int dim = 4, uint64_t cap = 100) {
-        char tmpl[] = "/tmp/lsmvec_C3_XXXXXX";
+        char tmpl[] = "/tmp/astervec_C3_XXXXXX";
         char* dir = mkdtemp(tmpl);
         REQUIRE(dir != nullptr);
         path = dir;
 
-        LSMVecDBOptions opts;
+        AsterVecDBOptions opts;
         opts.dim                  = dim;
         opts.vec_file_capacity    = cap;
         opts.vector_file_path     = path + "/vecs.bin";
-        REQUIRE(LSMVecDB::Open(path, opts, &db).ok());
+        REQUIRE(AsterVecDB::Open(path, opts, &db).ok());
     }
 
     ~TempEnv() {
@@ -43,7 +43,7 @@ struct TempEnv {
         std::filesystem::remove_all(path, ec);
     }
 
-    LSMVec& index() { return *db->index_for_test(); }
+    AsterVec& index() { return *db->index_for_test(); }
 };
 }  // namespace
 

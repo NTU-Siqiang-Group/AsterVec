@@ -14,7 +14,7 @@
 // the unit-test run timing-wise.
 
 #include "doctest.h"
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -39,17 +39,17 @@ std::string NewTempDir(const char* prefix) {
     return std::string(dir);
 }
 
-std::unique_ptr<lsm_vec::LSMVecDB>
+std::unique_ptr<astervec::AsterVecDB>
 OpenFresh(const std::string& path, int dim, std::size_t capacity) {
-    lsm_vec::LSMVecDBOptions opts;
+    astervec::AsterVecDBOptions opts;
     opts.dim = dim;
     opts.m = 8;
     opts.m_max = 24;
     opts.ef_construction = 32;
     opts.vec_file_capacity = capacity;
     opts.vector_file_path = path + "/vecs.bin";
-    std::unique_ptr<lsm_vec::LSMVecDB> db;
-    REQUIRE(lsm_vec::LSMVecDB::Open(path, opts, &db).ok());
+    std::unique_ptr<astervec::AsterVecDB> db;
+    REQUIRE(astervec::AsterVecDB::Open(path, opts, &db).ok());
     return db;
 }
 
@@ -101,7 +101,7 @@ TEST_CASE("Phase-0 baseline: serial recall@10 on synthetic 128-dim, 2000 vectors
     constexpr int kEfSearch    = 64;
     constexpr std::uint64_t kSeed = 0xB45EUL;  // "BASE"
 
-    std::string path = NewTempDir("lsmvec_recall_baseline");
+    std::string path = NewTempDir("astervec_recall_baseline");
     auto db = OpenFresh(path, kDim, kNumVectors * 2);
 
     // Reproducible base set.
@@ -111,7 +111,7 @@ TEST_CASE("Phase-0 baseline: serial recall@10 on synthetic 128-dim, 2000 vectors
     for (int i = 0; i < kNumVectors; ++i) {
         base.push_back(RandVec(kDim, rng));
         REQUIRE(db->Insert(static_cast<std::uint64_t>(i),
-                           lsm_vec::Span<float>(base[i]))
+                           astervec::Span<float>(base[i]))
                     .ok());
     }
     db->flushVectorWrites();
@@ -124,7 +124,7 @@ TEST_CASE("Phase-0 baseline: serial recall@10 on synthetic 128-dim, 2000 vectors
         queries.push_back(RandVec(kDim, qrng));
     }
 
-    lsm_vec::SearchOptions opts;
+    astervec::SearchOptions opts;
     opts.k = kK;
     opts.ef_search = kEfSearch;
 
@@ -134,8 +134,8 @@ TEST_CASE("Phase-0 baseline: serial recall@10 on synthetic 128-dim, 2000 vectors
         auto gt = BruteForceTopK(base, queries[q], kK);
         std::unordered_set<std::uint64_t> gt_set(gt.begin(), gt.end());
 
-        std::vector<lsm_vec::SearchResult> out;
-        REQUIRE(db->SearchKnn(lsm_vec::Span<float>(queries[q]), opts, &out)
+        std::vector<astervec::SearchResult> out;
+        REQUIRE(db->SearchKnn(astervec::Span<float>(queries[q]), opts, &out)
                     .ok());
         for (auto& r : out) {
             if (gt_set.count(r.id)) ++matched;

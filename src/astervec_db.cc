@@ -1,4 +1,4 @@
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 
 #include <cctype>
 #include <cmath>
@@ -24,7 +24,7 @@ void trim_allocator_now() {
 
 #include "distance.h"
 #include "json.hpp"
-#include "lsm_vec_index.h"
+#include "astervec_index.h"
 #include "logger.h"
 #include "metadata.h"
 #include "metadata_store.h"
@@ -34,7 +34,7 @@ void trim_allocator_now() {
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
 
-namespace lsm_vec
+namespace astervec
 {
 namespace {
 constexpr char kDefaultVectorFileName[] = "vector.log";
@@ -42,7 +42,7 @@ constexpr char kDefaultLogFileName[] = "lsm_vec_db.log";
 constexpr char kMetadataFileName[] = "lsm_vec_db.meta";
 } // namespace
 
-LSMVecDB::~LSMVecDB()
+AsterVecDB::~AsterVecDB()
 {
     // Tear down metadata resources in the right order if Close() was not called.
     metadata_store_.reset();
@@ -53,9 +53,9 @@ LSMVecDB::~LSMVecDB()
     metadata_db_.reset();
 }
 
-LSMVecDB::LSMVecDB(const std::string& db_path,
-                   const LSMVecDBOptions& options,
-                   std::unique_ptr<LSMVec> index,
+AsterVecDB::AsterVecDB(const std::string& db_path,
+                   const AsterVecDBOptions& options,
+                   std::unique_ptr<AsterVec> index,
                    std::unique_ptr<std::ostream> log_stream)
     : db_path_(db_path),
       options_(options),
@@ -64,9 +64,9 @@ LSMVecDB::LSMVecDB(const std::string& db_path,
 {
 }
 
-Status LSMVecDB::Open(const std::string& path,
-                      const LSMVecDBOptions& opts,
-                      std::unique_ptr<LSMVecDB>* db)
+Status AsterVecDB::Open(const std::string& path,
+                      const AsterVecDBOptions& opts,
+                      std::unique_ptr<AsterVecDB>* db)
 {
     if (!db) {
         return Status::InvalidArgument("db output must not be null");
@@ -81,7 +81,7 @@ Status LSMVecDB::Open(const std::string& path,
 
     initializeLogger(LogChoice::STDOUT, nullptr, LogSeverity::INFO);
 
-    LSMVecDBOptions normalized_opts = opts;
+    AsterVecDBOptions normalized_opts = opts;
     if (normalized_opts.vector_file_path.empty()) {
         normalized_opts.vector_file_path = path + "/" + kDefaultVectorFileName;
     }
@@ -94,10 +94,10 @@ Status LSMVecDB::Open(const std::string& path,
         return Status::IOError("failed to open log file");
     }
 
-    auto index = std::make_unique<LSMVec>(path, normalized_opts, *log_stream);
+    auto index = std::make_unique<AsterVec>(path, normalized_opts, *log_stream);
 
-    *db = std::unique_ptr<LSMVecDB>(
-        new LSMVecDB(path, normalized_opts, std::move(index), std::move(log_stream)));
+    *db = std::unique_ptr<AsterVecDB>(
+        new AsterVecDB(path, normalized_opts, std::move(index), std::move(log_stream)));
 
     if (!normalized_opts.reinit) {
         std::string metadata_path = path + "/" + kMetadataFileName;
@@ -107,7 +107,7 @@ Status LSMVecDB::Open(const std::string& path,
             if (!metadata_status.ok()) {
                 return metadata_status;
             }
-            // C5b: tombstoned set now lives inside LSMVec; no separate copy needed.
+            // C5b: tombstoned set now lives inside AsterVec; no separate copy needed.
         }
     }
 
@@ -176,7 +176,7 @@ Status LSMVecDB::Open(const std::string& path,
     return Status::OK();
 }
 
-Status LSMVecDB::ValidateVector(Span<float> vec) const
+Status AsterVecDB::ValidateVector(Span<float> vec) const
 {
     if (vec.size() != static_cast<size_t>(options_.dim)) {
         return Status::InvalidArgument("vector dimension mismatch");
@@ -184,7 +184,7 @@ Status LSMVecDB::ValidateVector(Span<float> vec) const
     return Status::OK();
 }
 
-Status LSMVecDB::EnsureMetricSupported() const
+Status AsterVecDB::EnsureMetricSupported() const
 {
     if (options_.metric != DistanceMetric::kL2 &&
         options_.metric != DistanceMetric::kCosine) {
@@ -193,14 +193,14 @@ Status LSMVecDB::EnsureMetricSupported() const
     return Status::OK();
 }
 
-float LSMVecDB::ComputeDistance(Span<float> a, Span<float> b) const
+float AsterVecDB::ComputeDistance(Span<float> a, Span<float> b) const
 {
     return distance::ComputeDistance(options_.metric,
                                      Span<const float>(a.data(), a.size()),
                                      Span<const float>(b.data(), b.size()));
 }
 
-Status LSMVecDB::Insert(node_id_t id, Span<float> vec)
+Status AsterVecDB::Insert(node_id_t id, Span<float> vec)
 {
     return Insert(id, vec, std::string_view{});
 }
@@ -231,11 +231,11 @@ Status ParseMetadataObject(std::string_view json, nlohmann::json* out) {
 }
 }  // namespace
 
-bool LSMVecDB::HasLiveVector(node_id_t id) const {
+bool AsterVecDB::HasLiveVector(node_id_t id) const {
     return index_ && index_->is_alive(static_cast<real_id_t>(id));
 }
 
-Status LSMVecDB::ValidateInsert(node_id_t id, Span<float> vec,
+Status AsterVecDB::ValidateInsert(node_id_t id, Span<float> vec,
                                 std::string_view metadata_json) const
 {
     const real_id_t r = static_cast<real_id_t>(id);
@@ -253,7 +253,7 @@ Status LSMVecDB::ValidateInsert(node_id_t id, Span<float> vec,
     return Status::OK();
 }
 
-Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata_json)
+Status AsterVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata_json)
 {
     // Validate everything up front (id range, metric, vector, metadata). Batch
     // callers run this for every item first, so a bad item writes nothing.
@@ -306,7 +306,7 @@ Status LSMVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata
     return Status::OK();
 }
 
-Status LSMVecDB::GetPayload(node_id_t id, std::string* out_json)
+Status AsterVecDB::GetPayload(node_id_t id, std::string* out_json)
 {
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
     const internal_id_t i = index_->resolve_internal(static_cast<real_id_t>(id));
@@ -318,7 +318,7 @@ Status LSMVecDB::GetPayload(node_id_t id, std::string* out_json)
     return st;
 }
 
-Status LSMVecDB::SetPayload(node_id_t id, std::string_view metadata_json)
+Status AsterVecDB::SetPayload(node_id_t id, std::string_view metadata_json)
 {
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
     const real_id_t r = static_cast<real_id_t>(id);
@@ -332,7 +332,7 @@ Status LSMVecDB::SetPayload(node_id_t id, std::string_view metadata_json)
     return metadata_store_->Put(i, metadata_json);
 }
 
-Status LSMVecDB::SetPayloadBatch(
+Status AsterVecDB::SetPayloadBatch(
     const std::vector<std::pair<node_id_t, std::string>>& items)
 {
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
@@ -355,7 +355,7 @@ Status LSMVecDB::SetPayloadBatch(
     return metadata_store_->PutBatch(internal_items);
 }
 
-Status LSMVecDB::UpdatePayload(node_id_t id, std::string_view partial_json)
+Status AsterVecDB::UpdatePayload(node_id_t id, std::string_view partial_json)
 {
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
     const real_id_t r = static_cast<real_id_t>(id);
@@ -369,7 +369,7 @@ Status LSMVecDB::UpdatePayload(node_id_t id, std::string_view partial_json)
     return metadata_store_->Update(i, patch);
 }
 
-Status LSMVecDB::DeletePayloadKeys(node_id_t id, Span<const std::string> keys)
+Status AsterVecDB::DeletePayloadKeys(node_id_t id, Span<const std::string> keys)
 {
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
     const internal_id_t i = index_->resolve_internal(static_cast<real_id_t>(id));
@@ -377,12 +377,12 @@ Status LSMVecDB::DeletePayloadKeys(node_id_t id, Span<const std::string> keys)
     return metadata_store_->DeleteKeys(i, key_vec);
 }
 
-Status LSMVecDB::Update(node_id_t id, Span<float> vec)
+Status AsterVecDB::Update(node_id_t id, Span<float> vec)
 {
     return UpdateInternal(id, vec, std::string_view{});
 }
 
-Status LSMVecDB::UpdateInternal(node_id_t id, Span<float> vec,
+Status AsterVecDB::UpdateInternal(node_id_t id, Span<float> vec,
                                 std::string_view metadata_json)
 {
     const real_id_t r = static_cast<real_id_t>(id);
@@ -452,7 +452,7 @@ Status LSMVecDB::UpdateInternal(node_id_t id, Span<float> vec,
     return Status::OK();
 }
 
-Status LSMVecDB::Delete(node_id_t id)
+Status AsterVecDB::Delete(node_id_t id)
 {
     if (!index_) return Status::InvalidArgument("db not opened");
     const real_id_t r = static_cast<real_id_t>(id);
@@ -490,7 +490,7 @@ Status LSMVecDB::Delete(node_id_t id)
     return Status::OK();
 }
 
-Status LSMVecDB::Get(node_id_t id, std::vector<float>* vec)
+Status AsterVecDB::Get(node_id_t id, std::vector<float>* vec)
 {
     if (!vec) return Status::InvalidArgument("output vector must not be null");
     if (!index_) return Status::InvalidArgument("db not opened");
@@ -516,7 +516,7 @@ Status LSMVecDB::Get(node_id_t id, std::vector<float>* vec)
     return Status::OK();
 }
 
-Status LSMVecDB::SearchKnn(Span<float> query,
+Status AsterVecDB::SearchKnn(Span<float> query,
                            const SearchOptions& options,
                            std::vector<SearchResult>* out)
 {
@@ -547,7 +547,7 @@ Status LSMVecDB::SearchKnn(Span<float> query,
     out->clear();
     out->reserve(results.size());
     for (const auto& result : results) {
-        // Defense in depth: LSMVec::knnSearchK already filters tombstones,
+        // Defense in depth: AsterVec::knnSearchK already filters tombstones,
         // but redoing the check makes the translation safe if that changes.
         if (index_->is_tombstoned(result.id)) continue;
         SearchResult translated;
@@ -564,7 +564,7 @@ Status LSMVecDB::SearchKnn(Span<float> query,
     return Status::OK();
 }
 
-Status LSMVecDB::SearchKnn(Span<float> query,
+Status AsterVecDB::SearchKnn(Span<float> query,
                            const SearchOptions& options,
                            std::string_view filter_json,
                            std::vector<SearchResult>* out)
@@ -631,7 +631,7 @@ Status LSMVecDB::SearchKnn(Span<float> query,
     return Status::OK();
 }
 
-Status LSMVecDB::SearchKnn(Span<float> query,
+Status AsterVecDB::SearchKnn(Span<float> query,
                            std::vector<SearchResult>* out)
 {
     SearchOptions opts;
@@ -640,12 +640,12 @@ Status LSMVecDB::SearchKnn(Span<float> query,
     return SearchKnn(query, opts, out);
 }
 
-void LSMVecDB::printStatistics() const
+void AsterVecDB::printStatistics() const
 {
     index_->printStatistics();
 }
 
-Status LSMVecDB::BulkBuild(Span<const float> vectors, int n,
+Status AsterVecDB::BulkBuild(Span<const float> vectors, int n,
                            const BulkBuildOptions& opts)
 {
     if (!index_) return Status::InvalidArgument("db not opened");
@@ -687,19 +687,19 @@ Status LSMVecDB::BulkBuild(Span<const float> vectors, int n,
     return Status::OK();
 }
 
-std::size_t LSMVecDB::VectorCount() const
+std::size_t AsterVecDB::VectorCount() const
 {
     const std::int64_t v = live_count_.load(std::memory_order_relaxed);
     return v > 0 ? static_cast<std::size_t>(v) : 0;
 }
 
-void LSMVecDB::persistCount() const
+void AsterVecDB::persistCount() const
 {
     std::ofstream f(db_path_ + "/vector_count", std::ios::trunc);
     if (f.is_open()) f << live_count_.load(std::memory_order_relaxed) << "\n";
 }
 
-void LSMVecDB::loadCount()
+void AsterVecDB::loadCount()
 {
     std::ifstream f(db_path_ + "/vector_count");
     long long v = 0;
@@ -710,7 +710,7 @@ void LSMVecDB::loadCount()
     }
 }
 
-void LSMVecDB::flushVectorWrites()
+void AsterVecDB::flushVectorWrites()
 {
     if (index_) {
         index_->vector_storage_->flushWrites();
@@ -722,12 +722,12 @@ void LSMVecDB::flushVectorWrites()
     trim_allocator_now();
 }
 
-void LSMVecDB::trimMemory()
+void AsterVecDB::trimMemory()
 {
     trim_allocator_now();
 }
 
-LSMVecDB::DeleteStats LSMVecDB::GetDeleteStats() const
+AsterVecDB::DeleteStats AsterVecDB::GetDeleteStats() const
 {
     DeleteStats s{};
     if (!index_) return s;
@@ -741,7 +741,7 @@ LSMVecDB::DeleteStats LSMVecDB::GetDeleteStats() const
     return s;
 }
 
-Status LSMVecDB::Close()
+Status AsterVecDB::Close()
 {
     if (!index_) {
         return Status::InvalidArgument("database not initialized");
@@ -770,7 +770,7 @@ Status LSMVecDB::Close()
         return Status::IOError("failed to open metadata file for writing");
     }
 
-    // C5b: LSMVec owns tombstoned_internal_ids_; no sync needed.
+    // C5b: AsterVec owns tombstoned_internal_ids_; no sync needed.
     Status metadata_status = index_->SerializeMetadata(metadata_stream);
     if (!metadata_status.ok()) {
         return metadata_status;
@@ -786,4 +786,4 @@ Status LSMVecDB::Close()
     index_->close();
     return Status::OK();
 }
-} // namespace lsm_vec
+} // namespace astervec

@@ -2,8 +2,8 @@
 #include "metadata_store.h"
 #include "metadata_store_fixture.h"
 
-using namespace lsm_vec;
-using namespace lsm_vec::test;
+using namespace astervec;
+using namespace astervec::test;
 
 TEST_CASE("MetadataStore: Put then Get round-trip") {
     TempDB t;

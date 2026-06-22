@@ -5,13 +5,13 @@
 #include <cstdint>
 #include <limits>
 
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 
 #if defined(__AVX2__) || defined(__SSE2__)
 #include <immintrin.h>
 #endif
 
-namespace lsm_vec::distance
+namespace astervec::distance
 {
 namespace detail {
 #if defined(__AVX2__)
@@ -298,4 +298,4 @@ inline float ComputeDistance(DistanceMetric metric,
     }
     return ComputeDistance(metric, a.data(), b.data(), a.size(), norm_a, norm_b);
 }
-} // namespace lsm_vec::distance
+} // namespace astervec::distance

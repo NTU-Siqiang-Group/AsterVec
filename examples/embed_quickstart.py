@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Embed LSM-Vec in your Python process (the primary way to use the engine).
+"""Embed AsterVec in your Python process (the primary way to use the engine).
 
 Run after building + installing the engine module:
     git submodule update --init --recursive
@@ -8,20 +8,20 @@ Run after building + installing the engine module:
     python examples/embed_quickstart.py
 """
 import os
-import lsm_vec
+import astervec
 
 DIM = 8
 DB_DIR = "./run/embed_db"
 
 # ---- open (creates a fresh DB) ----
-opts = lsm_vec.LSMVecDBOptions()
+opts = astervec.AsterVecDBOptions()
 opts.dim = DIM
-opts.metric = lsm_vec.DistanceMetric.L2
+opts.metric = astervec.DistanceMetric.L2
 opts.vector_file_path = os.path.join(DB_DIR, "vectors.bin")
 opts.reinit = True  # start fresh each run
 
 os.makedirs(DB_DIR, exist_ok=True)
-db = lsm_vec.LSMVecDB.open(DB_DIR, opts)
+db = astervec.AsterVecDB.open(DB_DIR, opts)
 
 # ---- insert vectors (+ optional JSON metadata) ----
 for i in range(1, 6):

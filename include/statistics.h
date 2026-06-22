@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <ostream>
 
-namespace lsm_vec {
+namespace astervec {
 
 // Thread-safe stats counters.
 //
@@ -255,4 +255,4 @@ private:
     bool enabled_set_ = false;
 };
 
-} // namespace lsm_vec
+} // namespace astervec

@@ -1,9 +1,9 @@
 // Concurrent search regression test.
 //
 // Verifies that N reader threads invoking SearchKnn against the same
-// LSMVecDB instance produce results identical to a single-threaded
+// AsterVecDB instance produce results identical to a single-threaded
 // baseline. Step 8 of the thread-safety refactor (see
-// pglsmvec/doc/thread-safety-refactor-plan.md).
+// pgastervec/doc/thread-safety-refactor-plan.md).
 //
 // Sanitizer notes:
 //   - TSAN on macOS x86_64h: TSAN's own allocator crashes inside
@@ -17,7 +17,7 @@
 // should run cleanly against this test. The plan-of-record is to
 // gate this test under -fsanitize=thread in Linux CI.
 #include "doctest.h"
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
@@ -38,17 +38,17 @@ std::string NewTempDir(const char* prefix) {
     return std::string(dir);
 }
 
-std::unique_ptr<lsm_vec::LSMVecDB>
+std::unique_ptr<astervec::AsterVecDB>
 OpenFresh(const std::string& path, int dim) {
-    lsm_vec::LSMVecDBOptions opts;
+    astervec::AsterVecDBOptions opts;
     opts.dim = dim;
     opts.m = 8;
     opts.m_max = 24;
     opts.ef_construction = 32;
     opts.vec_file_capacity = 20000;
     opts.vector_file_path = path + "/vecs.bin";
-    std::unique_ptr<lsm_vec::LSMVecDB> db;
-    REQUIRE(lsm_vec::LSMVecDB::Open(path, opts, &db).ok());
+    std::unique_ptr<astervec::AsterVecDB> db;
+    REQUIRE(astervec::AsterVecDB::Open(path, opts, &db).ok());
     return db;
 }
 
@@ -68,7 +68,7 @@ TEST_CASE("Concurrent search: 8 threads × 200 queries match single-thread basel
     constexpr int kNumThreads = 8;
     constexpr int kK = 10;
 
-    std::string path = NewTempDir("lsmvec_concsearch");
+    std::string path = NewTempDir("astervec_concsearch");
     auto db = OpenFresh(path, kDim);
 
     // Insert deterministic dataset.
@@ -76,7 +76,7 @@ TEST_CASE("Concurrent search: 8 threads × 200 queries match single-thread basel
     for (int i = 0; i < kNumVectors; ++i) {
         auto v = RandVec(kDim, rng);
         REQUIRE(db->Insert(static_cast<uint64_t>(i),
-                           lsm_vec::Span<float>(v))
+                           astervec::Span<float>(v))
                     .ok());
     }
     db->flushVectorWrites();
@@ -88,13 +88,13 @@ TEST_CASE("Concurrent search: 8 threads × 200 queries match single-thread basel
         queries.push_back(RandVec(kDim, rng));
     }
 
-    lsm_vec::SearchOptions opts;
+    astervec::SearchOptions opts;
     opts.k = kK;
     opts.ef_search = 64;
 
-    std::vector<std::vector<lsm_vec::SearchResult>> baseline(kNumQueries);
+    std::vector<std::vector<astervec::SearchResult>> baseline(kNumQueries);
     for (int q = 0; q < kNumQueries; ++q) {
-        REQUIRE(db->SearchKnn(lsm_vec::Span<float>(queries[q]),
+        REQUIRE(db->SearchKnn(astervec::Span<float>(queries[q]),
                               opts, &baseline[q])
                     .ok());
     }
@@ -108,8 +108,8 @@ TEST_CASE("Concurrent search: 8 threads × 200 queries match single-thread basel
     for (int t = 0; t < kNumThreads; ++t) {
         threads.emplace_back([&, t]() {
             for (int q = 0; q < kNumQueries; ++q) {
-                std::vector<lsm_vec::SearchResult> out;
-                auto st = db->SearchKnn(lsm_vec::Span<float>(queries[q]),
+                std::vector<astervec::SearchResult> out;
+                auto st = db->SearchKnn(astervec::Span<float>(queries[q]),
                                         opts, &out);
                 if (!st.ok()) {
                     error_count.fetch_add(1, std::memory_order_relaxed);
@@ -148,19 +148,19 @@ TEST_CASE("Concurrent search: many small queries do not crash or leak state") {
     constexpr int kNumThreads = 8;
     constexpr int kQueriesPerThread = 500;
 
-    std::string path = NewTempDir("lsmvec_concstress");
+    std::string path = NewTempDir("astervec_concstress");
     auto db = OpenFresh(path, kDim);
 
     std::mt19937 rng(0xF00D);
     for (int i = 0; i < kNumVectors; ++i) {
         auto v = RandVec(kDim, rng);
         REQUIRE(db->Insert(static_cast<uint64_t>(i),
-                           lsm_vec::Span<float>(v))
+                           astervec::Span<float>(v))
                     .ok());
     }
     db->flushVectorWrites();
 
-    lsm_vec::SearchOptions opts;
+    astervec::SearchOptions opts;
     opts.k = 5;
     opts.ef_search = 32;
 
@@ -171,8 +171,8 @@ TEST_CASE("Concurrent search: many small queries do not crash or leak state") {
             std::mt19937 trng(static_cast<unsigned>(0xABCD ^ t));
             for (int q = 0; q < kQueriesPerThread; ++q) {
                 auto query = RandVec(kDim, trng);
-                std::vector<lsm_vec::SearchResult> out;
-                auto st = db->SearchKnn(lsm_vec::Span<float>(query),
+                std::vector<astervec::SearchResult> out;
+                auto st = db->SearchKnn(astervec::Span<float>(query),
                                         opts, &out);
                 if (!st.ok() || out.empty()) {
                     error_count.fetch_add(1, std::memory_order_relaxed);

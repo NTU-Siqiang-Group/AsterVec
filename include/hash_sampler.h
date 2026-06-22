@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <iostream>
 
-namespace lsm_vec
+namespace astervec
 {
     /**
      * SimHash-based Sampling Module for LSM-VEC

@@ -1,7 +1,7 @@
-// One-shot bulk build for LSM-Vec, used by pglsmvec's in-memory
-// CREATE INDEX path. Pipeline (see pglsmvec/doc/in-memory-build-plan.md):
+// One-shot bulk build for AsterVec, used by pgastervec's in-memory
+// CREATE INDEX path. Pipeline (see pgastervec/doc/in-memory-build-plan.md):
 //
-//   1. RNN-Descent (lsm_vec_rnn_descent) builds a layer-0 KNN graph
+//   1. RNN-Descent (astervec_rnn_descent) builds a layer-0 KNN graph
 //      from the in-memory float* blob, fully multi-threaded.
 //   2. Per-node HNSW levels are drawn via randomLevel().
 //   3. Vectors + layer-0 edges are bulk-written to AsterDB. No per-row
@@ -22,12 +22,12 @@
 #include <vector>
 
 #include "distance.h"
-#include "lsm_vec_index.h"
-#include "lsm_vec_rnn_descent.h"
+#include "astervec_index.h"
+#include "astervec_rnn_descent.h"
 #include "logger.h"
 #include "rocksdb/graph.h"
 
-namespace lsm_vec {
+namespace astervec {
 
 namespace {
 
@@ -62,7 +62,7 @@ void parallel_for(int begin, int end, int chunk_size, int num_threads,
 // ---------------------------------------------------------------------
 // Phase D — vectors + layer-0 edges to disk
 // ---------------------------------------------------------------------
-void LSMVec::bulkLoadLayer0(const float* vectors, int n,
+void AsterVec::bulkLoadLayer0(const float* vectors, int n,
                             const int* csr_offsets, const int* csr_neighbors,
                             const int* levels,
                             int num_threads) {
@@ -212,7 +212,7 @@ void LSMVec::bulkLoadLayer0(const float* vectors, int n,
         scored.reserve(a.size());
         for (int w : a) {
             const float* wv = vectors + static_cast<size_t>(w) * dim;
-            float d = lsm_vec::distance::ComputeDistance(
+            float d = astervec::distance::ComputeDistance(
                 db_options_.metric, vv, wv,
                 static_cast<size_t>(dim));
             scored.emplace_back(d, w);
@@ -271,7 +271,7 @@ void LSMVec::bulkLoadLayer0(const float* vectors, int n,
 // Phase E worker — upper-layer-only insertNode
 // ---------------------------------------------------------------------
 //
-// Mirrors the layer >= 1 logic of LSMVec::insertNode (steps 4, 5, 8 in
+// Mirrors the layer >= 1 logic of AsterVec::insertNode (steps 4, 5, 8 in
 // the source comments). Differences:
 //   - presetLevel is given by the caller (drawn once up front), not via
 //     randomLevel().
@@ -280,7 +280,7 @@ void LSMVec::bulkLoadLayer0(const float* vectors, int n,
 //   - Caller guarantees nodes_[nodeId] is pre-published with the
 //     vector and empty neighbours map, and that entry_point_ and
 //     max_layer_ are already set to the bulk-build's final values.
-void LSMVec::addPointUpperLayersOnly(node_id_t nodeId,
+void AsterVec::addPointUpperLayersOnly(node_id_t nodeId,
                                      const float* vec_ptr,
                                      int presetLevel) {
     if (presetLevel < 1) return;  // nothing to do — caller may filter
@@ -362,7 +362,7 @@ void LSMVec::addPointUpperLayersOnly(node_id_t nodeId,
 // ---------------------------------------------------------------------
 // Public entry: bulkBuild
 // ---------------------------------------------------------------------
-void LSMVec::bulkBuild(const float* vectors, int n,
+void AsterVec::bulkBuild(const float* vectors, int n,
                        const BulkBuildOptions& opts) {
     if (n <= 0) return;
     if (vector_dim_ <= 0) {
@@ -460,4 +460,4 @@ void LSMVec::bulkBuild(const float* vectors, int n,
     std::vector<int>().swap(rnnd.offsets);
 }
 
-}  // namespace lsm_vec
+}  // namespace astervec

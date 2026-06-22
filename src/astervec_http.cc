@@ -1,4 +1,4 @@
-// LSM-Vec HTTP server — endpoints and request handlers.
+// AsterVec HTTP server — endpoints and request handlers.
 //
 // API surface (matches the design docs §5.3):
 //   GET    /health                       — gateway / liveness probe
@@ -16,7 +16,7 @@
 // JSON request/response. All errors as
 //   { "error": "...", "code": "..." } with appropriate HTTP status.
 
-#include "lsm_vec_http.h"
+#include "astervec_http.h"
 
 #include "httplib.h"
 #include "json.hpp"
@@ -37,7 +37,7 @@
 #include <thread>
 #include <vector>
 
-namespace lsm_vec {
+namespace astervec {
 
 using json = nlohmann::json;
 
@@ -46,24 +46,42 @@ namespace {
 constexpr char kBootstrapFileName[] = "lsm_vec_http_bootstrap.json";
 
 // ---------- env helpers ----------
+// Runtime compatibility boundary: the engine was renamed LSM-Vec -> AsterVec, but
+// existing pilot containers / ops still pass LSMVEC_*. Accept the new ASTERVEC_*
+// name and fall back to the legacy LSMVEC_* name (one-line deprecation note).
+const char* getenv_compat(const char* name) {
+    if (const char* v = std::getenv(name)) return v;
+    std::string n(name);
+    static const std::string kNewPfx = "ASTERVEC_";
+    if (n.compare(0, kNewPfx.size(), kNewPfx) == 0) {
+        std::string legacy = "LSMVEC_" + n.substr(kNewPfx.size());
+        if (const char* v = std::getenv(legacy.c_str())) {
+            std::fprintf(stderr,
+                "[astervec] note: env var %s is deprecated; use %s\n",
+                legacy.c_str(), name);
+            return v;
+        }
+    }
+    return nullptr;
+}
 std::string env_or(const char* name, std::string deflt) {
-    if (const char* v = std::getenv(name)) return std::string(v);
+    if (const char* v = getenv_compat(name)) return std::string(v);
     return deflt;
 }
 int env_int(const char* name, int deflt) {
-    if (const char* v = std::getenv(name)) {
+    if (const char* v = getenv_compat(name)) {
         try { return std::stoi(v); } catch (...) {}
     }
     return deflt;
 }
 std::size_t env_size(const char* name, std::size_t deflt) {
-    if (const char* v = std::getenv(name)) {
+    if (const char* v = getenv_compat(name)) {
         try { return static_cast<std::size_t>(std::stoull(v)); } catch (...) {}
     }
     return deflt;
 }
 bool env_bool(const char* name, bool deflt) {
-    if (const char* v = std::getenv(name)) {
+    if (const char* v = getenv_compat(name)) {
         std::string s(v);
         for (auto& c : s) c = static_cast<char>(std::tolower(c));
         if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
@@ -206,32 +224,32 @@ void startShutdownWatcher() {
 // ============================================================
 
 bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err) {
-    cfg->port = env_int("LSMVEC_PORT", 8000);
+    cfg->port = env_int("ASTERVEC_PORT", 8000);
     // Default: 1 thread per container. Per-user-container model
     // handles isolation; no contention within a single container.
-    // Override with LSMVEC_HTTP_THREADS=N on dedicated hardware.
-    cfg->http_threads = env_int("LSMVEC_HTTP_THREADS", 1);
-    cfg->data_dir = env_or("LSMVEC_DATA_DIR", "/data");
-    cfg->dim = env_int("LSMVEC_DIM", 0);
+    // Override with ASTERVEC_HTTP_THREADS=N on dedicated hardware.
+    cfg->http_threads = env_int("ASTERVEC_HTTP_THREADS", 1);
+    cfg->data_dir = env_or("ASTERVEC_DATA_DIR", "/data");
+    cfg->dim = env_int("ASTERVEC_DIM", 0);
 
-    std::string metric = env_or("LSMVEC_METRIC", "l2");
+    std::string metric = env_or("ASTERVEC_METRIC", "l2");
     for (auto& c : metric) c = static_cast<char>(std::tolower(c));
     if      (metric == "l2")     cfg->metric = DistanceMetric::kL2;
     else if (metric == "cosine") cfg->metric = DistanceMetric::kCosine;
     else {
-        *err = "LSMVEC_METRIC must be 'l2' or 'cosine' (got '" + metric + "')";
+        *err = "ASTERVEC_METRIC must be 'l2' or 'cosine' (got '" + metric + "')";
         return false;
     }
 
-    cfg->m                  = env_int("LSMVEC_M", 8);
-    cfg->m_max              = env_int("LSMVEC_MMAX", 24);
-    cfg->ef_construction    = env_int("LSMVEC_EFC", 32);
-    cfg->ef_search_default  = env_int("LSMVEC_EFS_DEFAULT", 128);
-    cfg->edge_cache_size    = env_size("LSMVEC_EDGE_CACHE_SIZE", 100000);
-    cfg->vec_file_capacity  = env_size("LSMVEC_VEC_FILE_CAPACITY", 1000000);
-    cfg->paged_max_cached_pages = env_size("LSMVEC_PAGED_MAX_CACHED_PAGES", 8192);
-    cfg->enable_stats       = env_bool("LSMVEC_ENABLE_STATS", false);
-    cfg->log_level          = env_or("LSMVEC_LOG_LEVEL", "info");
+    cfg->m                  = env_int("ASTERVEC_M", 8);
+    cfg->m_max              = env_int("ASTERVEC_MMAX", 24);
+    cfg->ef_construction    = env_int("ASTERVEC_EFC", 32);
+    cfg->ef_search_default  = env_int("ASTERVEC_EFS_DEFAULT", 128);
+    cfg->edge_cache_size    = env_size("ASTERVEC_EDGE_CACHE_SIZE", 100000);
+    cfg->vec_file_capacity  = env_size("ASTERVEC_VEC_FILE_CAPACITY", 1000000);
+    cfg->paged_max_cached_pages = env_size("ASTERVEC_PAGED_MAX_CACHED_PAGES", 8192);
+    cfg->enable_stats       = env_bool("ASTERVEC_ENABLE_STATS", false);
+    cfg->log_level          = env_or("ASTERVEC_LOG_LEVEL", "info");
 
     // Bootstrap: if data dir already has a bootstrap.json, the dim/metric
     // there is authoritative. Otherwise this is first boot and env dim/
@@ -240,7 +258,7 @@ bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err) {
     if (readBootstrap(cfg->data_dir, &saved)) {
         // Existing DB: validate that env matches if env was set.
         if (cfg->dim > 0 && cfg->dim != saved.dim) {
-            *err = "LSMVEC_DIM (" + std::to_string(cfg->dim) +
+            *err = "ASTERVEC_DIM (" + std::to_string(cfg->dim) +
                    ") does not match existing DB dim (" +
                    std::to_string(saved.dim) + ")";
             return false;
@@ -250,8 +268,8 @@ bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err) {
         for (auto& c : saved_metric) c = static_cast<char>(std::tolower(c));
         if (saved_metric != metric) {
             // Allow env to default to l2 silently if the DB says l2.
-            if (!(metric == "l2" && std::getenv("LSMVEC_METRIC") == nullptr)) {
-                *err = "LSMVEC_METRIC ('" + metric +
+            if (!(metric == "l2" && getenv_compat("ASTERVEC_METRIC") == nullptr)) {
+                *err = "ASTERVEC_METRIC ('" + metric +
                        "') does not match existing DB metric ('" +
                        saved.metric + "')";
                 return false;
@@ -260,7 +278,7 @@ bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err) {
         if      (saved_metric == "cosine") cfg->metric = DistanceMetric::kCosine;
         else                               cfg->metric = DistanceMetric::kL2;
     } else {
-        // First boot. If LSMVEC_DIM was provided (operator pre-init / back-compat),
+        // First boot. If ASTERVEC_DIM was provided (operator pre-init / back-compat),
         // persist it now and the server opens the DB at boot. Otherwise leave the
         // index UNINITIALIZED (cfg->dim stays 0, no bootstrap written): the server
         // boots without a DB and the user calls PUT /v1/index to set the dimension.
@@ -313,8 +331,8 @@ std::size_t processAnonRssBytes() {
 
 // Build engine options from the server config. Used both at boot
 // (RunHttpServer) and at runtime when PUT /v1/index opens the DB.
-LSMVecDBOptions buildOptions(const HttpServerConfig& cfg) {
-    LSMVecDBOptions opts;
+AsterVecDBOptions buildOptions(const HttpServerConfig& cfg) {
+    AsterVecDBOptions opts;
     opts.dim                  = cfg.dim;
     opts.metric               = cfg.metric;
     opts.m                    = cfg.m;
@@ -340,7 +358,7 @@ LSMVecDBOptions buildOptions(const HttpServerConfig& cfg) {
 // concurrent DELETE swaps it out.
 struct ServerState {
     std::mutex                  mu;
-    std::shared_ptr<LSMVecDB>   db;   // null == uninitialized
+    std::shared_ptr<AsterVecDB>   db;   // null == uninitialized
     HttpServerConfig            cfg;  // dim/metric set by PUT /v1/index
 };
 
@@ -468,13 +486,13 @@ public:
 private:
     // Live DB pointer (null when uninitialized). Copy under the lock so the
     // DB stays alive for the caller even if a concurrent DELETE swaps it out.
-    std::shared_ptr<LSMVecDB> dbShared() {
+    std::shared_ptr<AsterVecDB> dbShared() {
         std::lock_guard<std::mutex> lk(st_->mu);
         return st_->db;
     }
 
     // Data-route guard: returns the live DB, or null after sending a 409.
-    std::shared_ptr<LSMVecDB> requireInit(httplib::Response& res) {
+    std::shared_ptr<AsterVecDB> requireInit(httplib::Response& res) {
         auto sp = dbShared();
         if (!sp) {
             sendError(res, 409, "index_not_initialized",
@@ -494,7 +512,7 @@ private:
     int handleInsert(const httplib::Request& req, httplib::Response& res) {
         auto sp = requireInit(res);
         if (!sp) return 409;
-        LSMVecDB* db_ = sp.get();
+        AsterVecDB* db_ = sp.get();
         json body;
         try { body = json::parse(req.body); }
         catch (const std::exception& e) {
@@ -568,7 +586,7 @@ private:
     int handleInsertBatch(const httplib::Request& req, httplib::Response& res) {
         auto sp = requireInit(res);
         if (!sp) return 409;
-        LSMVecDB* db_ = sp.get();
+        AsterVecDB* db_ = sp.get();
         static constexpr std::size_t kMaxBatchItems = 10000;
         static constexpr std::size_t kMaxBatchBytes = 64 * 1024 * 1024;  // 64 MB
         // R3: bound the body BEFORE parsing (global cap is bulk_build_max_length).
@@ -688,7 +706,7 @@ private:
     int handleGet(const httplib::Request& req, httplib::Response& res) {
         auto sp = requireInit(res);
         if (!sp) return 409;
-        LSMVecDB* db_ = sp.get();
+        AsterVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -707,7 +725,7 @@ private:
     int handlePut(const httplib::Request& req, httplib::Response& res) {
         auto sp = requireInit(res);
         if (!sp) return 409;
-        LSMVecDB* db_ = sp.get();
+        AsterVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -743,7 +761,7 @@ private:
     int handleDelete(const httplib::Request& req, httplib::Response& res) {
         auto sp = requireInit(res);
         if (!sp) return 409;
-        LSMVecDB* db_ = sp.get();
+        AsterVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -761,7 +779,7 @@ private:
     int handleGetPayload(const httplib::Request& req, httplib::Response& res) {
         auto sp = requireInit(res);
         if (!sp) return 409;
-        LSMVecDB* db_ = sp.get();
+        AsterVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -782,7 +800,7 @@ private:
     int handleSetPayload(const httplib::Request& req, httplib::Response& res) {
         auto sp = requireInit(res);
         if (!sp) return 409;
-        LSMVecDB* db_ = sp.get();
+        AsterVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -805,7 +823,7 @@ private:
     int handlePatchPayload(const httplib::Request& req, httplib::Response& res) {
         auto sp = requireInit(res);
         if (!sp) return 409;
-        LSMVecDB* db_ = sp.get();
+        AsterVecDB* db_ = sp.get();
         node_id_t id;
         std::string err;
         if (!parseId(req.matches[1].str(), &id, &err)) {
@@ -827,7 +845,7 @@ private:
     int handleSearch(const httplib::Request& req, httplib::Response& res) {
         auto sp = requireInit(res);
         if (!sp) return 409;
-        LSMVecDB* db_ = sp.get();
+        AsterVecDB* db_ = sp.get();
         json body;
         try { body = json::parse(req.body); }
         catch (const std::exception& e) {
@@ -877,17 +895,25 @@ private:
     int handleBulkBuild(const httplib::Request& req, httplib::Response& res) {
         auto sp = requireInit(res);
         if (!sp) return 409;
-        LSMVecDB* db_ = sp.get();
+        AsterVecDB* db_ = sp.get();
         // Header-driven shape (avoids JSON parsing of a 50+ MB blob).
         auto get_hdr = [&](const char* k) -> std::string {
             auto it = req.headers.find(k);
-            return it == req.headers.end() ? "" : it->second;
+            if (it != req.headers.end()) return it->second;
+            // Accept legacy X-LSMVec-* headers (old client) as well as X-AsterVec-*.
+            std::string key(k);
+            static const std::string kNewPfx = "X-AsterVec-";
+            if (key.compare(0, kNewPfx.size(), kNewPfx) == 0) {
+                auto it2 = req.headers.find("X-LSMVec-" + key.substr(kNewPfx.size()));
+                if (it2 != req.headers.end()) return it2->second;
+            }
+            return "";
         };
-        std::string h_n   = get_hdr("X-LSMVec-N");
-        std::string h_dim = get_hdr("X-LSMVec-Dim");
+        std::string h_n   = get_hdr("X-AsterVec-N");
+        std::string h_dim = get_hdr("X-AsterVec-Dim");
         if (h_n.empty() || h_dim.empty()) {
             sendError(res, 400, "missing_header",
-                      "X-LSMVec-N and X-LSMVec-Dim required");
+                      "X-AsterVec-N and X-AsterVec-Dim required");
             return 400;
         }
         long long n_ll = 0, dim_ll = 0;
@@ -896,7 +922,7 @@ private:
             dim_ll = std::stoll(h_dim);
         } catch (...) {
             sendError(res, 400, "bad_header",
-                      "X-LSMVec-N / X-LSMVec-Dim must be integers");
+                      "X-AsterVec-N / X-AsterVec-Dim must be integers");
             return 400;
         }
         if (n_ll <= 0 || dim_ll <= 0) {
@@ -906,7 +932,7 @@ private:
         }
         if (dim_ll != cfg_.dim) {
             sendError(res, 400, "wrong_dim",
-                      "X-LSMVec-Dim (" + std::to_string(dim_ll) +
+                      "X-AsterVec-Dim (" + std::to_string(dim_ll) +
                       ") does not match DB dim (" +
                       std::to_string(cfg_.dim) + ")");
             return 400;
@@ -966,14 +992,14 @@ private:
         }
 
         BulkBuildOptions bopts;
-        std::string h_threads = get_hdr("X-LSMVec-Threads");
+        std::string h_threads = get_hdr("X-AsterVec-Threads");
         if (!h_threads.empty()) {
             try { bopts.num_threads = std::stoi(h_threads); }
             catch (...) {}
         }
         // Default to single-threaded build to match the server's
         // single-thread-per-container philosophy. Caller can opt in
-        // to multi-threaded by setting X-LSMVec-Threads.
+        // to multi-threaded by setting X-AsterVec-Threads.
         if (bopts.num_threads <= 0) bopts.num_threads = 1;
 
         const float* vectors =
@@ -1078,8 +1104,8 @@ private:
         HttpServerConfig tmp = cfg_;
         tmp.dim = dim;
         tmp.metric = dm;
-        std::unique_ptr<LSMVecDB> dbu;
-        auto st = LSMVecDB::Open(tmp.data_dir, buildOptions(tmp), &dbu);
+        std::unique_ptr<AsterVecDB> dbu;
+        auto st = AsterVecDB::Open(tmp.data_dir, buildOptions(tmp), &dbu);
         if (!st.ok()) {
             std::error_code ec;
             std::filesystem::remove(
@@ -1171,7 +1197,7 @@ private:
 int RunHttpServer(const HttpServerConfig& cfg) {
     // 0. Block SIGTERM/SIGINT in MAIN thread BEFORE any other thread
     // spawns. RocksDB / Aster spawns background threads inside
-    // LSMVecDB::Open (compaction, flush). httplib spawns workers in
+    // AsterVecDB::Open (compaction, flush). httplib spawns workers in
     // srv.listen. Both inherit the main thread's signal mask at spawn
     // time. If we block after these spawns, the background threads
     // have SIGTERM unblocked → kernel can deliver to them → default
@@ -1179,14 +1205,14 @@ int RunHttpServer(const HttpServerConfig& cfg) {
     blockShutdownSignalsInThisThread();
 
     // 1. Server state. Open the DB now only if a dimension is known (existing
-    //    bootstrap.json, or LSMVEC_DIM on first boot). Otherwise stay
+    //    bootstrap.json, or ASTERVEC_DIM on first boot). Otherwise stay
     //    UNINITIALIZED — the DB opens later when a client calls PUT /v1/index.
     ServerState state;
     state.cfg = cfg;
 
     if (cfg.dim > 0) {
-        std::unique_ptr<LSMVecDB> db;
-        auto st = LSMVecDB::Open(cfg.data_dir, buildOptions(cfg), &db);
+        std::unique_ptr<AsterVecDB> db;
+        auto st = AsterVecDB::Open(cfg.data_dir, buildOptions(cfg), &db);
         if (!st.ok()) {
             std::cerr << "{\"event\":\"open_failed\",\"error\":\""
                       << st.ToString() << "\"}\n";
@@ -1268,4 +1294,4 @@ int RunHttpServer(const HttpServerConfig& cfg) {
     return 0;
 }
 
-}  // namespace lsm_vec
+}  // namespace astervec

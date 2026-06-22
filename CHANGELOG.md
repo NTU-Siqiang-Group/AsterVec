@@ -1,15 +1,15 @@
 # Changelog
 
-All notable changes to LSM-Vec are documented here. The format is based on
+All notable changes to AsterVec are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0]
 
 Features added to the engine since the initial public release.
 
 ### Added
-- **HTTP/REST server** (`lsm_vec_http`) — a one-binary service wrapper around the
+- **HTTP/REST server** (`astervec_http`) — a one-binary service wrapper around the
   engine — plus a Docker image. See [docs/HTTP_API.md](docs/HTTP_API.md).
 - **Index lifecycle** over HTTP: `PUT` / `GET` / `DELETE /v1/index` to create,
   inspect, and wipe the index (user-set dimension and metric).
@@ -30,6 +30,12 @@ Features added to the engine since the initial public release.
   `search(..., filter=...)`, `bulk_build`, `trim_memory`, `delete_stats`.
 
 ### Changed
+- **Renamed the engine from LSM-Vec to AsterVec.** Version `0.1.0` used the LSM-Vec
+  name; this version uses `astervec` for the PyPI package/import, C++ API
+  (`AsterVecDB`, `namespace astervec`), binaries, Docker image, and docs. The old
+  `lsm-vec` PyPI package remains as a deprecated alias, and the server still accepts
+  the legacy `LSMVEC_*` env vars and `X-LSMVec-*` headers, so existing pilots and the
+  `lsmvec-client` keep working.
 - Aster is now built **zstd-only**; snappy / lz4 / bzip / zlib are no longer
   required to build or run.
 - Input guards: over-capacity ids and out-of-range dimensions are rejected with a

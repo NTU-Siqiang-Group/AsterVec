@@ -2,7 +2,7 @@
 //
 // Concurrent-writer-refactor-plan §6 Phase 0 deliverable. Authored
 // here; expected to PASS only after Phase 3 lands the per-real-id
-// transaction lock at the LSMVecDB layer (see
+// transaction lock at the AsterVecDB layer (see
 // concurrent-writer-refactor-plan.md §5.2). Today the Upsert path
 // has a check-then-act race on `is_alive(R)` →
 // `allocate_update_id()` → `record_update_mapping(R, new_id)`, so
@@ -26,8 +26,8 @@
 //      (broken invariant: claims to be R's current id but is dead).
 
 #include "doctest.h"
-#include "lsm_vec_db.h"
-#include "lsm_vec_index.h"   // needed for index_for_test()->is_alive()
+#include "astervec_db.h"
+#include "astervec_index.h"   // needed for index_for_test()->is_alive()
 
 #include <atomic>
 #include <cstdint>
@@ -50,17 +50,17 @@ std::string NewTempDir(const char* prefix) {
     return std::string(dir);
 }
 
-std::unique_ptr<lsm_vec::LSMVecDB>
+std::unique_ptr<astervec::AsterVecDB>
 OpenFresh(const std::string& path, int dim) {
-    lsm_vec::LSMVecDBOptions opts;
+    astervec::AsterVecDBOptions opts;
     opts.dim = dim;
     opts.m = 8;
     opts.m_max = 24;
     opts.ef_construction = 32;
     opts.vec_file_capacity = 4096;
     opts.vector_file_path = path + "/vecs.bin";
-    std::unique_ptr<lsm_vec::LSMVecDB> db;
-    REQUIRE(lsm_vec::LSMVecDB::Open(path, opts, &db).ok());
+    std::unique_ptr<astervec::AsterVecDB> db;
+    REQUIRE(astervec::AsterVecDB::Open(path, opts, &db).ok());
     return db;
 }
 
@@ -81,7 +81,7 @@ TEST_CASE("Concurrent UPSERT race: N threads on the same real_id"
     constexpr int kIters     = 100;     // upserts per thread on the SAME id
     constexpr std::uint64_t kTargetId = 42;
 
-    std::string path = NewTempDir("lsmvec_upsert_race");
+    std::string path = NewTempDir("astervec_upsert_race");
     auto db = OpenFresh(path, kDim);
 
     // Seed the key so we exercise the "alive → Update" path, not the
@@ -90,7 +90,7 @@ TEST_CASE("Concurrent UPSERT race: N threads on the same real_id"
     {
         std::mt19937 rng(0xFEED);
         auto v = RandVec(kDim, rng);
-        REQUIRE(db->Insert(kTargetId, lsm_vec::Span<float>(v)).ok());
+        REQUIRE(db->Insert(kTargetId, astervec::Span<float>(v)).ok());
     }
 
     std::atomic<int> upsert_failures{0};
@@ -100,7 +100,7 @@ TEST_CASE("Concurrent UPSERT race: N threads on the same real_id"
             auto v = RandVec(kDim, rng);
             // Insert on an alive key routes to UpdateInternal — the
             // check-then-act race target.
-            auto st = db->Insert(kTargetId, lsm_vec::Span<float>(v));
+            auto st = db->Insert(kTargetId, astervec::Span<float>(v));
             if (!st.ok()) {
                 upsert_failures.fetch_add(1, std::memory_order_relaxed);
             }
@@ -121,7 +121,7 @@ TEST_CASE("Concurrent UPSERT race: N threads on the same real_id"
     //      which thread wrote last, so just verify resolution still
     //      works and points at kTargetId.
     // index_for_test() exposes is_alive; HasLiveVector is private since
-    // we skip 9f14958 (pglsmvec-specific public API).
+    // we skip 9f14958 (pgastervec-specific public API).
     CHECK(db->index_for_test()->is_alive(kTargetId));
 
     // (3) Read-back via Get must succeed and return some valid vector

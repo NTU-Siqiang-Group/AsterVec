@@ -5,7 +5,7 @@ REPO_ROOT := ..
 ASTER_ROOT := $(REPO_ROOT)/lib/aster
 BUILD_DIR ?= $(REPO_ROOT)/build
 
-LSMVEC_STATIC := $(BUILD_DIR)/lib/liblsmvec.a
+ASTERVEC_STATIC := $(BUILD_DIR)/lib/libastervec.a
 TEST_SOURCES := test.cc
 
 INCLUDES := \
@@ -20,16 +20,16 @@ LIB_DIRS := \
 
 LIBS := -lrocksdb -lzstd -lsnappy -llz4 -lbz2 -lz -lpthread -ldl -ljemalloc
 
-TARGET := lsm_vec_test
+TARGET := astervec_test
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): $(LSMVEC_STATIC) $(TEST_SOURCES)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LIB_DIRS) $(TEST_SOURCES) $(LSMVEC_STATIC) -o $@ $(LIBS)
+$(TARGET): $(ASTERVEC_STATIC) $(TEST_SOURCES)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LIB_DIRS) $(TEST_SOURCES) $(ASTERVEC_STATIC) -o $@ $(LIBS)
 
-$(LSMVEC_STATIC):
+$(ASTERVEC_STATIC):
 	$(MAKE) -C $(REPO_ROOT) static
 
 clean:

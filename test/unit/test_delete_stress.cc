@@ -18,18 +18,18 @@
 #include <vector>
 
 #include "doctest.h"
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 
-using lsm_vec::LSMVecDB;
-using lsm_vec::LSMVecDBOptions;
-using lsm_vec::SearchOptions;
-using lsm_vec::SearchResult;
-using lsm_vec::Span;
+using astervec::AsterVecDB;
+using astervec::AsterVecDBOptions;
+using astervec::SearchOptions;
+using astervec::SearchResult;
+using astervec::Span;
 
 namespace {
 
 std::string make_path(const char* tag) {
-    std::string tmpl = std::string("/tmp/lsmvec_C9_") + tag + "_XXXXXX";
+    std::string tmpl = std::string("/tmp/astervec_C9_") + tag + "_XXXXXX";
     std::vector<char> buf(tmpl.begin(), tmpl.end());
     buf.push_back('\0');
     char* dir = mkdtemp(buf.data());
@@ -37,15 +37,15 @@ std::string make_path(const char* tag) {
     return dir;
 }
 
-std::unique_ptr<LSMVecDB> open_db(const std::string& path, int dim, uint64_t cap,
+std::unique_ptr<AsterVecDB> open_db(const std::string& path, int dim, uint64_t cap,
                                    uint64_t seed = 1) {
-    LSMVecDBOptions opts;
+    AsterVecDBOptions opts;
     opts.dim                  = dim;
     opts.vec_file_capacity    = cap;
     opts.vector_file_path     = path + "/vecs.bin";
     opts.random_seed          = seed;
-    std::unique_ptr<LSMVecDB> db;
-    REQUIRE(LSMVecDB::Open(path, opts, &db).ok());
+    std::unique_ptr<AsterVecDB> db;
+    REQUIRE(AsterVecDB::Open(path, opts, &db).ok());
     return db;
 }
 

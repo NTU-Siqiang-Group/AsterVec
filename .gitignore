@@ -1,5 +1,5 @@
 # SSH private key for the trial server — never commit
-lsmvec-key.pem
+astervec-key.pem
 *.pem
 
 # Benchmark scaffolding & datasets — local only, not tracked.

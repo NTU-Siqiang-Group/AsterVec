@@ -6,7 +6,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/write_batch.h"
 
-namespace lsm_vec {
+namespace astervec {
 
 using ROCKSDB_NAMESPACE::PinnableSlice;
 using ROCKSDB_NAMESPACE::ReadOptions;
@@ -95,4 +95,4 @@ MetadataStore::Status MetadataStore::DeleteKeys(node_id_t id,
     return Put(id, existing);
 }
 
-}  // namespace lsm_vec
+}  // namespace astervec

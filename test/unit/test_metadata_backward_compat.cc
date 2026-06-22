@@ -6,22 +6,22 @@
 
 #include "doctest.h"
 #include "json.hpp"
-#include "lsm_vec_db.h"
+#include "astervec_db.h"
 
 TEST_CASE("Opening a DB that was created before metadata feature works") {
-    char tmpl[] = "/tmp/lsmvec_bc_XXXXXX";
+    char tmpl[] = "/tmp/astervec_bc_XXXXXX";
     std::string path = mkdtemp(tmpl);
 
     // First open: creates metadata CF. Insert a few vectors without metadata.
     {
-        lsm_vec::LSMVecDBOptions opts;
+        astervec::AsterVecDBOptions opts;
         opts.dim = 4;
         opts.vec_file_capacity = 100;
         opts.vector_file_path = path + "/vecs.bin";
-        std::unique_ptr<lsm_vec::LSMVecDB> db;
-        REQUIRE(lsm_vec::LSMVecDB::Open(path, opts, &db).ok());
+        std::unique_ptr<astervec::AsterVecDB> db;
+        REQUIRE(astervec::AsterVecDB::Open(path, opts, &db).ok());
         std::vector<float> v{1, 2, 3, 4};
-        for (uint64_t i = 0; i < 10; ++i) REQUIRE(db->Insert(i, lsm_vec::Span<float>(v)).ok());
+        for (uint64_t i = 0; i < 10; ++i) REQUIRE(db->Insert(i, astervec::Span<float>(v)).ok());
         db->Close();
     }
 
@@ -31,12 +31,12 @@ TEST_CASE("Opening a DB that was created before metadata feature works") {
 
     // Second open: metadata CF must be re-created; vectors still accessible.
     {
-        lsm_vec::LSMVecDBOptions opts;
+        astervec::AsterVecDBOptions opts;
         opts.dim = 4;
         opts.vec_file_capacity = 100;
         opts.vector_file_path = path + "/vecs.bin";
-        std::unique_ptr<lsm_vec::LSMVecDB> db;
-        REQUIRE(lsm_vec::LSMVecDB::Open(path, opts, &db).ok());
+        std::unique_ptr<astervec::AsterVecDB> db;
+        REQUIRE(astervec::AsterVecDB::Open(path, opts, &db).ok());
         CHECK(std::filesystem::exists(path + "/metadata"));
 
         std::vector<float> out;
@@ -51,26 +51,26 @@ TEST_CASE("Metadata survives clean close+reopen round-trip (I2)") {
     // Insert vectors with metadata, Close(), reopen the SAME path,
     // and verify metadata round-trips through RocksDB's WAL / compaction.
     // Also exercises the full lifecycle: payload CRUD after reopen.
-    char tmpl[] = "/tmp/lsmvec_rtt_XXXXXX";
+    char tmpl[] = "/tmp/astervec_rtt_XXXXXX";
     char* dir = mkdtemp(tmpl);
     REQUIRE(dir != nullptr);
     std::string path = dir;
 
     // Phase 1: populate.
     {
-        lsm_vec::LSMVecDBOptions opts;
+        astervec::AsterVecDBOptions opts;
         opts.dim = 4;
         opts.vec_file_capacity = 100;
         opts.vector_file_path = path + "/vecs.bin";
-        std::unique_ptr<lsm_vec::LSMVecDB> db;
-        REQUIRE(lsm_vec::LSMVecDB::Open(path, opts, &db).ok());
+        std::unique_ptr<astervec::AsterVecDB> db;
+        REQUIRE(astervec::AsterVecDB::Open(path, opts, &db).ok());
 
         std::vector<float> v{1.0f, 2.0f, 3.0f, 4.0f};
-        REQUIRE(db->Insert(1, lsm_vec::Span<float>(v),
+        REQUIRE(db->Insert(1, astervec::Span<float>(v),
                            R"({"tenant":"acme","n":1})").ok());
-        REQUIRE(db->Insert(2, lsm_vec::Span<float>(v),
+        REQUIRE(db->Insert(2, astervec::Span<float>(v),
                            R"({"tenant":"acme","n":2})").ok());
-        REQUIRE(db->Insert(3, lsm_vec::Span<float>(v)).ok());  // no metadata
+        REQUIRE(db->Insert(3, astervec::Span<float>(v)).ok());  // no metadata
 
         // Mutate via the payload APIs to make sure RMW updates also persist.
         REQUIRE(db->UpdatePayload(2, R"({"n":22,"new":true})").ok());
@@ -81,12 +81,12 @@ TEST_CASE("Metadata survives clean close+reopen round-trip (I2)") {
 
     // Phase 2: reopen same path, verify every payload mutation survived.
     {
-        lsm_vec::LSMVecDBOptions opts;
+        astervec::AsterVecDBOptions opts;
         opts.dim = 4;
         opts.vec_file_capacity = 100;
         opts.vector_file_path = path + "/vecs.bin";
-        std::unique_ptr<lsm_vec::LSMVecDB> db;
-        REQUIRE(lsm_vec::LSMVecDB::Open(path, opts, &db).ok());
+        std::unique_ptr<astervec::AsterVecDB> db;
+        REQUIRE(astervec::AsterVecDB::Open(path, opts, &db).ok());
 
         std::string md;
         REQUIRE(db->GetPayload(1, &md).ok());
