@@ -1,4 +1,4 @@
-name: Build and publish to PyPI
+name: Build and publish AsterVec wheels
 
 on:
   release:
@@ -7,14 +7,18 @@ on:
 
 jobs:
   build_wheels:
-    name: Build wheels on ${{ matrix.os }}
+    name: Build wheels (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14]
-        # ubuntu-22.04: Linux x86_64
-        # macos-14: macOS arm64 (Apple Silicon)
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            arch: x86_64
+          - name: macos-arm64
+            os: macos-14
+            arch: arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -24,50 +28,46 @@ jobs:
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.21
         env:
-          # Target architectures
-          CIBW_ARCHS_LINUX: x86_64
-          CIBW_ARCHS_MACOS: native
+          CIBW_ARCHS: ${{ matrix.arch }}
 
           # Use manylinux_2_28 for broader glibc compatibility
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
 
-          # Skip Python 3.8, PyPy, and musllinux
-          CIBW_SKIP: "cp38-* pp* *-musllinux*"
+          # AsterVec supports CPython 3.9+.
+          CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-*"
+          CIBW_SKIP: "*-musllinux*"
 
-          # Install system dependencies and build Aster (Linux - inside manylinux container)
-          # Note: AlmaLinux 8 uses libzstd-devel (not zstd-devel), and needs EPEL for some packages
+          # AsterVec 0.2.0 builds Aster zstd-only. Do not install/link snappy,
+          # lz4, bzip2, or zlib for the wheel build.
           CIBW_BEFORE_ALL_LINUX: >
             yum install -y epel-release &&
-            yum install -y libzstd-devel snappy-devel lz4-devel bzip2-devel
-            zlib-devel boost-devel &&
+            yum install -y libzstd-devel boost-devel &&
             cd {project} && make aster
 
-          # Install system dependencies and build Aster (macOS)
-          # Export MACOSX_DEPLOYMENT_TARGET before building to avoid std::optional::value() availability errors
           CIBW_BEFORE_ALL_MACOS: >
-            brew install zstd snappy lz4 boost &&
-            export MACOSX_DEPLOYMENT_TARGET=10.14 &&
+            brew install zstd boost jemalloc &&
+            export MACOSX_DEPLOYMENT_TARGET=14.0 &&
+            export CPATH="$(brew --prefix)/include" &&
             cd {project} &&
-            make -C lib/aster static_lib -j$(sysctl -n hw.ncpu) DEBUG_LEVEL=0
-            DISABLE_WARNING_AS_ERROR=1
-            EXTRA_CXXFLAGS="-fPIC -I$(brew --prefix boost)/include"
+            make aster
 
-          CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=10.14"
+          CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=14.0"
 
-          # Pass both Python build and static linking flags
-          CIBW_CONFIG_SETTINGS: "cmake.args=-DASTERVEC_BUILD_PYTHON=ON;-DASTERVEC_PYTHON_STATIC=ON"
+          # Build only the Python extension for wheels, linked statically.
+          CIBW_CONFIG_SETTINGS: "cmake.args=-DASTERVEC_BUILD_PYTHON=ON;-DASTERVEC_PYTHON_STATIC=ON;-DASTERVEC_BUILD_HTTP=OFF;-DASTERVEC_BUILD_UNIT_TESTS=OFF"
 
-          # Repair wheels (bundle shared libs)
-          # Linux: auditwheel bundles any dynamically linked libs
+          CIBW_TEST_COMMAND: "python -c \"import astervec; print(astervec.__name__)\""
+
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
             auditwheel repair -w {dest_dir} {wheel}
 
-          # macOS: skip delocate — static linking means no external dylibs to bundle
-          CIBW_REPAIR_WHEEL_COMMAND_MACOS: "cp {wheel} {dest_dir}"
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
+            python -m pip install delocate &&
+            delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.name }}
           path: ./wheelhouse/*.whl
 
   publish:

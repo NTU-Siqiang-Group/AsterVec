@@ -32,8 +32,8 @@ classifiers = [
 keywords = ["vector-database", "ann", "hnsw", "rocksdb", "similarity-search"]
 
 [project.urls]
-Homepage = "https://github.com/NTU-Siqiang-Group/LSM-Vec"
-Repository = "https://github.com/NTU-Siqiang-Group/LSM-Vec"
+Homepage = "https://github.com/NTU-Siqiang-Group/AsterVec"
+Repository = "https://github.com/NTU-Siqiang-Group/AsterVec"
 
 [tool.scikit-build]
 wheel.packages = []
