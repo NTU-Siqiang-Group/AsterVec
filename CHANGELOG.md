@@ -33,9 +33,8 @@ Features added to the engine since the initial public release.
 - **Renamed the engine from LSM-Vec to AsterVec.** Version `0.1.0` used the LSM-Vec
   name; this version uses `astervec` for the PyPI package/import, C++ API
   (`AsterVecDB`, `namespace astervec`), binaries, Docker image, and docs. The old
-  `lsm-vec` PyPI package remains as a deprecated alias, and the server still accepts
-  the legacy `LSMVEC_*` env vars and `X-LSMVec-*` headers, so existing pilots and the
-  `lsmvec-client` keep working.
+  `lsm-vec` PyPI package remains as a deprecated alias. Legacy `LSMVEC_*` env vars
+  and `X-LSMVec-*` headers are still accepted for compatibility.
 - Aster is now built **zstd-only**; snappy / lz4 / bzip / zlib are no longer
   required to build or run.
 - Input guards: over-capacity ids and out-of-range dimensions are rejected with a
@@ -44,3 +43,26 @@ Features added to the engine since the initial public release.
 ### Notes
 - The **graph-in-LSM** design (HNSW layer-0 edges persisted in Aster `RocksGraph`)
   and the paged, cached vector storage are the core of the engine.
+
+## [0.1.0] - 2026-04-02
+
+Initial public release under the **LSM-Vec** name.
+
+### Added
+- Embeddable C++ vector engine with Python bindings (`pip install .`).
+- HNSW approximate nearest-neighbor search with configurable `M`, `Mmax`,
+  `m_level`, `ef_construction`, `ef_search`, and `k`.
+- Disk-oriented graph storage: layer-0 HNSW edges persisted in Aster `RocksGraph`,
+  with upper navigation layers kept in memory.
+- Persistent vector storage with paged 4 KB layout and page cache.
+- Batch vector reads to reduce repeated disk I/O during graph search.
+- L2 and Cosine distance metrics with SIMD-accelerated distance computation.
+- Basic lifecycle APIs: insert, update, delete, get, search, close/reopen.
+- Benchmark/test CLI for loading vector datasets, running k-NN queries, and
+  comparing against ground truth.
+
+### Notes
+- The project was published as `lsm-vec`, imported as `lsm_vec`, and exposed the
+  C++ API as `LSMVecDB` in `namespace lsm_vec`.
+- HTTP service mode, metadata payloads, filtered search, batch insert, bulk build,
+  SQ8, and the AsterVec rename were added later in `0.2.0`.

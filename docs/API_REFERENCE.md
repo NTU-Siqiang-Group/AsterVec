@@ -38,11 +38,32 @@ import astervec            # Python (pybind11 bindings)
   - [17. Metadata Filter Operators](#17-metadata-filter-operators)
   - [18. Error Handling](#18-error-handling)
 - [Build and Linking](#build-and-linking)
+- [Concurrency Model](#concurrency-model)
 
 > **Note on quantization.** Vectors are stored with 8-bit scalar quantization
 > (SQ8): `Get`/`get` returns a dequantized vector that differs from the input by
 > up to ~`range/255` per element, and distances/recall are computed on the
 > quantized form.
+
+---
+
+# Concurrency Model
+
+`AsterVecDB` is the supported concurrency boundary for embedded use. Normal
+operations (`Insert`, `SearchKnn`, `Update`, `Delete`, and payload methods) are
+caller-driven: run them from your application's worker pool when you want
+parallelism. There is no global "engine thread count" for these methods.
+
+Writes to the same real id are serialized by the DB layer; operations on
+different ids and concurrent searches can proceed from different application
+threads. `BulkBuild` is different: it is an initial-load-only operation with its
+own internal parallelism (`BulkBuildOptions::num_threads` in C++,
+`threads=...` in Python) and should run on an empty DB before incremental
+updates begin.
+
+For the optional HTTP server, `ASTERVEC_HTTP_THREADS` controls request-level
+concurrency. `/v1/build/bulk` can additionally use `X-AsterVec-Threads` for the
+bulk-build operation itself.
 
 ---
 
@@ -208,7 +229,6 @@ thread-safe).
 | `k` | `int` | `1` | Default neighbors for the no-options search overload. |
 | `vec_file_capacity` | `size_t` | `100000` | Initial vector-file capacity (auto-expands when paged). |
 | `paged_max_cached_pages` | `size_t` | `8192` | 4 KB pages in the user-space page cache. |
-| `vector_storage_type` | `int` | `1` | `0` = flat file, `1` = paged + cached. |
 | `edge_cache_size` | `size_t` | `100000` | In-memory graph edge cache entries. |
 | `db_target_size` | `uint64_t` | `~100 GiB` | Aster (RocksDB) target file size hint. |
 | `random_seed` | `int` | `12345` | RNG seed for HNSW level generation. |
@@ -256,7 +276,8 @@ python -c "import astervec; print('OK')"
 ```
 
 The Python package is published on PyPI as **`aster-vec`** and imported as
-`import astervec`. (Distinct from `lsmvec-client`, the HTTP client.)
+`import astervec`. This is the embedded engine module; for the optional REST
+server, see [HTTP_API.md](HTTP_API.md).
 
 ---
 
@@ -382,7 +403,6 @@ All properties are read-write.
 | `k` | `int` | `1` | Default neighbors for the bare `search_knn`. |
 | `vec_file_capacity` | `int` | `100000` | Initial vector-file capacity. |
 | `paged_max_cached_pages` | `int` | `8192` | Page cache size (4 KB pages). |
-| `vector_storage_type` | `int` | `1` | `0` = basic, `1` = paged. |
 | `db_target_size` | `int` | `107374182400` | Aster target file size (bytes). |
 | `random_seed` | `int` | `12345` | RNG seed. |
 | `enable_stats` | `bool` | `False` | Collect statistics. |

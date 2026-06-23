@@ -8,12 +8,11 @@ the compiled static library.
 
 ## Prerequisites
 
-1) Build Aster (RocksDB fork) under `lib/aster` from the repo root:
+1) Build Aster (RocksDB fork) from the repo root:
 
 ```bash
 git submodule update --init --recursive
-cd lib/aster
-make static_lib -j"$(nproc)" DEBUG_LEVEL=0 DISABLE_WARNING_AS_ERROR=1 EXTRA_CXXFLAGS=-fPIC
+make aster
 ```
 
 * Ensure system dependencies are installed (see the repo root `README.md`).

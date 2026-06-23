@@ -1,13 +1,13 @@
 # Contributing to AsterVec
 
-Thanks for your interest in AsterVec, an embeddable vector engine for local retrieval
-workloads. This guide covers building from source, running tests, and submitting
-changes.
+Thanks for your interest in AsterVec, an embeddable vector engine for persistent
+AI retrieval with a small system-memory footprint. This guide covers building
+from source, running tests, and submitting changes.
 
 ## Development setup
 
 ```bash
-git clone --recurse-submodules https://github.com/NTU-Siqiang-Group/LSM-Vec.git
+git clone --recurse-submodules https://github.com/NTU-Siqiang-Group/AsterVec.git
 cd AsterVec
 
 # If you cloned without --recurse-submodules:
@@ -21,7 +21,7 @@ make unit_test    # build + run the test suite
 **Prerequisites:** a C++17 compiler (GCC 8+ / Clang 10+), CMake ≥ 3.10, GNU Make,
 Boost (headers only), and **zstd** (the only required compression library — Aster
 is built zstd-only). On macOS also install `jemalloc`. See the
-[README](README.md#build-from-source) for the package commands.
+[README](README.md#install--build) for the package commands.
 
 To work on the Python bindings: `python -m pip install .` (after `make aster`).
 
@@ -58,6 +58,13 @@ tests for new behavior where practical.
 2. Build cleanly and ensure the test suite passes.
 3. Describe what changed and why; reference any related issue.
 4. Update the relevant docs (`README.md`, `docs/`) when you change behavior or APIs.
+
+## AI-assisted contributions
+
+AI tools are fine as coding aids, but you are responsible for every submitted
+change. Please review generated code carefully, keep PRs focused, and be ready to
+explain the design and tradeoffs in your own words. If a material part of a PR was
+generated or rewritten with an AI tool, mention that in the PR description.
 
 ## Reporting issues
 

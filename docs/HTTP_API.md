@@ -199,7 +199,7 @@ X-AsterVec-Threads: 4        (optional; default 1)
 
 Errors: `409` if the index is not initialized or already holds data; `400` on a
 dim/header/payload mismatch; `413` if the body exceeds the bulk limit (~4 GB).
-The Python client wraps this as `bulk_build(...)`.
+The embedded Python API exposes the analogous operation as `bulk_build(...)`.
 
 ## Metadata filters
 

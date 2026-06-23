@@ -1,48 +1,38 @@
-# AsterVec — memory-friendly vector storage engine
-
 <p align="center">
-  <img src="docs/assets/aster-vec-poster.jpg" alt="AsterVec" width="350">
+  <img src="docs/assets/aster-vec-logo-text.png" alt="AsterVec" width="350">
 </p>
 
 <p align="center">
-  <b>A lightweight, memory-friendly vector storage engine for on-device retrieval.</b>
+  <b><span style="font-size: 1.15em;">The vector engine for on-device AI memory.</span></b>
 </p>
 
 <p align="center">
-  <a href="https://lsmvec.com">Website</a> ·
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#build-from-source">Build</a> ·
+  <a href="#install--build">Install / Build</a> ·
   <a href="docs/API_REFERENCE.md">Python / C++ API</a> ·
   <a href="docs/HTTP_API.md">HTTP API</a>
 </p>
 
-AsterVec is an embeddable vector engine for AI applications that need persistent
-retrieval close to the app. It keeps large vector indexes mostly on disk using
-**[Aster](https://github.com/NTU-Siqiang-Group/Aster)**, a graph-oriented LSM-tree storage engine,
-so agents and desktop RAG systems can run vector search without assuming a large always-on database server.
+AsterVec lets AI applications run persistent vector search with much less system
+memory. It stores vectors and the largest graph layer on disk with
+**[Aster](https://github.com/NTU-Siqiang-Group/Aster)**, a graph-oriented LSM-tree
+storage engine, while keeping only the hot navigation path in RAM. This makes
+retrieval practical on personal computers for AI agents and desktop RAG, while
+extending naturally to large-scale deployments.
 
-Use AsterVec as local retrieval infrastructure in two modes:
+Use AsterVec as a local vector retrieval layer in two modes:
 
-- **Embed it** *(primary)* — run the engine in-process for local agent memory,
-  RAG indexes, and app-owned vector storage.
+- **Embed it** *(primary)* — run the engine in-process for agent retrieval,
+  RAG embeddings, and app-owned vector storage.
 - **Serve it** *(optional)* — run `astervec_http` when an app needs a local REST
   boundary.
-
-> **Naming.** Asteroid is the product; AsterVec is the open-source engine in this
-> repo. The Python module is `astervec`; Asteroid Cloud is the managed service.
-
-> **Rename note.** AsterVec was previously named **LSM-Vec** (version `0.1.0`). The
-> latest version uses `astervec` for the Python package/import, C++ API, binaries,
-> Docker image, and HTTP config. The old `lsm-vec` PyPI package stays as a deprecated
-> alias, and the server still accepts the legacy `LSMVEC_*` env vars and `X-LSMVec-*`
-> headers, so existing deployments keep working.
 
 ## Why AsterVec?
 
 - **Minimal memory footprint.** Unlike vector databases that hold the whole index
   in RAM, AsterVec is disk-oriented — memory stays small and predictable at scale.
-- **Built for on-device retrieval.** Disk-backed indexing keeps persistent vector
-  search practical for agents, desktop RAG, and small servers.
+- **Built for on-device retrieval.** Disk-backed indexes keep persistent retrieval
+  practical for agents, desktop RAG, and small servers.
 - **Graph-in-LSM storage.** AsterVec persists the largest HNSW layer in Aster
   `RocksGraph`, keeping only the upper navigation layers in memory.
 - **Designed as an engine.** Embed it into your app when retrieval state should stay
@@ -52,14 +42,18 @@ Use AsterVec as local retrieval infrastructure in two modes:
 
 - **Local retrieval engine** — embed persistent vector search directly in Python or
   C++ applications.
+- **Thread-safe embedded API** — run search and incremental writes from application
+  worker threads.
 - **Agent/RAG-ready metadata** — attach JSON payloads and filter retrieval with
   Mongo-style predicates (`$eq`, `$gt`, `$in`, `$and`, ...).
+- **Mutable vector lifecycle** — upsert vectors, update payloads, and delete ids
+  without rebuilding the index.
 - **Disk-backed HNSW** — layer-0 edges live in Aster `RocksGraph`; upper layers stay
   in memory.
-- **Compact vector storage** — SQ8 quantization and paged storage reduce disk and
-  memory pressure.
-- **Ingestion paths** — insert/upsert, batch insert, and in-memory bulk build for
-  initial retrieval indexes.
+- **Graph-aware vector layout** — AsterVec places graph-near vectors into shared
+  4 KB pages, then uses page caching and SQ8 compression to keep reads compact.
+- **Fast initial loads** — build an empty index in memory when embeddings fit in
+  RAM; use streaming insert/update for incremental changes.
 - **Optional service mode** — expose the same engine through `astervec_http` when a
   REST boundary is useful.
 
@@ -86,7 +80,7 @@ opts.reinit = True               # start fresh
 
 db = astervec.AsterVecDB.open("./db", opts)
 
-db.insert(1, [0.1] * 128, metadata={"source": "notes", "type": "memory"})
+db.insert(1, [0.1] * 128, metadata={"source": "notes", "type": "snippet"})
 
 # k-NN search → list[SearchResult(id, distance)]
 for r in db.search_knn([0.1] * 128, k=10, ef_search=128):
@@ -101,6 +95,14 @@ db.close()
 Both Python lists and NumPy `float32` arrays are accepted. See the
 [Python / C++ API reference](docs/API_REFERENCE.md) and the
 [Python SDK guide](docs/python_sdk_guide.md).
+
+For initial loads, use `bulk_build` when the full embedding set fits in memory;
+use `insert` / `update` for incremental changes.
+
+```python
+vectors = np.random.rand(100_000, 128).astype("float32")
+report = db.bulk_build(vectors, threads=4)
+```
 
 ### C++
 
@@ -137,14 +139,20 @@ AsterVecDB (public API — astervec_db.h)
   └─ AsterVec (HNSW index)
        ├─ RocksGraph (Aster)  — layer-0 graph edges on disk (LSM-tree)
        ├─ nodes_ map          — upper-layer edges in memory
-       └─ IVectorStorage      — raw vectors on disk (paged + cached)
+       └─ IVectorStorage      — vectors on disk (graph-aware pages + cache + SQ8)
 ```
 
 AsterVec keeps the hot navigation path small. Upper HNSW layers stay in memory,
-while layer-0 edges and vector data are stored on disk. `PagedVectorStorage` stores
-vectors in 4 KB pages and caches recently used pages during search.
+while layer-0 edges and vector data are stored on disk. Instead of laying vectors
+out by id, the vector store uses the HNSW search path to choose a section for each
+vector, so vectors likely to be visited together are co-located in 4 KB pages. A
+small page cache and SQ8 compression keep search practical under tight memory
+budgets.
 
-## Build from source
+## Install / Build
+
+The Quick Start above is the normal path for using AsterVec from Python or C++.
+This section is for local development, contributors, and source builds.
 
 ### Prerequisites
 
@@ -168,11 +176,10 @@ brew install cmake boost zstd jemalloc
 ### Build
 
 ```bash
-git submodule update --init --recursive   # fetch the Aster submodule
-make aster                                 # build lib/aster/librocksdb.a (required first)
-make                                       # build build/lib/libastervec.{a,so} + the test binary (build/bin/astervec)
-python -m pip install .                    # (optional) build + install the Python module
-make unit_test                             # (optional) run the test suite
+git submodule update --init --recursive
+make aster
+make
+python -m pip install .
 ```
 
 `make` produces the static/shared libraries and the `astervec` test/benchmark binary.
@@ -197,17 +204,8 @@ docker build -t astervec:latest .                        # needs lib/aster popul
 docker run -d --name astervec -p 8000:8000 -v "$(pwd)/data:/data" astervec:latest
 ```
 
-```bash
-# Create the index, insert, search, inspect — over HTTP (toy 2-D vectors):
-H='content-type: application/json'
-curl -s -X PUT localhost:8000/v1/index -H "$H" -d '{"dim":2,"metric":"l2"}'
-curl -s localhost:8000/v1/vectors      -H "$H" -d '{"id":1,"vector":[0.1,0.2]}'
-curl -s localhost:8000/v1/search       -H "$H" -d '{"vector":[0.1,0.2],"k":10}'
-curl -s localhost:8000/v1/stats        # {"vectors":1,"dim":2,"metric":"l2","memory_bytes":...}
-```
-
-See the full **[HTTP API reference](docs/HTTP_API.md)** for every endpoint, the
-metadata-filter language, and configuration.
+See the full **[HTTP API reference](docs/HTTP_API.md)** for endpoint examples,
+metadata filters, and service configuration.
 
 ## Configuration
 
@@ -221,7 +219,6 @@ Pass an `AsterVecDBOptions` to `open`. Common fields:
 | `m_max` | `24` | HNSW max neighbors, upper layers. |
 | `ef_construction` | `32.0` | Candidate pool during construction. |
 | `ef_search` | `128` | Default candidate pool during search. |
-| `vector_storage_type` | `1` | `0` = flat file, `1` = paged + cached. |
 | `paged_max_cached_pages` | `8192` | Page cache size (4 KB pages). |
 | `reinit` | `false` | `true` = wipe on open; `false` = reopen. |
 | `vector_file_path` | `""` | Path to the vector data file. |
@@ -232,15 +229,6 @@ the complete list.
 
 For service mode, use `ASTERVEC_*` environment variables; see
 [HTTP_API.md](docs/HTTP_API.md).
-
-## Storage & quantization
-
-- **PagedVectorStorage** — stores vectors in 4 KB pages and caches recently used
-  pages, reducing repeated disk reads during graph search.
-- **BasicVectorStorage** — stores vectors in a contiguous flat file and relies on the
-  OS page cache.
-- **SQ8** — stores vectors as 8-bit scalar-quantized values; `get` returns
-  dequantized vectors, and search runs on the quantized representation.
 
 ## Test binary / benchmarking
 
@@ -275,7 +263,8 @@ batch read, etc.).
 
 ## Contributing
 
-Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for source
+builds, tests, PR expectations, and issue reports.
 
 ## License
 

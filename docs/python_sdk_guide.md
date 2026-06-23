@@ -5,8 +5,9 @@ bindings) — the embeddable, in-process interface. For the dense per-method
 reference see [API_REFERENCE.md](API_REFERENCE.md); for the optional HTTP/REST
 server see [HTTP_API.md](HTTP_API.md).
 
-> The PyPI package is **`aster-vec`** (`import astervec`). It is *not* the same as
-> `lsmvec-client`, which is a separate HTTP client for the `astervec_http` server.
+> The PyPI package is **`aster-vec`** (`import astervec`). This guide covers the
+> embedded Python engine module; for the optional REST server, see
+> [HTTP_API.md](HTTP_API.md).
 
 ## Prerequisites
 
@@ -136,7 +137,6 @@ concurrent calls from a thread pool — the engine is thread-safe).
 | `k` | `int` | `1` | Default neighbors for the bare `search_knn`. |
 | `vec_file_capacity` | `int` | `100000` | Initial vector-file capacity. |
 | `paged_max_cached_pages` | `int` | `8192` | Page cache size (4 KB pages). |
-| `vector_storage_type` | `int` | `1` | `0` = basic, `1` = paged. |
 | `enable_batch_read` | `bool` | `True` | Batch vector reads by page during search. |
 | `reinit` | `bool` | `False` | Wipe existing data on open. |
 | `vector_file_path` | `str` | `""` | Vector storage file path. |
