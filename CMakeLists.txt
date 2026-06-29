@@ -176,18 +176,14 @@ target_include_directories(astervec_shared PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
 target_link_libraries(astervec_static PUBLIC ${ASTERVEC_LINK_LIBS})
 target_link_libraries(astervec_shared PUBLIC ${ASTERVEC_LINK_LIBS})
-if(APPLE)
-    find_library(JEMALLOC_LIB NAMES jemalloc
-        HINTS /usr/local/lib /opt/homebrew/lib /opt/homebrew/opt/jemalloc/lib
-    )
-
-    if(JEMALLOC_LIB)
-        message(STATUS "Found jemalloc at: ${JEMALLOC_LIB}")
-        target_link_libraries(astervec_shared PRIVATE ${JEMALLOC_LIB})
-    else()
-        message(STATUS "jemalloc not found, skipping (optional)")
-    endif()
-endif()
+# NOTE: do NOT link jemalloc into astervec_shared / the embeddable libraries.
+# As an embedded library (Python extension, or a C++ app linking libastervec),
+# jemalloc registers a malloc zone and corrupts the host process's heap when its
+# allocations interleave with the host allocator (e.g. Python + SQLite) on macOS.
+# Aster is also built with ROCKSDB_DISABLE_JEMALLOC=1 (see Makefile). If the
+# standalone server ever wants jemalloc, link it onto the astervec_http executable
+# (process-level interposition, Linux), never here.
+# See docs/local/2026-06-28_1318_JEMALLOC_EMBED_FIX.md
 
 set_target_properties(astervec_static PROPERTIES
     OUTPUT_NAME astervec
@@ -202,7 +198,7 @@ set_target_properties(astervec_shared PROPERTIES
 # Add the executable target
 add_executable(astervec test/test.cc)
 target_include_directories(astervec PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(astervec PRIVATE astervec_shared)
+target_link_libraries(astervec PRIVATE astervec_static)
 
 # Set output directory for the executable
 set_target_properties(astervec PROPERTIES
@@ -212,7 +208,7 @@ set_target_properties(astervec PROPERTIES
 # Concurrent search benchmark tool — for Phase A multi-thread perf testing.
 add_executable(concurrent_search_bench test/concurrent_search_bench.cc)
 target_include_directories(concurrent_search_bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(concurrent_search_bench PRIVATE astervec_shared)
+target_link_libraries(concurrent_search_bench PRIVATE astervec_static)
 set_target_properties(concurrent_search_bench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
@@ -230,7 +226,7 @@ if(ASTERVEC_BUILD_HTTP)
         ${CMAKE_SOURCE_DIR}/third_party/httplib
         ${CMAKE_SOURCE_DIR}/third_party/json
     )
-    target_link_libraries(astervec_http PRIVATE astervec_shared)
+    target_link_libraries(astervec_http PRIVATE astervec_static)
     # httplib requires threads.
     find_package(Threads REQUIRED)
     target_link_libraries(astervec_http PRIVATE Threads::Threads)
@@ -240,7 +236,7 @@ if(ASTERVEC_BUILD_HTTP)
 endif()
 
 option(ASTERVEC_BUILD_PYTHON "Build Python bindings" OFF)
-option(ASTERVEC_PYTHON_STATIC "Link Python module against static lib (for wheel builds)" OFF)
+option(ASTERVEC_PYTHON_STATIC "Link the Python module against the static engine lib (default ON: self-contained ext, no libastervec.dylib at runtime)" ON)
 
 if(ASTERVEC_BUILD_PYTHON)
     include(FetchContent)

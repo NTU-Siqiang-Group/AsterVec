@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b><span style="font-size: 1.15em;">The vector engine for on-device AI memory.</span></b>
+  <b><span style="font-size: 1.15em;">Memory-friendly vector engine for on-device AI memory.</span></b>
 </p>
 
 <p align="center">

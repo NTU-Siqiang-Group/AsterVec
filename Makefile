@@ -31,6 +31,7 @@ NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 # before `make aster` so the platform is re-detected.
 aster:
 	ROCKSDB_DISABLE_SNAPPY=1 ROCKSDB_DISABLE_LZ4=1 ROCKSDB_DISABLE_BZIP=1 ROCKSDB_DISABLE_ZLIB=1 \
+	ROCKSDB_DISABLE_JEMALLOC=1 \
 	$(MAKE) -C lib/aster static_lib -j$(NPROC) DEBUG_LEVEL=0 DISABLE_WARNING_AS_ERROR=1 EXTRA_CXXFLAGS=-fPIC
 
 clean:

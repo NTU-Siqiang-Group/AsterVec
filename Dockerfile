@@ -41,7 +41,7 @@ RUN cmake -B build \
         -DASTERVEC_BUILD_HTTP=ON
 RUN cmake --build build --target astervec_http -j
 # Strip symbols to keep the runtime image small.
-RUN strip --strip-unneeded build/lib/libastervec.so build/bin/astervec_http
+RUN strip --strip-unneeded build/bin/astervec_http
 
 # ---- runtime stage ----
 FROM ubuntu:24.04 AS runtime
@@ -49,10 +49,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libzstd1 libjemalloc2 \
     ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
-# Binary depends on the AsterVec shared library; ship both.
+# astervec_http is statically linked against the engine — ship just the binary.
 COPY --from=build /src/build/bin/astervec_http /usr/local/bin/
-COPY --from=build /src/build/lib/libastervec.so /usr/local/lib/
-RUN ldconfig
 
 # Default config — every value is also overridable by env var (see docs/HTTP_API.md).
 ENV ASTERVEC_DATA_DIR=/data \
