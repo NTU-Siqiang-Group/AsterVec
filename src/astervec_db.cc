@@ -94,6 +94,44 @@ Status AsterVecDB::Open(const std::string& path,
         return Status::IOError("failed to open log file");
     }
 
+    // Resolve the on-disk graph adjacency encoding BEFORE the index (and its
+    // RocksGraph) is constructed. Aster treats the encoding as a constructor
+    // parameter and never persists it, so the engine owns the choice: it is
+    // fixed at create time, recorded in lsm_vec_db.meta (v3+), and replayed
+    // on every open. Opening with the wrong value would silently mis-decode
+    // every adjacency list.
+    bool fresh_meta = false;
+    {
+        std::string metadata_path = path + "/" + kMetadataFileName;
+        if (normalized_opts.reinit) {
+            // A reinit destroys the graph; a stale encoding must not survive.
+            std::remove(metadata_path.c_str());
+        }
+        uint32_t enc = 0;
+        Status pst = AsterVec::PeekGraphEncoding(metadata_path, &enc);
+        if (pst.ok()) {
+            normalized_opts.graph_encoding_internal = enc;
+        } else if (pst.IsNotFound()) {
+            if (!normalized_opts.reinit &&
+                std::ifstream(path + "/CURRENT").good()) {
+                return Status::Corruption(
+                    "graph data exists but lsm_vec_db.meta is missing; the "
+                    "adjacency encoding cannot be determined — refusing to "
+                    "guess. Rebuild the store (reinit) to recover.");
+            }
+            // True new DB: varint by default. ASTERVEC_GRAPH_VARINT=0 is a
+            // bake-in kill-switch, honored at CREATE time only — whatever is
+            // created gets recorded and replayed regardless of env later.
+            const char* kill = std::getenv("ASTERVEC_GRAPH_VARINT");
+            bool use_varint = !(kill && kill[0] == '0');
+            normalized_opts.graph_encoding_internal =
+                use_varint ? ENCODING_TYPE_VARINT : ENCODING_TYPE_NONE;
+            fresh_meta = true;
+        } else {
+            return pst;  // corrupt metadata header
+        }
+    }
+
     auto index = std::make_unique<AsterVec>(path, normalized_opts, *log_stream);
 
     *db = std::unique_ptr<AsterVecDB>(
@@ -108,6 +146,25 @@ Status AsterVecDB::Open(const std::string& path,
                 return metadata_status;
             }
             // C5b: tombstoned set now lives inside AsterVec; no separate copy needed.
+        }
+    }
+
+    if (fresh_meta) {
+        // Persist the encoding BEFORE any user write reaches the graph: a
+        // crash before the first Close() must not leave it ambiguous. A full
+        // (empty-index) serialize is used so the file is a valid v3 meta.
+        std::string metadata_path = path + "/" + kMetadataFileName;
+        std::ofstream meta_out(metadata_path,
+                               std::ios::binary | std::ios::trunc);
+        Status wst = meta_out.is_open()
+            ? (*db)->index_->SerializeMetadata(meta_out)
+            : Status::IOError("failed to create metadata file");
+        if (wst.ok()) {
+            meta_out.flush();
+            if (!meta_out) wst = Status::IOError("failed to flush metadata file");
+        }
+        if (!wst.ok()) {
+            return wst;
         }
     }
 

@@ -69,6 +69,12 @@ private:
 struct AsterVecDBOptions {
     int dim = 0;
     DistanceMetric metric = DistanceMetric::kL2;
+    // INTERNAL — the on-disk adjacency encoding (Aster ENCODING_TYPE_*).
+    // Resolved by AsterVecDB::Open from lsm_vec_db.meta (or the new-DB
+    // default) BEFORE the index is constructed; not a user knob, not bound
+    // in Python. Do not set manually: opening a DB with the wrong value
+    // mis-decodes every adjacency list.
+    uint32_t graph_encoding_internal = 0;  // ENCODING_TYPE_NONE
     int m = 8;
     int m_max = 24;
     int m_level = 1;

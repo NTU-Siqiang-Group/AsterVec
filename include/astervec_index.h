@@ -518,6 +518,13 @@ namespace astervec
 
         Status SerializeMetadata(std::ostream& out) const;
         Status DeserializeMetadata(std::istream& in);
+        // Reads ONLY the meta header (magic, version, and — for v3 files —
+        // the graph adjacency encoding, CRC-verified) so AsterVecDB::Open can
+        // resolve the encoding BEFORE this index (and its RocksGraph) is
+        // constructed. Returns NotFound when the file does not exist; pre-v3
+        // files resolve to encoding 0 (raw). See the kMetadataVersion notes.
+        static Status PeekGraphEncoding(const std::string& meta_path,
+                                        uint32_t* encoding);
         // Backward-compatible accessors: now backed by tombstoned_internal_ids_.
         // node_id_t and internal_id_t are both aliases for uint64_t, so callers
         // (AsterVecDB, persistence) compile unchanged.
@@ -755,6 +762,10 @@ namespace astervec
         float ef_construction_;      // Parameter for candidate selection
 
         std::unique_ptr<rocksdb::RocksGraph> db_;
+        // On-disk adjacency encoding (Aster ENCODING_TYPE_*), fixed for the
+        // lifetime of the DB at create time and persisted in the v3 metadata
+        // header. Set from options before db_ is constructed.
+        uint32_t graph_encoding_ = 0;
         rocksdb::Options options_;
         
         std::ostream &out_file_;     // Output stream for logging

@@ -41,6 +41,9 @@ using namespace ROCKSDB_NAMESPACE;
     {
         stats.setEnabledOnConstruction(db_options_.enable_stats);
         enable_batch_read_ = db_options_.enable_batch_read;
+        // Resolved by AsterVecDB::Open from lsm_vec_db.meta (or the new-DB
+        // default) — must be fixed before the RocksGraph below is built.
+        graph_encoding_ = db_options_.graph_encoding_internal;
         if (db_options_.edge_cache_size > 0) {
             edge_cache_ = std::make_unique<EdgeLRUCache>(db_options_.edge_cache_size);
             LOG(INFO) << "Edge LRU cache: " << db_options_.edge_cache_size << " entries";
@@ -89,7 +92,7 @@ using namespace ROCKSDB_NAMESPACE;
         db_ = std::make_unique<rocksdb::RocksGraph>(
             options_,
             EDGE_UPDATE_EAGER,
-            ENCODING_TYPE_NONE,
+            static_cast<int>(graph_encoding_),
             db_options_.reinit,
             db_path,
             /*minimal_mode=*/true,
@@ -152,7 +155,55 @@ using namespace ROCKSDB_NAMESPACE;
     constexpr char kMetadataMagic[] = "LSMVMETA";
     // v1: original metadata-filtering era format (entry_point, layers, nodes_, deleted_ids)
     // v2: + update sparse map + next_update_internal_id_ counter (C7, robust delete)
-    constexpr uint32_t kMetadataVersion = 2;
+    // v3: + graph adjacency encoding + header CRC32 (batch2: the encoding is a
+    //     RocksGraph CONSTRUCTOR parameter that Aster does not persist, so the
+    //     engine records it here at create time and replays it at every open;
+    //     files with version < 3 are raw-encoded by definition)
+    constexpr uint32_t kMetadataVersion = 3;
+
+    // Reflected CRC-32 (poly 0xEDB88320) over the fixed header fields. Guards
+    // the routing-critical values (encoding above all: a silently flipped but
+    // still-legal encoding value would select the wrong decoder) against
+    // accidental corruption. A deliberate edit that recomputes the CRC is out
+    // of the threat model.
+    uint32_t Crc32(const void* data, size_t n)
+    {
+        static uint32_t table[256];
+        static bool init = false;
+        if (!init) {
+            for (uint32_t i = 0; i < 256; i++) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; k++)
+                    c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : (c >> 1);
+                table[i] = c;
+            }
+            init = true;
+        }
+        uint32_t crc = 0xFFFFFFFFu;
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (size_t i = 0; i < n; i++)
+            crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+        return crc ^ 0xFFFFFFFFu;
+    }
+
+    struct MetaHeaderV3 {
+        uint64_t entry_point;
+        int32_t  max_layer;
+        uint64_t node_count;
+        uint64_t deleted_count;
+        uint32_t graph_encoding;
+    };
+
+    uint32_t MetaHeaderCrc(const MetaHeaderV3& h)
+    {
+        unsigned char buf[32];
+        std::memcpy(buf +  0, &h.entry_point,   8);
+        std::memcpy(buf +  8, &h.max_layer,     4);
+        std::memcpy(buf + 12, &h.node_count,    8);
+        std::memcpy(buf + 20, &h.deleted_count, 8);
+        std::memcpy(buf + 28, &h.graph_encoding, 4);
+        return Crc32(buf, sizeof(buf));
+    }
 
     template <typename T>
     bool WriteValue(std::ostream& out, const T& value)
@@ -168,6 +219,45 @@ using namespace ROCKSDB_NAMESPACE;
         return static_cast<bool>(in);
     }
     } // namespace
+
+    Status AsterVec::PeekGraphEncoding(const std::string& meta_path,
+                                       uint32_t* encoding)
+    {
+        std::ifstream in(meta_path, std::ios::binary);
+        if (!in.is_open()) {
+            return Status::NotFound("metadata file not found");
+        }
+        char magic[sizeof(kMetadataMagic) - 1] = {};
+        in.read(magic, sizeof(magic));
+        if (!in || std::string(magic, sizeof(magic)) != kMetadataMagic) {
+            return Status::Corruption("invalid metadata magic");
+        }
+        uint32_t version = 0;
+        if (!ReadValue(in, &version) || version < 1 ||
+            version > kMetadataVersion) {
+            return Status::Corruption("unsupported metadata version");
+        }
+        if (version < 3) {
+            *encoding = 0;  // pre-v3 files are raw-encoded by definition
+            return Status::OK();
+        }
+        MetaHeaderV3 hdr{};
+        uint32_t storedCrc = 0;
+        if (!ReadValue(in, &hdr.entry_point) ||
+            !ReadValue(in, &hdr.max_layer) ||
+            !ReadValue(in, &hdr.node_count) ||
+            !ReadValue(in, &hdr.deleted_count) ||
+            !ReadValue(in, &hdr.graph_encoding) ||
+            !ReadValue(in, &storedCrc)) {
+            return Status::Corruption("truncated metadata header");
+        }
+        if (MetaHeaderCrc(hdr) != storedCrc) {
+            return Status::Corruption(
+                "metadata header CRC mismatch — file is damaged");
+        }
+        *encoding = hdr.graph_encoding;
+        return Status::OK();
+    }
 
     Status AsterVec::SerializeMetadata(std::ostream& out) const
     {
@@ -194,6 +284,14 @@ using namespace ROCKSDB_NAMESPACE;
             !WriteValue(out, nodeCount) ||
             !WriteValue(out, deletedCount)) {
             return Status::IOError("failed to write metadata header");
+        }
+
+        // v3: adjacency encoding + header CRC (see kMetadataVersion comment).
+        MetaHeaderV3 hdr{entryPoint, maxLayer, nodeCount, deletedCount,
+                         graph_encoding_};
+        uint32_t crc = MetaHeaderCrc(hdr);
+        if (!WriteValue(out, graph_encoding_) || !WriteValue(out, crc)) {
+            return Status::IOError("failed to write graph encoding header");
         }
 
         std::vector<float> serialize_dequant_scratch;
@@ -310,6 +408,34 @@ using namespace ROCKSDB_NAMESPACE;
             !ReadValue(in, &nodeCount) ||
             !ReadValue(in, &deletedCount)) {
             return Status::IOError("failed to read metadata header");
+        }
+
+        if (version >= 3) {
+            uint32_t storedEncoding = 0;
+            uint32_t storedCrc = 0;
+            if (!ReadValue(in, &storedEncoding) || !ReadValue(in, &storedCrc)) {
+                return Status::IOError("failed to read graph encoding header");
+            }
+            MetaHeaderV3 hdr{entryPoint, maxLayer, nodeCount, deletedCount,
+                             storedEncoding};
+            if (MetaHeaderCrc(hdr) != storedCrc) {
+                return Status::Corruption(
+                    "metadata header CRC mismatch — file is damaged");
+            }
+            // The graph was already constructed with the encoding Open peeked
+            // from this same file; a mismatch here means the file changed
+            // underneath us.
+            if (storedEncoding != graph_encoding_) {
+                return Status::Corruption(
+                    "graph encoding changed between peek and load");
+            }
+        } else {
+            // Pre-v3 files predate the encoding field: raw by definition.
+            if (graph_encoding_ != 0 /* ENCODING_TYPE_NONE */) {
+                return Status::Corruption(
+                    "pre-v3 metadata implies raw adjacency encoding, but the "
+                    "graph was opened with a different encoding");
+            }
         }
 
         nodes_.clear();
@@ -1973,7 +2099,7 @@ using namespace ROCKSDB_NAMESPACE;
         db_ = std::make_unique<rocksdb::RocksGraph>(
             options_,
             EDGE_UPDATE_EAGER,
-            ENCODING_TYPE_NONE,
+            static_cast<int>(graph_encoding_),
             /*auto_reinitialize=*/false,
             db_path_,
             /*minimal_mode=*/true,
