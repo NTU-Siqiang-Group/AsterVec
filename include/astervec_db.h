@@ -168,6 +168,10 @@ public:
 
     void printStatistics() const;
 
+    // Test-only access to the underlying index (fault injection through the
+    // storage seam). Not part of the public API contract.
+    class AsterVec* TESTONLY_index() { return index_.get(); }
+
     // Reset accumulated statistics counters (index + storage). Lets a
     // benchmark harness report build-phase and query-phase stats separately.
     void resetStatistics();

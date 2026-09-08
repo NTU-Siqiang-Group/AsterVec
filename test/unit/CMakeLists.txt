@@ -45,3 +45,19 @@ target_link_libraries(astervec_unit_tests PRIVATE astervec_static ${ROCKSDB_LIB}
 if(APPLE AND JEMALLOC_LIB)
     target_link_libraries(astervec_unit_tests PRIVATE ${JEMALLOC_LIB})
 endif()
+
+# Batch2 R5: standalone driver for the cross-process NONE/VARINT
+# differential (run by test_graph_encoding_meta.cc via ENCODING_DIFF_DRIVER).
+add_executable(encoding_diff_driver encoding_diff_driver.cc)
+target_include_directories(encoding_diff_driver PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/json
+    ${CMAKE_SOURCE_DIR}/include
+    ${ROCKSDB_INCLUDE_DIR}
+)
+target_link_libraries(encoding_diff_driver PRIVATE astervec_static ${ROCKSDB_LIB})
+if(APPLE AND JEMALLOC_LIB)
+    target_link_libraries(encoding_diff_driver PRIVATE ${JEMALLOC_LIB})
+endif()
+add_dependencies(astervec_unit_tests encoding_diff_driver)
+target_compile_definitions(astervec_unit_tests PRIVATE
+    ENCODING_DIFF_DRIVER="$<TARGET_FILE:encoding_diff_driver>")

@@ -244,3 +244,214 @@ TEST_CASE("encoding: truncated meta header is rejected") {
     auto st = astervec::AsterVecDB::Open(dir, opts, &db);
     CHECK(st.IsCorruption());
 }
+
+// ---------- Batch2 R-review additions (2026-09-08) ----------
+
+#include <thread>
+#include "astervec_index.h"
+#include "graph_store.h"
+
+TEST_CASE("encoding: crash before first Close still replays the encoding") {
+    // R5.2: create -> insert -> destroy WITHOUT Close -> reopen. The
+    // create-time meta stub must carry the encoding; the index is empty
+    // (today's no-WAL semantics) but consistent and correctly decoded.
+    std::string dir = NewTempDir("enc_crash");
+    std::string meta = dir + "/lsm_vec_db.meta";
+    const int dim = 16;
+    auto vecs = MakeVectors(50, dim, 0x11);
+
+    unsetenv("ASTERVEC_GRAPH_VARINT");
+    auto opts = BaseOpts(dir, dim);
+    {
+        std::unique_ptr<astervec::AsterVecDB> db;
+        REQUIRE(astervec::AsterVecDB::Open(dir, opts, &db).ok());
+        for (int i = 0; i < 50; i++) {
+            REQUIRE(db->Insert(static_cast<astervec::node_id_t>(i),
+                               astervec::Span<float>(vecs[i].data(), dim))
+                        .ok());
+        }
+        db.reset();  // simulated crash: no Close()
+    }
+    CHECK(ReadMetaField32(meta, kEncodingOff) == 2);  // stub survived
+    std::unique_ptr<astervec::AsterVecDB> db;
+    REQUIRE(astervec::AsterVecDB::Open(dir, opts, &db).ok());
+    // Index state is empty (no-WAL semantics: upper layers lived only in
+    // memory); the pre-existing contract returns NotFound on empty indexes.
+    auto q = MakeVectors(1, dim, 0x12);
+    astervec::SearchOptions so;
+    so.k = 5;
+    so.ef_search = 64;
+    std::vector<astervec::SearchResult> res;
+    auto sst = db->SearchKnn(
+        astervec::Span<float>(q[0].data(), q[0].size()), so, &res);
+    CHECK(sst.IsNotFound());
+    REQUIRE(db->Close().ok());
+}
+
+TEST_CASE("encoding: PeekGraphEncoding is safe under concurrent first use") {
+    // R4: exercises the CRC-table init from many threads (TSAN gate).
+    std::string dir = NewTempDir("enc_conc");
+    std::string meta = dir + "/lsm_vec_db.meta";
+    unsetenv("ASTERVEC_GRAPH_VARINT");
+    {
+        std::unique_ptr<astervec::AsterVecDB> db;
+        auto opts = BaseOpts(dir, 16);
+        REQUIRE(astervec::AsterVecDB::Open(dir, opts, &db).ok());
+        REQUIRE(db->Close().ok());
+    }
+    std::vector<std::thread> ts;
+    std::atomic<int> failures{0};
+    for (int i = 0; i < 8; i++) {
+        ts.emplace_back([&] {
+            for (int j = 0; j < 100; j++) {
+                uint32_t enc = 99;
+                auto st = astervec::AsterVec::PeekGraphEncoding(meta, &enc);
+                if (!st.ok() || enc != 2) failures.fetch_add(1);
+            }
+        });
+    }
+    for (auto& t : ts) t.join();
+    CHECK(failures.load() == 0);
+}
+
+TEST_CASE("encoding: corrupted meta BODY is rejected by the payload CRC") {
+    // R3: flip one byte in a node vector (well past the fixed header).
+    std::string dir = NewTempDir("enc_body");
+    std::string meta = dir + "/lsm_vec_db.meta";
+    const int dim = 16;
+    auto vecs = MakeVectors(80, dim, 0x21);
+    unsetenv("ASTERVEC_GRAPH_VARINT");
+    auto opts = BaseOpts(dir, dim);
+    {
+        std::unique_ptr<astervec::AsterVecDB> db;
+        REQUIRE(astervec::AsterVecDB::Open(dir, opts, &db).ok());
+        for (int i = 0; i < 80; i++) {
+            REQUIRE(db->Insert(static_cast<astervec::node_id_t>(i),
+                               astervec::Span<float>(vecs[i].data(), dim))
+                        .ok());
+        }
+        REQUIRE(db->Close().ok());
+    }
+    {
+        std::fstream f(meta, std::ios::binary | std::ios::in | std::ios::out);
+        f.seekg(0, std::ios::end);
+        auto size = static_cast<size_t>(f.tellg());
+        REQUIRE(size > 120);
+        f.seekp(static_cast<std::streamoff>(size / 2));  // deep in the body
+        char b = 0x5A;
+        f.write(&b, 1);
+    }
+    std::unique_ptr<astervec::AsterVecDB> db;
+    CHECK(astervec::AsterVecDB::Open(dir, opts, &db).IsCorruption());
+}
+
+TEST_CASE("encoding: v3->v2 version relabel fails cleanly, no throw") {
+    // R3: relabeling bypasses the v3 CRC path entirely; the bounded legacy
+    // parse must return Corruption instead of dying in an allocation.
+    std::string dir = NewTempDir("enc_relabel");
+    std::string meta = dir + "/lsm_vec_db.meta";
+    const int dim = 16;
+    auto vecs = MakeVectors(60, dim, 0x31);
+    unsetenv("ASTERVEC_GRAPH_VARINT");
+    auto opts = BaseOpts(dir, dim);
+    {
+        std::unique_ptr<astervec::AsterVecDB> db;
+        REQUIRE(astervec::AsterVecDB::Open(dir, opts, &db).ok());
+        for (int i = 0; i < 60; i++) {
+            REQUIRE(db->Insert(static_cast<astervec::node_id_t>(i),
+                               astervec::Span<float>(vecs[i].data(), dim))
+                        .ok());
+        }
+        REQUIRE(db->Close().ok());
+    }
+    {
+        std::fstream f(meta, std::ios::binary | std::ios::in | std::ios::out);
+        f.seekp(kVersionOff);
+        uint32_t two = 2;
+        f.write(reinterpret_cast<const char*>(&two), sizeof(two));
+    }
+    std::unique_ptr<astervec::AsterVecDB> db;
+    auto st = astervec::AsterVecDB::Open(dir, opts, &db);
+    CHECK((st.IsCorruption() || st.IsIOError() || st.IsInvalidArgument()));
+}
+
+namespace {
+// R2: fault-injection backend — every graph operation fails.
+struct FailingGraphStore final : astervec::IGraphStore {
+    Status AddVertex(uint64_t) override {
+        return Status::Corruption("injected");
+    }
+    Status AddEdgeBatch(
+        const std::vector<std::pair<uint64_t, uint64_t>>&) override {
+        return Status::Corruption("injected");
+    }
+    Status DeleteEdgeBatch(
+        const std::vector<std::pair<uint64_t, uint64_t>>&) override {
+        return Status::Corruption("injected");
+    }
+    Status GetOutEdges(uint64_t, std::vector<uint64_t>* out) override {
+        out->clear();
+        return Status::Corruption("injected");
+    }
+};
+}  // namespace
+
+TEST_CASE("R2: graph corruption fails Search and Insert at the public API") {
+    std::string dir = NewTempDir("enc_inject");
+    const int dim = 16;
+    auto vecs = MakeVectors(120, dim, 0x41);
+    unsetenv("ASTERVEC_GRAPH_VARINT");
+    auto opts = BaseOpts(dir, dim);
+    opts.edge_cache_size = 0;  // force every hop to the (failing) store
+
+    std::unique_ptr<astervec::AsterVecDB> db;
+    REQUIRE(astervec::AsterVecDB::Open(dir, opts, &db).ok());
+    for (int i = 0; i < 120; i++) {
+        REQUIRE(db->Insert(static_cast<astervec::node_id_t>(i),
+                           astervec::Span<float>(vecs[i].data(), dim))
+                    .ok());
+    }
+
+    db->TESTONLY_index()->TESTONLY_swapGraphStore(
+        std::make_unique<FailingGraphStore>());
+
+    astervec::SearchOptions so;
+    so.k = 10;
+    so.ef_search = 64;
+    std::vector<astervec::SearchResult> res;
+    auto sst = db->SearchKnn(
+        astervec::Span<float>(vecs[0].data(), dim), so, &res);
+    CHECK(sst.IsCorruption());  // NOT "OK with truncated results"
+
+    // Sticky: subsequent calls fail too.
+    auto sst2 = db->SearchKnn(
+        astervec::Span<float>(vecs[1].data(), dim), so, &res);
+    CHECK(sst2.IsCorruption());
+
+    // Write path propagates directly.
+    auto ist = db->Insert(500, astervec::Span<float>(vecs[2].data(), dim));
+    CHECK(!ist.ok());
+}
+
+TEST_CASE("R5: NONE vs VARINT cross-process differential is id-exact") {
+    const char* driver = ENCODING_DIFF_DRIVER;
+    std::string base = NewTempDir("enc_diff");
+    std::string cmd_v = std::string("ASTERVEC_GRAPH_VARINT=1 \"") + driver +
+                        "\" " + base + "/v " + base + "/v.out > " + base +
+                        "/v.log 2>&1";
+    std::string cmd_n = std::string("ASTERVEC_GRAPH_VARINT=0 \"") + driver +
+                        "\" " + base + "/n " + base + "/n.out > " + base +
+                        "/n.log 2>&1";
+    REQUIRE(system((std::string("mkdir -p ") + base + "/v " + base + "/n").c_str()) == 0);
+    REQUIRE(system(cmd_v.c_str()) == 0);
+    REQUIRE(system(cmd_n.c_str()) == 0);
+    std::ifstream fv(base + "/v.out"), fn(base + "/n.out");
+    REQUIRE(fv.is_open());
+    REQUIRE(fn.is_open());
+    std::string sv((std::istreambuf_iterator<char>(fv)),
+                   std::istreambuf_iterator<char>());
+    std::string sn((std::istreambuf_iterator<char>(fn)),
+                   std::istreambuf_iterator<char>());
+    REQUIRE(!sv.empty());
+    CHECK(sv == sn);  // byte-identical result ids across encodings
+}

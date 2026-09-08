@@ -98,9 +98,30 @@ Status AsterVecDB::Open(const std::string& path,
     bool fresh_meta = false;
     {
         std::string metadata_path = path + "/" + kMetadataFileName;
+        std::string metadata_bak = metadata_path + ".reinit_bak";
         if (normalized_opts.reinit) {
-            // A reinit destroys the graph; a stale encoding must not survive.
-            std::remove(metadata_path.c_str());
+            // R1: two-phase, not delete. Aster's RocksGraph ctor exit(1)s on
+            // an open failure (e.g. lock held by a live process), so a failed
+            // reinit must leave the store's metadata recoverable: rename it
+            // aside, and let the next Open restore the backup if the reinit
+            // never completed. If a backup from a previous crashed attempt
+            // already exists and the main file is gone, keep that backup.
+            if (std::ifstream(metadata_path).good()) {
+                std::remove(metadata_bak.c_str());
+                if (std::rename(metadata_path.c_str(),
+                                metadata_bak.c_str()) != 0) {
+                    return Status::IOError(
+                        "failed to stage metadata for reinit");
+                }
+            }
+        } else if (!std::ifstream(metadata_path).good() &&
+                   std::ifstream(metadata_bak).good()) {
+            // Orphaned backup from a crashed/failed reinit: restore it.
+            if (std::rename(metadata_bak.c_str(),
+                            metadata_path.c_str()) != 0) {
+                return Status::IOError(
+                    "failed to restore metadata backup from a failed reinit");
+            }
         }
         uint32_t enc = 0;
         Status pst = AsterVec::PeekGraphEncoding(metadata_path, &enc);
@@ -161,6 +182,9 @@ Status AsterVecDB::Open(const std::string& path,
         if (!wst.ok()) {
             return wst;
         }
+        // Reinit completed and the fresh meta is on disk: the staged backup
+        // (if any) is now obsolete.
+        std::remove((path + "/" + kMetadataFileName + ".reinit_bak").c_str());
     }
 
     // Open the sibling metadata KV store (owned end-to-end by MetadataStore;
@@ -294,7 +318,10 @@ Status AsterVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metada
 
     try {
         std::vector<float> data(vec.begin(), vec.end());
-        index_->insertNode(target_internal, data);
+        {
+            Status ist = index_->insertNode(target_internal, data);
+            if (!ist.ok()) return ist;
+        }
     } catch (const std::exception& ex) {
         return Status::IOError(ex.what());
     }
@@ -424,7 +451,10 @@ Status AsterVecDB::UpdateInternal(node_id_t id, Span<float> vec,
 
     try {
         std::vector<float> data(vec.begin(), vec.end());
-        index_->insertNode(new_internal, data);
+        {
+            Status ist = index_->insertNode(new_internal, data);
+            if (!ist.ok()) return ist;
+        }
     } catch (const std::exception& ex) {
         return Status::IOError(ex.what());
     }
@@ -544,6 +574,9 @@ Status AsterVecDB::SearchKnn(Span<float> query,
     std::vector<float> query_vec(query.begin(), query.end());
     std::vector<SearchResult> results =
         index_->knnSearchK(query_vec, options.k, options.ef_search);
+    if (index_->graphCorrupted()) {
+        return index_->graphCorruptionStatus();
+    }
     if (results.empty()) {
         return Status::NotFound("index is empty");
     }
@@ -618,6 +651,9 @@ Status AsterVecDB::SearchKnn(Span<float> query,
         &pred,
         options.max_scan_candidates,
         metadata_store_.get());
+    if (index_->graphCorrupted()) {
+        return index_->graphCorruptionStatus();
+    }
 
     out->clear();
     out->reserve(results.size());
