@@ -18,6 +18,7 @@
 #include "rocksdb/status.h"
 #include <iostream>
 #include "bloom_filter.h"
+#include "graph_store.h"
 #include "cgroup_monitor.h"
 #include "disk_vector.h"
 #include "id_types.h"
@@ -518,6 +519,18 @@ namespace astervec
 
         Status SerializeMetadata(std::ostream& out) const;
         Status DeserializeMetadata(std::istream& in);
+        // Streaming bodies without the v3 whole-payload CRC framing; the
+        // public pair above adds/verifies it. Impl deserialize bounds every
+        // count against total_size before allocating.
+        Status SerializeMetadataImpl(std::ostream& out) const;
+        Status DeserializeMetadataImpl(std::istream& in, size_t total_size);
+        // Reads ONLY the meta header (magic, version, and — for v3 files —
+        // the graph adjacency encoding, CRC-verified) so AsterVecDB::Open can
+        // resolve the encoding BEFORE this index (and its RocksGraph) is
+        // constructed. Returns NotFound when the file does not exist; pre-v3
+        // files resolve to encoding 0 (raw). See the kMetadataVersion notes.
+        static Status PeekGraphEncoding(const std::string& meta_path,
+                                        uint32_t* encoding);
         // Backward-compatible accessors: now backed by tombstoned_internal_ids_.
         // node_id_t and internal_id_t are both aliases for uint64_t, so callers
         // (AsterVecDB, persistence) compile unchanged.
@@ -534,7 +547,9 @@ namespace astervec
             tombstoned_internal_ids_ = ids;
         }
 
-        void insertNode(node_id_t nodeId, const std::vector<float> &vector);
+        // Returns non-OK when a graph write fails (e.g. Corruption from the
+        // storage backend); the node may be partially linked in that case.
+        Status insertNode(node_id_t nodeId, const std::vector<float> &vector);
         Status deleteNode(node_id_t id);
         Status getNodeVector(node_id_t id, std::vector<float>* out);
 
@@ -710,7 +725,7 @@ namespace astervec
         node_id_t greedySearchUpperLayer(const std::vector<float>& query,
                                           node_id_t entryPoint, int layer);
         void linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer);
-        void linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds);
+        Status linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds);
         std::vector<node_id_t> getEdgesCached(node_id_t id);
 
         std::vector<node_id_t> selectNeighbors(
@@ -754,7 +769,37 @@ namespace astervec
         int m_level_;                // Normalization factor for level generation
         float ef_construction_;      // Parameter for candidate selection
 
-        std::unique_ptr<rocksdb::RocksGraph> db_;
+        std::unique_ptr<IGraphStore> db_;
+        // R2: sticky graph-corruption latch. Traversal helpers return
+        // neighbor lists by value, so a decode Corruption inside them is
+        // recorded here and public entry points fail the CALL instead of
+        // returning silently truncated results. Sticky by design:
+        // adjacency corruption is store-wide and does not heal — every
+        // subsequent call fails until the store is reopened after repair.
+        mutable std::atomic<bool> graph_corrupt_{false};
+
+    public:
+        // Test-only: swap the graph backend (e.g. for fault injection via a
+        // mock IGraphStore). Not for production use.
+        void TESTONLY_swapGraphStore(std::unique_ptr<IGraphStore> gs) {
+            db_ = std::move(gs);
+        }
+        bool graphCorrupted() const {
+            return graph_corrupt_.load(std::memory_order_acquire);
+        }
+        Status graphCorruptionStatus() const {
+            return graphCorrupted()
+                ? Status::Corruption(
+                      "graph adjacency corrupted (decode failed); rebuild "
+                      "the store or restore from backup")
+                : Status::OK();
+        }
+
+    private:
+        // On-disk adjacency encoding (Aster ENCODING_TYPE_*), fixed for the
+        // lifetime of the DB at create time and persisted in the v3 metadata
+        // header. Set from options before db_ is constructed.
+        uint32_t graph_encoding_ = 0;
         rocksdb::Options options_;
         
         std::ostream &out_file_;     // Output stream for logging

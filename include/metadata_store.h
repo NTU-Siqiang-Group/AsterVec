@@ -20,8 +20,18 @@ public:
     using ColumnFamilyHandle = ROCKSDB_NAMESPACE::ColumnFamilyHandle;
 
     // Caller owns db. MetadataStore does not own the CF handle (the AsterVecDB
-    // that created the CF does), it only borrows both.
+    // that created the CF does), it only borrows both. (Kept for tests; the
+    // engine uses Open() below, which owns everything.)
     MetadataStore(DB* db, ColumnFamilyHandle* cf);
+
+    // Opens (creating if missing) the sibling RocksDB at <dir> with the
+    // metadata column family and returns a store that OWNS the DB and the CF
+    // handle — the storage-seam form: callers hold no RocksDB types.
+    static Status Open(const std::string& dir,
+                       std::unique_ptr<MetadataStore>* out);
+
+    // Destroys the owned CF handle and DB (no-op for the borrowing ctor).
+    ~MetadataStore();
 
     // Write the raw JSON bytes verbatim under the given id. Overwrites any prior value.
     Status Put(node_id_t id, std::string_view json_bytes);
@@ -58,6 +68,7 @@ public:
 private:
     DB*                 db_;
     ColumnFamilyHandle* cf_;
+    bool                owns_ = false;  // true iff created via Open()
     mutable size_t      point_gets_ = 0;
     mutable size_t      parses_     = 0;
 

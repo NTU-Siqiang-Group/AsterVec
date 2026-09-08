@@ -69,6 +69,12 @@ private:
 struct AsterVecDBOptions {
     int dim = 0;
     DistanceMetric metric = DistanceMetric::kL2;
+    // INTERNAL — the on-disk adjacency encoding (Aster ENCODING_TYPE_*).
+    // Resolved by AsterVecDB::Open from lsm_vec_db.meta (or the new-DB
+    // default) BEFORE the index is constructed; not a user knob, not bound
+    // in Python. Do not set manually: opening a DB with the wrong value
+    // mis-decodes every adjacency list.
+    uint32_t graph_encoding_internal = 0;  // ENCODING_TYPE_NONE
     int m = 8;
     int m_max = 24;
     int m_level = 1;
@@ -162,6 +168,10 @@ public:
 
     void printStatistics() const;
 
+    // Test-only access to the underlying index (fault injection through the
+    // storage seam). Not part of the public API contract.
+    class AsterVec* TESTONLY_index() { return index_.get(); }
+
     // Reset accumulated statistics counters (index + storage). Lets a
     // benchmark harness report build-phase and query-phase stats separately.
     void resetStatistics();
@@ -225,8 +235,6 @@ private:
     std::unique_ptr<std::ostream> log_stream_;
     std::unique_ptr<class AsterVec> index_;
 
-    std::unique_ptr<ROCKSDB_NAMESPACE::DB>  metadata_db_;
-    ROCKSDB_NAMESPACE::ColumnFamilyHandle*  metadata_cf_ = nullptr;
     std::unique_ptr<MetadataStore>          metadata_store_;
 
     // Live vector count (see VectorCount()). Maintained on insert/delete,

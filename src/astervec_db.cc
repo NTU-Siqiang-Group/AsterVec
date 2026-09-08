@@ -46,11 +46,6 @@ AsterVecDB::~AsterVecDB()
 {
     // Tear down metadata resources in the right order if Close() was not called.
     metadata_store_.reset();
-    if (metadata_cf_ && metadata_db_) {
-        metadata_db_->DestroyColumnFamilyHandle(metadata_cf_);
-        metadata_cf_ = nullptr;
-    }
-    metadata_db_.reset();
 }
 
 AsterVecDB::AsterVecDB(const std::string& db_path,
@@ -94,6 +89,65 @@ Status AsterVecDB::Open(const std::string& path,
         return Status::IOError("failed to open log file");
     }
 
+    // Resolve the on-disk graph adjacency encoding BEFORE the index (and its
+    // RocksGraph) is constructed. Aster treats the encoding as a constructor
+    // parameter and never persists it, so the engine owns the choice: it is
+    // fixed at create time, recorded in lsm_vec_db.meta (v3+), and replayed
+    // on every open. Opening with the wrong value would silently mis-decode
+    // every adjacency list.
+    bool fresh_meta = false;
+    {
+        std::string metadata_path = path + "/" + kMetadataFileName;
+        std::string metadata_bak = metadata_path + ".reinit_bak";
+        if (normalized_opts.reinit) {
+            // R1: two-phase, not delete. Aster's RocksGraph ctor exit(1)s on
+            // an open failure (e.g. lock held by a live process), so a failed
+            // reinit must leave the store's metadata recoverable: rename it
+            // aside, and let the next Open restore the backup if the reinit
+            // never completed. If a backup from a previous crashed attempt
+            // already exists and the main file is gone, keep that backup.
+            if (std::ifstream(metadata_path).good()) {
+                std::remove(metadata_bak.c_str());
+                if (std::rename(metadata_path.c_str(),
+                                metadata_bak.c_str()) != 0) {
+                    return Status::IOError(
+                        "failed to stage metadata for reinit");
+                }
+            }
+        } else if (!std::ifstream(metadata_path).good() &&
+                   std::ifstream(metadata_bak).good()) {
+            // Orphaned backup from a crashed/failed reinit: restore it.
+            if (std::rename(metadata_bak.c_str(),
+                            metadata_path.c_str()) != 0) {
+                return Status::IOError(
+                    "failed to restore metadata backup from a failed reinit");
+            }
+        }
+        uint32_t enc = 0;
+        Status pst = AsterVec::PeekGraphEncoding(metadata_path, &enc);
+        if (pst.ok()) {
+            normalized_opts.graph_encoding_internal = enc;
+        } else if (pst.IsNotFound()) {
+            if (!normalized_opts.reinit &&
+                std::ifstream(path + "/CURRENT").good()) {
+                return Status::Corruption(
+                    "graph data exists but lsm_vec_db.meta is missing; the "
+                    "adjacency encoding cannot be determined — refusing to "
+                    "guess. Rebuild the store (reinit) to recover.");
+            }
+            // True new DB: varint by default. ASTERVEC_GRAPH_VARINT=0 is a
+            // bake-in kill-switch, honored at CREATE time only — whatever is
+            // created gets recorded and replayed regardless of env later.
+            const char* kill = std::getenv("ASTERVEC_GRAPH_VARINT");
+            bool use_varint = !(kill && kill[0] == '0');
+            normalized_opts.graph_encoding_internal =
+                use_varint ? ENCODING_TYPE_VARINT : ENCODING_TYPE_NONE;
+            fresh_meta = true;
+        } else {
+            return pst;  // corrupt metadata header
+        }
+    }
+
     auto index = std::make_unique<AsterVec>(path, normalized_opts, *log_stream);
 
     *db = std::unique_ptr<AsterVecDB>(
@@ -111,63 +165,37 @@ Status AsterVecDB::Open(const std::string& path,
         }
     }
 
-    // Open sibling rocksdb::DB at <path>/metadata for the metadata column family.
+    if (fresh_meta) {
+        // Persist the encoding BEFORE any user write reaches the graph: a
+        // crash before the first Close() must not leave it ambiguous. A full
+        // (empty-index) serialize is used so the file is a valid v3 meta.
+        std::string metadata_path = path + "/" + kMetadataFileName;
+        std::ofstream meta_out(metadata_path,
+                               std::ios::binary | std::ios::trunc);
+        Status wst = meta_out.is_open()
+            ? (*db)->index_->SerializeMetadata(meta_out)
+            : Status::IOError("failed to create metadata file");
+        if (wst.ok()) {
+            meta_out.flush();
+            if (!meta_out) wst = Status::IOError("failed to flush metadata file");
+        }
+        if (!wst.ok()) {
+            return wst;
+        }
+        // Reinit completed and the fresh meta is on disk: the staged backup
+        // (if any) is now obsolete.
+        std::remove((path + "/" + kMetadataFileName + ".reinit_bak").c_str());
+    }
+
+    // Open the sibling metadata KV store (owned end-to-end by MetadataStore;
+    // no RocksDB types cross this boundary — storage seam).
     {
-        std::string meta_path = path + "/metadata";
-        rocksdb::Options meta_opts;
-        meta_opts.create_if_missing = true;
-        meta_opts.create_missing_column_families = true;
-        meta_opts.compression = rocksdb::kZSTD;
-        // Cap total memtable memory across all CFs at 16 MB.
-        meta_opts.db_write_buffer_size = 16 << 20;
-
-        // One 16 MB LRU cache shared by default + metadata CFs. Without this,
-        // each BlockBasedTableFactory would instantiate its own default cache
-        // (32 MB each in current RocksDB). The default CF is never written to
-        // so its contribution to the cache stays ~0.
-        auto shared_block_cache = rocksdb::NewLRUCache(16 << 20);
-
-        std::vector<rocksdb::ColumnFamilyDescriptor> cfds;
-
-        rocksdb::BlockBasedTableOptions default_table_opts;
-        default_table_opts.block_cache = shared_block_cache;
-        rocksdb::ColumnFamilyOptions default_cfopts;
-        // Never written to, but set explicitly so it doesn't inherit RocksDB's
-        // kSnappy default (Snappy is no longer compiled into Aster).
-        default_cfopts.compression = rocksdb::kNoCompression;
-        default_cfopts.table_factory.reset(
-            rocksdb::NewBlockBasedTableFactory(default_table_opts));
-        cfds.emplace_back(rocksdb::kDefaultColumnFamilyName, default_cfopts);
-
-        rocksdb::ColumnFamilyOptions cfopts;
-        cfopts.compression = rocksdb::kZSTD;
-        cfopts.write_buffer_size = 8 << 20;   // 8 MB per memtable
-        cfopts.max_write_buffer_number = 2;   // up to 2 memtables: 2 * 8 MB = 16 MB
-        rocksdb::BlockBasedTableOptions table_opts;
-        table_opts.block_cache = shared_block_cache;
-        table_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false));
-        cfopts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
-        cfds.emplace_back("metadata", cfopts);
-
-        std::vector<rocksdb::ColumnFamilyHandle*> handles;
-        rocksdb::DB* meta_raw = nullptr;
-        auto mst = rocksdb::DB::Open(meta_opts, meta_path, cfds, &handles, &meta_raw);
+        Status mst = MetadataStore::Open(path + "/metadata",
+                                         &(*db)->metadata_store_);
         if (!mst.ok()) {
-            // Some RocksDB versions populate handles even on partial failure — clean up.
-            for (auto* h : handles) {
-                if (h && meta_raw) meta_raw->DestroyColumnFamilyHandle(h);
-            }
-            delete meta_raw;
             db->reset();  // API contract: *db is null on error.
             return mst;
         }
-
-        (*db)->metadata_db_.reset(meta_raw);
-        (*db)->metadata_cf_ = handles[1];
-        (*db)->metadata_store_ =
-            std::make_unique<MetadataStore>(meta_raw, handles[1]);
-        // Default CF not used; destroy its handle now.
-        meta_raw->DestroyColumnFamilyHandle(handles[0]);
     }
 
     // Restore the live vector count persisted by a prior flush/Close (0 on a
@@ -290,7 +318,10 @@ Status AsterVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metada
 
     try {
         std::vector<float> data(vec.begin(), vec.end());
-        index_->insertNode(target_internal, data);
+        {
+            Status ist = index_->insertNode(target_internal, data);
+            if (!ist.ok()) return ist;
+        }
     } catch (const std::exception& ex) {
         return Status::IOError(ex.what());
     }
@@ -420,7 +451,10 @@ Status AsterVecDB::UpdateInternal(node_id_t id, Span<float> vec,
 
     try {
         std::vector<float> data(vec.begin(), vec.end());
-        index_->insertNode(new_internal, data);
+        {
+            Status ist = index_->insertNode(new_internal, data);
+            if (!ist.ok()) return ist;
+        }
     } catch (const std::exception& ex) {
         return Status::IOError(ex.what());
     }
@@ -540,6 +574,9 @@ Status AsterVecDB::SearchKnn(Span<float> query,
     std::vector<float> query_vec(query.begin(), query.end());
     std::vector<SearchResult> results =
         index_->knnSearchK(query_vec, options.k, options.ef_search);
+    if (index_->graphCorrupted()) {
+        return index_->graphCorruptionStatus();
+    }
     if (results.empty()) {
         return Status::NotFound("index is empty");
     }
@@ -614,6 +651,9 @@ Status AsterVecDB::SearchKnn(Span<float> query,
         &pred,
         options.max_scan_candidates,
         metadata_store_.get());
+    if (index_->graphCorrupted()) {
+        return index_->graphCorruptionStatus();
+    }
 
     out->clear();
     out->reserve(results.size());
@@ -755,18 +795,11 @@ Status AsterVecDB::Close()
     // Persist the live count so a graceful restart restores it exactly.
     persistCount();
 
-    // Tear down the metadata column family / DB FIRST, so file locks on
+    // Tear down the metadata KV store FIRST, so file locks on
     // <path>/metadata are released even if the index-metadata file write
-    // below fails (I3). These teardown steps do not fail; the destructor
-    // performs the same sequence idempotently.
-    if (metadata_store_) {
-        metadata_store_.reset();
-    }
-    if (metadata_cf_ && metadata_db_) {
-        metadata_db_->DestroyColumnFamilyHandle(metadata_cf_);
-        metadata_cf_ = nullptr;
-    }
-    metadata_db_.reset();
+    // below fails (I3). MetadataStore owns its DB and CF handle (storage
+    // seam); the destructor performs the same reset idempotently.
+    metadata_store_.reset();
 
     // Now persist the HNSW index metadata (may fail on disk-full etc.).
     std::string metadata_path = db_path_ + "/" + kMetadataFileName;

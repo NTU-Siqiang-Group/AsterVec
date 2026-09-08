@@ -1,4 +1,6 @@
+#include <array>
 #include "astervec_index.h"
+#include "aster_graph_store.h"
 #include "disk_vector.h"
 #include "distance.h"
 #include "metadata_store.h"
@@ -41,6 +43,9 @@ using namespace ROCKSDB_NAMESPACE;
     {
         stats.setEnabledOnConstruction(db_options_.enable_stats);
         enable_batch_read_ = db_options_.enable_batch_read;
+        // Resolved by AsterVecDB::Open from lsm_vec_db.meta (or the new-DB
+        // default) — must be fixed before the RocksGraph below is built.
+        graph_encoding_ = db_options_.graph_encoding_internal;
         if (db_options_.edge_cache_size > 0) {
             edge_cache_ = std::make_unique<EdgeLRUCache>(db_options_.edge_cache_size);
             LOG(INFO) << "Edge LRU cache: " << db_options_.edge_cache_size << " entries";
@@ -83,13 +88,17 @@ using namespace ROCKSDB_NAMESPACE;
         // also makes the graph tolerate u64 ids with bit 63 set (our update_id
         // namespace) without the counter array trying to allocate ~exabytes.
         // Requires Aster's feature/minimal-mode branch.
-        db_ = std::make_unique<rocksdb::RocksGraph>(
+        // skip_property_cfs: AsterVec never reads vertex/edge properties, so
+        // the empty per-vertex records bulk build would write into the
+        // property CFs (via AddVertex) are pure overhead — skipped for good.
+        db_ = std::make_unique<AsterGraphStore>(
             options_,
             EDGE_UPDATE_EAGER,
-            ENCODING_TYPE_NONE,
+            static_cast<int>(graph_encoding_),
             db_options_.reinit,
             db_path,
-            /*minimal_mode=*/true
+            /*minimal_mode=*/true,
+            /*skip_property_cfs=*/true
         );
 
         nodes_.reserve(10000);
@@ -148,7 +157,62 @@ using namespace ROCKSDB_NAMESPACE;
     constexpr char kMetadataMagic[] = "LSMVMETA";
     // v1: original metadata-filtering era format (entry_point, layers, nodes_, deleted_ids)
     // v2: + update sparse map + next_update_internal_id_ counter (C7, robust delete)
-    constexpr uint32_t kMetadataVersion = 2;
+    // v3: + graph adjacency encoding + header CRC32 (batch2: the encoding is a
+    //     RocksGraph CONSTRUCTOR parameter that Aster does not persist, so the
+    //     engine records it here at create time and replays it at every open;
+    //     files with version < 3 are raw-encoded by definition)
+    constexpr uint32_t kMetadataVersion = 3;
+
+    // Reflected CRC-32 (poly 0xEDB88320) over the fixed header fields. Guards
+    // the routing-critical values (encoding above all: a silently flipped but
+    // still-legal encoding value would select the wrong decoder) against
+    // accidental corruption. A deliberate edit that recomputes the CRC is out
+    // of the threat model.
+    uint32_t Crc32(const void* data, size_t n)
+    {
+        // Magic-static IIFE: thread-safe one-time init (a hand-rolled
+        // `static bool init` guard is a data race under concurrent first
+        // calls — caught by TSan in review R4).
+        static const std::array<uint32_t, 256> table = [] {
+            std::array<uint32_t, 256> t{};
+            for (uint32_t i = 0; i < 256; i++) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; k++)
+                    c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : (c >> 1);
+                t[i] = c;
+            }
+            return t;
+        }();
+        uint32_t crc = 0xFFFFFFFFu;
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (size_t i = 0; i < n; i++)
+            crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+        return crc ^ 0xFFFFFFFFu;
+    }
+
+    struct MetaHeaderV3 {
+        uint32_t version;
+        uint64_t entry_point;
+        int32_t  max_layer;
+        uint64_t node_count;
+        uint64_t deleted_count;
+        uint32_t graph_encoding;
+    };
+
+    // Covers magic + version + every fixed header field (review R3: a CRC
+    // that excludes the version lets a v3->v2 relabel bypass it entirely).
+    uint32_t MetaHeaderCrc(const MetaHeaderV3& h)
+    {
+        unsigned char buf[44];
+        std::memcpy(buf +  0, kMetadataMagic, 8);
+        std::memcpy(buf +  8, &h.version,       4);
+        std::memcpy(buf + 12, &h.entry_point,   8);
+        std::memcpy(buf + 20, &h.max_layer,     4);
+        std::memcpy(buf + 24, &h.node_count,    8);
+        std::memcpy(buf + 32, &h.deleted_count, 8);
+        std::memcpy(buf + 40, &h.graph_encoding, 4);
+        return Crc32(buf, sizeof(buf));
+    }
 
     template <typename T>
     bool WriteValue(std::ostream& out, const T& value)
@@ -165,7 +229,105 @@ using namespace ROCKSDB_NAMESPACE;
     }
     } // namespace
 
+    Status AsterVec::PeekGraphEncoding(const std::string& meta_path,
+                                       uint32_t* encoding)
+    {
+        std::ifstream in(meta_path, std::ios::binary);
+        if (!in.is_open()) {
+            return Status::NotFound("metadata file not found");
+        }
+        char magic[sizeof(kMetadataMagic) - 1] = {};
+        in.read(magic, sizeof(magic));
+        if (!in || std::string(magic, sizeof(magic)) != kMetadataMagic) {
+            return Status::Corruption("invalid metadata magic");
+        }
+        uint32_t version = 0;
+        if (!ReadValue(in, &version) || version < 1 ||
+            version > kMetadataVersion) {
+            return Status::Corruption("unsupported metadata version");
+        }
+        if (version < 3) {
+            *encoding = 0;  // pre-v3 files are raw-encoded by definition
+            return Status::OK();
+        }
+        MetaHeaderV3 hdr{};
+        hdr.version = version;
+        uint32_t storedCrc = 0;
+        if (!ReadValue(in, &hdr.entry_point) ||
+            !ReadValue(in, &hdr.max_layer) ||
+            !ReadValue(in, &hdr.node_count) ||
+            !ReadValue(in, &hdr.deleted_count) ||
+            !ReadValue(in, &hdr.graph_encoding) ||
+            !ReadValue(in, &storedCrc)) {
+            return Status::Corruption("truncated metadata header");
+        }
+        if (MetaHeaderCrc(hdr) != storedCrc) {
+            return Status::Corruption(
+                "metadata header CRC mismatch — file is damaged");
+        }
+        *encoding = hdr.graph_encoding;
+        return Status::OK();
+    }
+
     Status AsterVec::SerializeMetadata(std::ostream& out) const
+    {
+        // v3 integrity: serialize into memory, append a CRC32 over the WHOLE
+        // payload (magic + version + header + body), then write. Guards the
+        // body (vectors, layers, update map) that the header CRC cannot
+        // (review R3). Transient buffer ~= meta size; acceptable at Close.
+        std::ostringstream oss(std::ios::binary);
+        Status s = SerializeMetadataImpl(oss);
+        if (!s.ok()) {
+            return s;
+        }
+        const std::string body = oss.str();
+        uint32_t full_crc = Crc32(body.data(), body.size());
+        if (!out.write(body.data(),
+                       static_cast<std::streamsize>(body.size())) ||
+            !WriteValue(out, full_crc)) {
+            return Status::IOError("failed to write metadata");
+        }
+        return Status::OK();
+    }
+
+    Status AsterVec::DeserializeMetadata(std::istream& in)
+    {
+        std::string all((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+        if (all.size() < sizeof(kMetadataMagic) - 1 + sizeof(uint32_t)) {
+            return Status::Corruption("metadata file truncated");
+        }
+        uint32_t version = 0;
+        std::memcpy(&version, all.data() + sizeof(kMetadataMagic) - 1,
+                    sizeof(version));
+        std::string body;
+        if (version >= 3) {
+            if (all.size() < sizeof(uint32_t)) {
+                return Status::Corruption("metadata file truncated");
+            }
+            uint32_t stored = 0;
+            std::memcpy(&stored, all.data() + all.size() - sizeof(uint32_t),
+                        sizeof(stored));
+            body = all.substr(0, all.size() - sizeof(uint32_t));
+            if (Crc32(body.data(), body.size()) != stored) {
+                return Status::Corruption(
+                    "metadata payload CRC mismatch — file is damaged");
+            }
+        } else {
+            body = std::move(all);  // v1/v2 predate the CRC; bounded parse only
+        }
+        std::istringstream iss(body, std::ios::binary);
+        try {
+            return DeserializeMetadataImpl(iss, body.size());
+        } catch (const std::exception& e) {
+            return Status::Corruption(
+                std::string("metadata parse raised: ") + e.what());
+        } catch (...) {
+            return Status::Corruption("metadata parse raised");
+        }
+    }
+
+    Status AsterVec::SerializeMetadataImpl(std::ostream& out) const
     {
         if (!out) {
             return Status::IOError("metadata output stream is not ready");
@@ -190,6 +352,14 @@ using namespace ROCKSDB_NAMESPACE;
             !WriteValue(out, nodeCount) ||
             !WriteValue(out, deletedCount)) {
             return Status::IOError("failed to write metadata header");
+        }
+
+        // v3: adjacency encoding + header CRC (see kMetadataVersion comment).
+        MetaHeaderV3 hdr{kMetadataVersion, entryPoint, maxLayer, nodeCount,
+                         deletedCount, graph_encoding_};
+        uint32_t crc = MetaHeaderCrc(hdr);
+        if (!WriteValue(out, graph_encoding_) || !WriteValue(out, crc)) {
+            return Status::IOError("failed to write graph encoding header");
         }
 
         std::vector<float> serialize_dequant_scratch;
@@ -280,7 +450,7 @@ using namespace ROCKSDB_NAMESPACE;
         return Status::OK();
     }
 
-    Status AsterVec::DeserializeMetadata(std::istream& in)
+    Status AsterVec::DeserializeMetadataImpl(std::istream& in, size_t total_size)
     {
         if (!in) {
             return Status::IOError("metadata input stream is not ready");
@@ -308,6 +478,46 @@ using namespace ROCKSDB_NAMESPACE;
             return Status::IOError("failed to read metadata header");
         }
 
+        if (version >= 3) {
+            uint32_t storedEncoding = 0;
+            uint32_t storedCrc = 0;
+            if (!ReadValue(in, &storedEncoding) || !ReadValue(in, &storedCrc)) {
+                return Status::IOError("failed to read graph encoding header");
+            }
+            MetaHeaderV3 hdr{version, entryPoint, maxLayer, nodeCount,
+                             deletedCount, storedEncoding};
+            if (MetaHeaderCrc(hdr) != storedCrc) {
+                return Status::Corruption(
+                    "metadata header CRC mismatch — file is damaged");
+            }
+            // The graph was already constructed with the encoding Open peeked
+            // from this same file; a mismatch here means the file changed
+            // underneath us.
+            if (storedEncoding != graph_encoding_) {
+                return Status::Corruption(
+                    "graph encoding changed between peek and load");
+            }
+        } else {
+            // Pre-v3 files predate the encoding field: raw by definition.
+            if (graph_encoding_ != 0 /* ENCODING_TYPE_NONE */) {
+                return Status::Corruption(
+                    "pre-v3 metadata implies raw adjacency encoding, but the "
+                    "graph was opened with a different encoding");
+            }
+        }
+
+        // R3: every count is bounded by the bytes actually present before
+        // any allocation, so corrupt (or version-relabeled) headers fail
+        // with Corruption instead of a bad_array_new_length throw.
+        auto bytes_left = [&in, total_size]() -> uint64_t {
+            auto pos = in.tellg();
+            if (pos < 0) return 0;
+            uint64_t p = static_cast<uint64_t>(pos);
+            return p > total_size ? 0 : total_size - p;
+        };
+        if (nodeCount > bytes_left() / 24) {  // >= 24 B per node record
+            return Status::Corruption("metadata node count exceeds file size");
+        }
         nodes_.clear();
         nodes_.reserve(static_cast<size_t>(nodeCount));
         for (uint64_t i = 0; i < nodeCount; ++i) {
@@ -318,6 +528,9 @@ using namespace ROCKSDB_NAMESPACE;
             }
             if (pointSize != static_cast<uint64_t>(vector_dim_)) {
                 return Status::InvalidArgument("node vector dimension mismatch");
+            }
+            if (bytes_left() < pointSize * sizeof(float)) {
+                return Status::Corruption("metadata node vector truncated");
             }
             std::vector<float> point(static_cast<size_t>(pointSize));
             if (!point.empty()) {
@@ -332,6 +545,10 @@ using namespace ROCKSDB_NAMESPACE;
             if (!ReadValue(in, &neighborLayers)) {
                 return Status::IOError("failed to read neighbor layer count");
             }
+            if (neighborLayers > bytes_left() / 12) {  // >= 12 B per layer
+                return Status::Corruption(
+                    "metadata neighbor layer count exceeds file size");
+            }
             Node node;
             node.id = nodeId;
             node.point = std::move(point);
@@ -340,6 +557,10 @@ using namespace ROCKSDB_NAMESPACE;
                 uint64_t neighborCount = 0;
                 if (!ReadValue(in, &layer) || !ReadValue(in, &neighborCount)) {
                     return Status::IOError("failed to read neighbor metadata");
+                }
+                if (neighborCount > bytes_left() / sizeof(node_id_t)) {
+                    return Status::Corruption(
+                        "metadata neighbor count exceeds file size");
                 }
                 std::vector<node_id_t> neighbors;
                 neighbors.reserve(static_cast<size_t>(neighborCount));
@@ -362,6 +583,10 @@ using namespace ROCKSDB_NAMESPACE;
             nodes_.emplace(nodeId, std::move(node));
         }
 
+        if (deletedCount > bytes_left() / sizeof(node_id_t)) {
+            return Status::Corruption(
+                "metadata deleted count exceeds file size");
+        }
         tombstoned_internal_ids_.clear();
         for (uint64_t i = 0; i < deletedCount; ++i) {
             node_id_t id = 0;
@@ -383,6 +608,10 @@ using namespace ROCKSDB_NAMESPACE;
                 return Status::IOError("failed to read update map header");
             }
             next_update_internal_id_ = static_cast<internal_id_t>(nextUpdateId);
+            if (updatedCount > bytes_left() / 16) {  // 16 B per map entry
+                return Status::Corruption(
+                    "metadata update-map count exceeds file size");
+            }
             updated_real_to_internal_.reserve(static_cast<size_t>(updatedCount));
             for (uint64_t i = 0; i < updatedCount; ++i) {
                 uint64_t r = 0, inter = 0;
@@ -561,7 +790,7 @@ using namespace ROCKSDB_NAMESPACE;
         stats.addCount(1, stats.vec_read_count);
     }
 
-    void AsterVec::insertNode(node_id_t nodeId, const std::vector<float> &vector)
+    Status AsterVec::insertNode(node_id_t nodeId, const std::vector<float> &vector)
     {
         // C5a: removed deleted_ids_.erase(nodeId). Re-insert of a tombstoned id
         // is now routed by AsterVecDB::Insert (C5b) to allocate a fresh
@@ -631,7 +860,10 @@ using namespace ROCKSDB_NAMESPACE;
         node_id_t currentEntryPoint = k_invalid_node_id;
         if (entry_point_.load(std::memory_order_acquire) == k_invalid_node_id)
         {
-            linkNeighborsAsterDB(nodeId, {});
+            {
+                Status link_st = linkNeighborsAsterDB(nodeId, {});
+                if (!link_st.ok()) return link_st;
+            }
             storeVectorWithStats(nodeId, vector, /*sectionKey=*/nodeId);
             vectorStored = true;
 
@@ -651,7 +883,7 @@ using namespace ROCKSDB_NAMESPACE;
                               << " time_s="
                               << (static_cast<double>(insert_timer.duration_ns) / 1e9);
                 }
-                return;
+                return Status::OK();
             }
             // Lost the CAS race. expected_invalid now has the winning
             // entry point (some other writer's nodeId). Use it for
@@ -721,7 +953,10 @@ using namespace ROCKSDB_NAMESPACE;
         // Forward + reverse edges go in via linkNeighborsAsterDB. After
         // this, layer-0 readers (using Aster) may reach us; the vector
         // is on disk so distance computation succeeds.
-        linkNeighborsAsterDB(nodeId, selectedPerLayer[0]);
+        {
+            Status link_st = linkNeighborsAsterDB(nodeId, selectedPerLayer[0]);
+            if (!link_st.ok()) return link_st;
+        }
 
         // ----- Step 5: upper-layer link + shrink (publish in-memory edges) -----
         // Set our outgoing neighbors at each upper layer, then push the
@@ -787,7 +1022,7 @@ using namespace ROCKSDB_NAMESPACE;
         // ----- Step 6: layer-0 Aster shrink (existing logic) -----
         {
             const std::vector<node_id_t>& selectedLevel0 = selectedPerLayer[0];
-            std::vector<std::pair<rocksdb::node_id_t, rocksdb::node_id_t>> edgesToDelete;
+            std::vector<std::pair<uint64_t, uint64_t>> edgesToDelete;
             for (node_id_t neighbor : selectedLevel0)
             {
                 auto eConns = getEdgesCached(neighbor);
@@ -805,13 +1040,19 @@ using namespace ROCKSDB_NAMESPACE;
                         {
                             edgesToDelete.emplace_back(
                                 static_cast<rocksdb::node_id_t>(neighbor),
-                                static_cast<rocksdb::node_id_t>(node));
+                                node);
                         }
                     }
                 }
             }
             if (!edgesToDelete.empty()) {
-                db_->DeleteEdgeBatch(edgesToDelete);
+                Status del_st = db_->DeleteEdgeBatch(edgesToDelete);
+                if (!del_st.ok()) {
+                    if (del_st.IsCorruption()) {
+                        graph_corrupt_.store(true, std::memory_order_release);
+                    }
+                    return del_st;
+                }
                 if (edge_cache_) {
                     for (const auto& [from, to] : edgesToDelete) {
                         edge_cache_->erase(from);
@@ -847,6 +1088,7 @@ using namespace ROCKSDB_NAMESPACE;
 
         stats.accumulateTime(insert_timer, stats.indexing_time);
         stats.addCount(1, stats.insert_count);
+        return Status::OK();
     }
 
     // C5a pivot: deleteNode is a tombstone insertion only. The HNSW graph is
@@ -1005,7 +1247,7 @@ using namespace ROCKSDB_NAMESPACE;
         }
     }
 
-    void AsterVec::linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds)
+    Status AsterVec::linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds)
     {
         // All forward + reverse edges go through a single AddEdgeBatch:
         // ONE db_->Write, ONE WAL flush, ONE RocksDB WriteThread acquisition
@@ -1018,24 +1260,31 @@ using namespace ROCKSDB_NAMESPACE;
         // empty) and writes the merged adj list. The HNSW path doesn't read
         // edge_prop_cf_ / vertex_prop_cf_ that AddVertexWithEdges initialises,
         // so dropping that initialisation is correctness-equivalent here.
-        if (neighborIds.empty()) return;
+        if (neighborIds.empty()) return Status::OK();
 
-        std::vector<std::pair<rocksdb::node_id_t, rocksdb::node_id_t>> all_edges;
+        std::vector<std::pair<uint64_t, uint64_t>> all_edges;
         all_edges.reserve(neighborIds.size() * 2);
         for (node_id_t neighborId : neighborIds) {
             all_edges.emplace_back(
-                static_cast<rocksdb::node_id_t>(nodeId),
-                static_cast<rocksdb::node_id_t>(neighborId));
+                nodeId,
+                neighborId);
             all_edges.emplace_back(
-                static_cast<rocksdb::node_id_t>(neighborId),
-                static_cast<rocksdb::node_id_t>(nodeId));
+                neighborId,
+                nodeId);
         }
-        db_->AddEdgeBatch(all_edges);
+        Status add_st = db_->AddEdgeBatch(all_edges);
+        if (!add_st.ok()) {
+            if (add_st.IsCorruption()) {
+                graph_corrupt_.store(true, std::memory_order_release);
+            }
+            return add_st;
+        }
         if (edge_cache_) {
             for (node_id_t neighborId : neighborIds) {
                 edge_cache_->erase(neighborId);
             }
         }
+        return Status::OK();
     }
 
     std::vector<node_id_t> AsterVec::getEdgesCached(node_id_t id) {
@@ -1044,14 +1293,16 @@ using namespace ROCKSDB_NAMESPACE;
             if (edge_cache_->get(id, &cached)) return cached;
         }
 
-        rocksdb::Edges edges;
-        db_->GetAllEdges(id, &edges);
         std::vector<node_id_t> result;
-        result.reserve(edges.num_edges_out);
-        for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
-            result.push_back(edges.nxts_out[i].nxt);
+        Status s = db_->GetOutEdges(id, &result);
+        if (!s.ok()) {
+            // R2: record store-wide corruption so the PUBLIC call fails
+            // (checked at the AsterVecDB entry points); never cache the
+            // empty list — the poison would outlive the query.
+            LOG(ERR) << "GetOutEdges(" << id << ") failed: " << s.ToString();
+            graph_corrupt_.store(true, std::memory_order_release);
+            return {};
         }
-        rocksdb::free_edges(&edges);
 
         if (edge_cache_) {
             edge_cache_->put(id, result);
@@ -1966,13 +2217,14 @@ using namespace ROCKSDB_NAMESPACE;
 
         // 4. Reopen the SAME path. auto_reinitialize MUST be false — true would
         //    DestroyDB and wipe the graph.
-        db_ = std::make_unique<rocksdb::RocksGraph>(
+        db_ = std::make_unique<AsterGraphStore>(
             options_,
             EDGE_UPDATE_EAGER,
-            ENCODING_TYPE_NONE,
+            static_cast<int>(graph_encoding_),
             /*auto_reinitialize=*/false,
             db_path_,
-            /*minimal_mode=*/true);
+            /*minimal_mode=*/true,
+            /*skip_property_cfs=*/true);
         const auto t_reopened = clock::now();
 
         direct_io_active_.store(true, std::memory_order_release);

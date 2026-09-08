@@ -72,7 +72,7 @@ void AsterVec::bulkLoadLayer0(const float* vectors, int n,
     // Step 1: register vertices in AsterDB. Sequential — rocksdb's
     // WriteThread serialises this anyway, and the calls are cheap.
     for (int u = 0; u < n; ++u) {
-        auto st = db_->AddVertex(static_cast<rocksdb::node_id_t>(u));
+        auto st = db_->AddVertex(u);
         if (!st.ok()) {
             throw std::runtime_error(
                 "bulkLoadLayer0: AddVertex failed: " + st.ToString());
@@ -227,14 +227,13 @@ void AsterVec::bulkLoadLayer0(const float* vectors, int n,
     // Step 3d: emit edges. Symmetry is now in the adjacency lists, so
     // we only emit forward edges — every (v, u) pair appears as part of
     // v's own iteration when u is in adj[v].
-    std::vector<std::pair<rocksdb::node_id_t, rocksdb::node_id_t>> all_edges;
+    std::vector<std::pair<uint64_t, uint64_t>> all_edges;
     size_t total_edges = 0;
     for (int u = 0; u < n; ++u) total_edges += adj[u].size();
     all_edges.reserve(total_edges);
     for (int u = 0; u < n; ++u) {
         for (int v : adj[u]) {
-            all_edges.emplace_back(static_cast<rocksdb::node_id_t>(u),
-                                   static_cast<rocksdb::node_id_t>(v));
+            all_edges.emplace_back(u, v);
         }
     }
     std::vector<std::vector<int>>().swap(adj);  // free working memory
@@ -256,7 +255,7 @@ void AsterVec::bulkLoadLayer0(const float* vectors, int n,
     constexpr size_t kEdgeChunk = 64 * 1024;
     for (size_t off = 0; off < all_edges.size(); off += kEdgeChunk) {
         size_t end = std::min(off + kEdgeChunk, all_edges.size());
-        std::vector<std::pair<rocksdb::node_id_t, rocksdb::node_id_t>> chunk(
+        std::vector<std::pair<uint64_t, uint64_t>> chunk(
             all_edges.begin() + static_cast<ptrdiff_t>(off),
             all_edges.begin() + static_cast<ptrdiff_t>(end));
         auto st = db_->AddEdgeBatch(chunk);
