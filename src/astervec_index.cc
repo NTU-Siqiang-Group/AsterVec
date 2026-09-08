@@ -1,4 +1,5 @@
 #include "astervec_index.h"
+#include "aster_graph_store.h"
 #include "disk_vector.h"
 #include "distance.h"
 #include "metadata_store.h"
@@ -89,7 +90,7 @@ using namespace ROCKSDB_NAMESPACE;
         // skip_property_cfs: AsterVec never reads vertex/edge properties, so
         // the empty per-vertex records bulk build would write into the
         // property CFs (via AddVertex) are pure overhead — skipped for good.
-        db_ = std::make_unique<rocksdb::RocksGraph>(
+        db_ = std::make_unique<AsterGraphStore>(
             options_,
             EDGE_UPDATE_EAGER,
             static_cast<int>(graph_encoding_),
@@ -917,7 +918,7 @@ using namespace ROCKSDB_NAMESPACE;
         // ----- Step 6: layer-0 Aster shrink (existing logic) -----
         {
             const std::vector<node_id_t>& selectedLevel0 = selectedPerLayer[0];
-            std::vector<std::pair<rocksdb::node_id_t, rocksdb::node_id_t>> edgesToDelete;
+            std::vector<std::pair<uint64_t, uint64_t>> edgesToDelete;
             for (node_id_t neighbor : selectedLevel0)
             {
                 auto eConns = getEdgesCached(neighbor);
@@ -935,7 +936,7 @@ using namespace ROCKSDB_NAMESPACE;
                         {
                             edgesToDelete.emplace_back(
                                 static_cast<rocksdb::node_id_t>(neighbor),
-                                static_cast<rocksdb::node_id_t>(node));
+                                node);
                         }
                     }
                 }
@@ -1150,15 +1151,15 @@ using namespace ROCKSDB_NAMESPACE;
         // so dropping that initialisation is correctness-equivalent here.
         if (neighborIds.empty()) return;
 
-        std::vector<std::pair<rocksdb::node_id_t, rocksdb::node_id_t>> all_edges;
+        std::vector<std::pair<uint64_t, uint64_t>> all_edges;
         all_edges.reserve(neighborIds.size() * 2);
         for (node_id_t neighborId : neighborIds) {
             all_edges.emplace_back(
-                static_cast<rocksdb::node_id_t>(nodeId),
-                static_cast<rocksdb::node_id_t>(neighborId));
+                nodeId,
+                neighborId);
             all_edges.emplace_back(
-                static_cast<rocksdb::node_id_t>(neighborId),
-                static_cast<rocksdb::node_id_t>(nodeId));
+                neighborId,
+                nodeId);
         }
         db_->AddEdgeBatch(all_edges);
         if (edge_cache_) {
@@ -1174,14 +1175,13 @@ using namespace ROCKSDB_NAMESPACE;
             if (edge_cache_->get(id, &cached)) return cached;
         }
 
-        rocksdb::Edges edges;
-        db_->GetAllEdges(id, &edges);
         std::vector<node_id_t> result;
-        result.reserve(edges.num_edges_out);
-        for (uint32_t i = 0; i < edges.num_edges_out; ++i) {
-            result.push_back(edges.nxts_out[i].nxt);
+        Status s = db_->GetOutEdges(id, &result);
+        if (!s.ok()) {
+            // A decode failure means the stored adjacency is corrupt; the
+            // search continues with an empty list (as before), but loudly.
+            LOG(ERR) << "GetOutEdges(" << id << ") failed: " << s.ToString();
         }
-        rocksdb::free_edges(&edges);
 
         if (edge_cache_) {
             edge_cache_->put(id, result);
@@ -2096,7 +2096,7 @@ using namespace ROCKSDB_NAMESPACE;
 
         // 4. Reopen the SAME path. auto_reinitialize MUST be false — true would
         //    DestroyDB and wipe the graph.
-        db_ = std::make_unique<rocksdb::RocksGraph>(
+        db_ = std::make_unique<AsterGraphStore>(
             options_,
             EDGE_UPDATE_EAGER,
             static_cast<int>(graph_encoding_),

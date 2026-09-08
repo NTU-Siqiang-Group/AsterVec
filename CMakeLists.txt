@@ -137,6 +137,7 @@ set(LIB_SOURCES
     src/bloom_filter.cc
     src/astervec_rnn_descent.cc
     src/astervec_bulk_build.cc
+    src/aster_graph_store.cc
 )
 
 find_library(ZSTD_LIB zstd

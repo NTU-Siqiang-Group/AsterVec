@@ -18,6 +18,7 @@
 #include "rocksdb/status.h"
 #include <iostream>
 #include "bloom_filter.h"
+#include "graph_store.h"
 #include "cgroup_monitor.h"
 #include "disk_vector.h"
 #include "id_types.h"
@@ -761,7 +762,7 @@ namespace astervec
         int m_level_;                // Normalization factor for level generation
         float ef_construction_;      // Parameter for candidate selection
 
-        std::unique_ptr<rocksdb::RocksGraph> db_;
+        std::unique_ptr<IGraphStore> db_;
         // On-disk adjacency encoding (Aster ENCODING_TYPE_*), fixed for the
         // lifetime of the DB at create time and persisted in the v3 metadata
         // header. Set from options before db_ is constructed.

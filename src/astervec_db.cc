@@ -46,11 +46,6 @@ AsterVecDB::~AsterVecDB()
 {
     // Tear down metadata resources in the right order if Close() was not called.
     metadata_store_.reset();
-    if (metadata_cf_ && metadata_db_) {
-        metadata_db_->DestroyColumnFamilyHandle(metadata_cf_);
-        metadata_cf_ = nullptr;
-    }
-    metadata_db_.reset();
 }
 
 AsterVecDB::AsterVecDB(const std::string& db_path,
@@ -168,63 +163,15 @@ Status AsterVecDB::Open(const std::string& path,
         }
     }
 
-    // Open sibling rocksdb::DB at <path>/metadata for the metadata column family.
+    // Open the sibling metadata KV store (owned end-to-end by MetadataStore;
+    // no RocksDB types cross this boundary — storage seam).
     {
-        std::string meta_path = path + "/metadata";
-        rocksdb::Options meta_opts;
-        meta_opts.create_if_missing = true;
-        meta_opts.create_missing_column_families = true;
-        meta_opts.compression = rocksdb::kZSTD;
-        // Cap total memtable memory across all CFs at 16 MB.
-        meta_opts.db_write_buffer_size = 16 << 20;
-
-        // One 16 MB LRU cache shared by default + metadata CFs. Without this,
-        // each BlockBasedTableFactory would instantiate its own default cache
-        // (32 MB each in current RocksDB). The default CF is never written to
-        // so its contribution to the cache stays ~0.
-        auto shared_block_cache = rocksdb::NewLRUCache(16 << 20);
-
-        std::vector<rocksdb::ColumnFamilyDescriptor> cfds;
-
-        rocksdb::BlockBasedTableOptions default_table_opts;
-        default_table_opts.block_cache = shared_block_cache;
-        rocksdb::ColumnFamilyOptions default_cfopts;
-        // Never written to, but set explicitly so it doesn't inherit RocksDB's
-        // kSnappy default (Snappy is no longer compiled into Aster).
-        default_cfopts.compression = rocksdb::kNoCompression;
-        default_cfopts.table_factory.reset(
-            rocksdb::NewBlockBasedTableFactory(default_table_opts));
-        cfds.emplace_back(rocksdb::kDefaultColumnFamilyName, default_cfopts);
-
-        rocksdb::ColumnFamilyOptions cfopts;
-        cfopts.compression = rocksdb::kZSTD;
-        cfopts.write_buffer_size = 8 << 20;   // 8 MB per memtable
-        cfopts.max_write_buffer_number = 2;   // up to 2 memtables: 2 * 8 MB = 16 MB
-        rocksdb::BlockBasedTableOptions table_opts;
-        table_opts.block_cache = shared_block_cache;
-        table_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false));
-        cfopts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
-        cfds.emplace_back("metadata", cfopts);
-
-        std::vector<rocksdb::ColumnFamilyHandle*> handles;
-        rocksdb::DB* meta_raw = nullptr;
-        auto mst = rocksdb::DB::Open(meta_opts, meta_path, cfds, &handles, &meta_raw);
+        Status mst = MetadataStore::Open(path + "/metadata",
+                                         &(*db)->metadata_store_);
         if (!mst.ok()) {
-            // Some RocksDB versions populate handles even on partial failure — clean up.
-            for (auto* h : handles) {
-                if (h && meta_raw) meta_raw->DestroyColumnFamilyHandle(h);
-            }
-            delete meta_raw;
             db->reset();  // API contract: *db is null on error.
             return mst;
         }
-
-        (*db)->metadata_db_.reset(meta_raw);
-        (*db)->metadata_cf_ = handles[1];
-        (*db)->metadata_store_ =
-            std::make_unique<MetadataStore>(meta_raw, handles[1]);
-        // Default CF not used; destroy its handle now.
-        meta_raw->DestroyColumnFamilyHandle(handles[0]);
     }
 
     // Restore the live vector count persisted by a prior flush/Close (0 on a
@@ -812,18 +759,11 @@ Status AsterVecDB::Close()
     // Persist the live count so a graceful restart restores it exactly.
     persistCount();
 
-    // Tear down the metadata column family / DB FIRST, so file locks on
+    // Tear down the metadata KV store FIRST, so file locks on
     // <path>/metadata are released even if the index-metadata file write
-    // below fails (I3). These teardown steps do not fail; the destructor
-    // performs the same sequence idempotently.
-    if (metadata_store_) {
-        metadata_store_.reset();
-    }
-    if (metadata_cf_ && metadata_db_) {
-        metadata_db_->DestroyColumnFamilyHandle(metadata_cf_);
-        metadata_cf_ = nullptr;
-    }
-    metadata_db_.reset();
+    // below fails (I3). MetadataStore owns its DB and CF handle (storage
+    // seam); the destructor performs the same reset idempotently.
+    metadata_store_.reset();
 
     // Now persist the HNSW index metadata (may fail on disk-full etc.).
     std::string metadata_path = db_path_ + "/" + kMetadataFileName;

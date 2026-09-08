@@ -231,8 +231,6 @@ private:
     std::unique_ptr<std::ostream> log_stream_;
     std::unique_ptr<class AsterVec> index_;
 
-    std::unique_ptr<ROCKSDB_NAMESPACE::DB>  metadata_db_;
-    ROCKSDB_NAMESPACE::ColumnFamilyHandle*  metadata_cf_ = nullptr;
     std::unique_ptr<MetadataStore>          metadata_store_;
 
     // Live vector count (see VectorCount()). Maintained on insert/delete,
