@@ -26,6 +26,8 @@ add_executable(astervec_unit_tests
     test_edge_cache_arena.cc
     test_concurrent_search.cc
     test_bulk_build.cc
+    test_graph_encoding_meta.cc
+    test_prebatch_backcompat.cc
     # A1.7 Phase 0 torture tests (test_quiesce_backup.cc intentionally
     # SKIPPED — pgastervec-only; see the design docs §4.6).
     test_recall_baseline.cc
