@@ -83,13 +83,17 @@ using namespace ROCKSDB_NAMESPACE;
         // also makes the graph tolerate u64 ids with bit 63 set (our update_id
         // namespace) without the counter array trying to allocate ~exabytes.
         // Requires Aster's feature/minimal-mode branch.
+        // skip_property_cfs: AsterVec never reads vertex/edge properties, so
+        // the empty per-vertex records bulk build would write into the
+        // property CFs (via AddVertex) are pure overhead — skipped for good.
         db_ = std::make_unique<rocksdb::RocksGraph>(
             options_,
             EDGE_UPDATE_EAGER,
             ENCODING_TYPE_NONE,
             db_options_.reinit,
             db_path,
-            /*minimal_mode=*/true
+            /*minimal_mode=*/true,
+            /*skip_property_cfs=*/true
         );
 
         nodes_.reserve(10000);
@@ -1972,7 +1976,8 @@ using namespace ROCKSDB_NAMESPACE;
             ENCODING_TYPE_NONE,
             /*auto_reinitialize=*/false,
             db_path_,
-            /*minimal_mode=*/true);
+            /*minimal_mode=*/true,
+            /*skip_property_cfs=*/true);
         const auto t_reopened = clock::now();
 
         direct_io_active_.store(true, std::memory_order_release);
