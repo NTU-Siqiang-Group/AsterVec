@@ -31,6 +31,7 @@ public:
     Status DeleteEdgeBatch(
         const std::vector<std::pair<uint64_t, uint64_t>>& edges) override;
     Status GetOutEdges(uint64_t id, std::vector<uint64_t>* out) override;
+    Status SyncWAL() override;
 
 private:
     // No conversion scratch member: batch calls may run concurrently (the

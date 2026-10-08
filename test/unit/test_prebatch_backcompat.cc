@@ -99,12 +99,12 @@ TEST_CASE("backcompat: v0.2.2 bulk-built store opens, matches, upgrades") {
         }
     }
 
-    // The store stays writable, and Close upgrades the meta to v3/raw.
+    // The store stays writable, and Close upgrades the meta to v4/raw.
     std::vector<float> nv(dim, 0.25f);
     REQUIRE(db->Insert(2000, astervec::Span<float>(nv.data(), nv.size())).ok());
     REQUIRE(db->Close().ok());
     db.reset();
-    CHECK(ReadMetaField32(meta, 8) == 3);    // upgraded
+    CHECK(ReadMetaField32(meta, 8) == 4);    // upgraded
     CHECK(ReadMetaField32(meta, 40) == 0);   // still raw, forever
 
     REQUIRE(astervec::AsterVecDB::Open(dir, opts, &db).ok());

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -25,6 +26,9 @@ class ColumnFamilyHandle;
 namespace astervec
 {
 class MetadataStore;  // forward declaration
+class OpLog;
+struct OpRecord;
+enum class OpType : std::uint8_t;
 using Status = ROCKSDB_NAMESPACE::Status;
 
 enum class DistanceMetric {
@@ -96,6 +100,20 @@ struct AsterVecDBOptions {
     size_t write_buf_cap = 8192;
     std::string vector_file_path;
     std::string log_file_path;
+
+    // ---- Crash recovery ----
+    // Log every insert, update and delete to <db>/oplog so acknowledged
+    // writes survive a process crash (replayed on Open). Off: a crash loses
+    // the writes since the last checkpoint. A log left by an earlier run is
+    // replayed on Open either way.
+    bool enable_oplog = false;
+    // Checkpoint automatically after this many inserts/updates/deletes
+    // (0 = only on Checkpoint(), flushVectorWrites() and Close()). Bounds
+    // replay time with the log on, and the loss window with it off.
+    uint64_t checkpoint_interval_ops = 0;
+    // Operation log segment size; older segments are removed once two
+    // checkpoints cover them.
+    uint64_t oplog_segment_bytes = 64ull << 20;
 };
 
 struct SearchOptions {
@@ -175,7 +193,26 @@ public:
     // Reset accumulated statistics counters (index + storage). Lets a
     // benchmark harness report build-phase and query-phase stats separately.
     void resetStatistics();
+
+    // Make everything written so far durable and record it as the restart
+    // point: flush and fsync the vector file, sync the graph and payload
+    // WALs, then atomically replace lsm_vec_db.meta (the previous one is
+    // kept as lsm_vec_db.meta.prev). Writes wait while it runs. A no-op if
+    // nothing changed since the last checkpoint.
+    Status Checkpoint();
+
+    // Flush buffered vector writes and checkpoint (see Checkpoint()).
     void flushVectorWrites();
+
+    // What the last Open replayed from the operation log.
+    struct RecoveryStats {
+        std::uint64_t checkpoint_lsn = 0;   // where replay started (+1)
+        std::uint64_t replayed_ops = 0;     // records applied
+        std::uint64_t dropped_bytes = 0;    // torn log tail skipped
+        bool lsn_gap = false;               // stopped at a missing record
+        double seconds = 0;
+    };
+    RecoveryStats GetRecoveryStats() const { return recovery_stats_; }
 
     // 20260516_malloc_trim: ask the allocator to return idle heap memory to
     // the OS. On glibc this calls malloc_trim(0) (a few ms on a fragmented
@@ -225,6 +262,40 @@ private:
     // True iff id has a live vector in the index (not deleted, slot assigned).
     // Centralizes the "id must have a vector" invariant used by payload CRUD.
     bool HasLiveVector(node_id_t id) const;
+
+    // Every mutating call holds write_gate_ shared; Checkpoint() holds it
+    // exclusive so the state it writes is not changing underneath it.
+    // Lock order: write_gate_ before the per-real-id lock.
+    mutable std::shared_mutex write_gate_;
+    // Writes since the last checkpoint (0 => Checkpoint() has nothing to do).
+    std::atomic<std::uint64_t> writes_since_checkpoint_{0};
+    bool closed_ = false;
+    class WriteScope;
+    Status checkpointLocked();
+    Status writeMetadataFile();
+
+    // Operation log (null when enable_oplog is off).
+    std::unique_ptr<OpLog> oplog_;
+    // checkpoint_lsn of lsn_vec_db.meta; segments up to it are kept so the
+    // .prev fallback can still replay.
+    std::uint64_t main_checkpoint_lsn_ = 0;
+    // Logged-kind writes since the last checkpoint, for checkpoint_interval_ops.
+    std::atomic<std::uint64_t> ops_since_checkpoint_{0};
+    std::atomic<bool> checkpoint_due_{false};
+    RecoveryStats recovery_stats_;
+    // Appends one insert/update/delete. With the log on, `*encoded` is set
+    // to the vector in the store's encoding (thread-local; valid until this
+    // thread's next call) and `*lsn` to the record's lsn; otherwise both
+    // stay null/0.
+    Status logOp(OpType op, node_id_t real_id, node_id_t internal_id,
+                 node_id_t old_internal_id, Span<float> vec,
+                 std::string_view payload, std::uint64_t* lsn,
+                 const char** encoded);
+    // Marks a logged operation as failed so replay skips it.
+    void logAbort(std::uint64_t lsn);
+    Status recoverFromOpLog();
+    Status replayRecord(const OpRecord& rec, bool aborted,
+                        std::vector<float>& scratch);
 
     // C5b internal helpers (declared private; callers use public Update/Insert).
     Status UpdateInternal(node_id_t id, Span<float> vec,

@@ -140,6 +140,10 @@ MetadataStore::Status MetadataStore::Get(node_id_t id, Json* out_doc) const {
     return Status::OK();
 }
 
+MetadataStore::Status MetadataStore::SyncWAL() {
+    return db_->SyncWAL();
+}
+
 MetadataStore::Status MetadataStore::Delete(node_id_t id) {
     return db_->Delete(WriteOptions(), cf_, EncodeKey(id));
 }

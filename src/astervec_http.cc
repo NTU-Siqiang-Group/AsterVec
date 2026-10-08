@@ -247,6 +247,9 @@ bool LoadHttpConfigFromEnv(HttpServerConfig* cfg, std::string* err) {
     cfg->edge_cache_size    = env_size("ASTERVEC_EDGE_CACHE_SIZE", 100000);
     cfg->vec_file_capacity  = env_size("ASTERVEC_VEC_FILE_CAPACITY", 1000000);
     cfg->paged_max_cached_pages = env_size("ASTERVEC_PAGED_MAX_CACHED_PAGES", 8192);
+    cfg->enable_oplog       = env_bool("ASTERVEC_OPLOG", false);
+    cfg->checkpoint_interval_ops = env_size("ASTERVEC_CHECKPOINT_INTERVAL_OPS", 0);
+    cfg->oplog_segment_bytes = env_size("ASTERVEC_OPLOG_SEGMENT_BYTES", 64ull << 20);
     cfg->enable_stats       = env_bool("ASTERVEC_ENABLE_STATS", false);
     cfg->log_level          = env_or("ASTERVEC_LOG_LEVEL", "info");
 
@@ -346,6 +349,9 @@ AsterVecDBOptions buildOptions(const HttpServerConfig& cfg) {
     opts.paged_max_cached_pages = cfg.paged_max_cached_pages;
     opts.vector_storage_type  = 1;
     opts.edge_cache_size      = cfg.edge_cache_size;
+    opts.enable_oplog         = cfg.enable_oplog;
+    opts.checkpoint_interval_ops = cfg.checkpoint_interval_ops;
+    opts.oplog_segment_bytes  = cfg.oplog_segment_bytes;
     opts.enable_stats         = cfg.enable_stats;
     opts.enable_batch_read    = true;
     opts.reinit               = false;
@@ -1226,6 +1232,9 @@ int RunHttpServer(const HttpServerConfig& cfg) {
                   << cfg.data_dir << "\",\"dim\":" << cfg.dim
                   << ",\"edge_cache_size\":" << cfg.edge_cache_size
                   << ",\"enable_stats\":" << (cfg.enable_stats ? "true" : "false")
+                  << ",\"oplog\":" << (cfg.enable_oplog ? "true" : "false")
+                  << ",\"replayed_ops\":"
+                  << state.db->GetRecoveryStats().replayed_ops
                   << "}\n";
     } else {
         std::cerr << "{\"event\":\"uninitialized\",\"data_dir\":\""

@@ -22,6 +22,9 @@ add_executable(astervec_unit_tests
     test_astervec_resolvers.cc
     test_delete_robust_red.cc
     test_delete_persistence.cc
+    test_crash_recovery.cc
+    test_oplog.cc
+    test_oplog_replay.cc
     test_delete_stress.cc
     test_edge_cache_arena.cc
     test_concurrent_search.cc

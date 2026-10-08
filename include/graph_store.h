@@ -34,6 +34,10 @@ public:
     virtual Status DeleteEdgeBatch(
         const std::vector<std::pair<uint64_t, uint64_t>>& edges) = 0;
     virtual Status GetOutEdges(uint64_t id, std::vector<uint64_t>* out) = 0;
+
+    // Make every write accepted so far durable (WAL fsync). Backends with
+    // no log of their own have nothing to do.
+    virtual Status SyncWAL() { return Status::OK(); }
 };
 
 }  // namespace astervec

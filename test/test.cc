@@ -36,6 +36,8 @@ int main(int argc, char* argv[])
     options.reinit = config.reinit;
     options.edge_cache_size = config.edge_cache_size;
     options.vector_file_path = config.vector_file_path;
+    options.enable_oplog = config.enable_oplog;
+    options.checkpoint_interval_ops = config.checkpoint_interval_ops;
 
     std::unique_ptr<astervec::AsterVecDB> db;
     auto open_status = astervec::AsterVecDB::Open(config.db_path, options, &db);

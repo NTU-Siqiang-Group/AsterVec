@@ -1,11 +1,14 @@
 #include "astervec_db.h"
 
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <limits>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __GLIBC__
@@ -23,11 +26,13 @@ void trim_allocator_now() {
 } // anonymous namespace
 
 #include "distance.h"
+#include "durable_io.h"
 #include "json.hpp"
 #include "astervec_index.h"
 #include "logger.h"
 #include "metadata.h"
 #include "metadata_store.h"
+#include "oplog.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/db.h"
 #include "rocksdb/filter_policy.h"
@@ -40,7 +45,53 @@ namespace {
 constexpr char kDefaultVectorFileName[] = "vector.log";
 constexpr char kDefaultLogFileName[] = "lsm_vec_db.log";
 constexpr char kMetadataFileName[] = "lsm_vec_db.meta";
+constexpr char kOpLogDirName[] = "oplog";
+// Present only while a new store is being created: written (with the chosen
+// graph encoding) before the graph files exist, removed once the first
+// metadata file is installed. Graph files with this marker and no metadata
+// file are an interrupted create, not a damaged store.
+constexpr char kCreatingMarkerName[] = "lsm_vec_db.creating";
+
+// Nesting depth of WriteScope on this thread: public write calls call each
+// other (Insert <-> UpdateInternal), and only the outermost takes the gate.
+thread_local int t_write_scope_depth = 0;
 } // namespace
+
+class AsterVecDB::WriteScope {
+public:
+    explicit WriteScope(AsterVecDB& db)
+        : db_(db), owner_(t_write_scope_depth == 0)
+    {
+        if (owner_) db_.write_gate_.lock_shared();
+        ++t_write_scope_depth;
+        db_.writes_since_checkpoint_.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~WriteScope()
+    {
+        --t_write_scope_depth;
+        if (!owner_) return;
+        db_.write_gate_.unlock_shared();
+        // checkpoint_interval_ops: checkpoint here, outside the shared gate
+        // (Checkpoint takes it exclusively). One writer wins the flag.
+        if (db_.checkpoint_due_.load(std::memory_order_relaxed) &&
+            db_.checkpoint_due_.exchange(false)) {
+            try {
+                Status s = db_.Checkpoint();
+                if (!s.ok()) {
+                    LOG(ERR) << "automatic checkpoint failed: " << s.ToString();
+                }
+            } catch (const std::exception& e) {
+                LOG(ERR) << "automatic checkpoint failed: " << e.what();
+            }
+        }
+    }
+    WriteScope(const WriteScope&) = delete;
+    WriteScope& operator=(const WriteScope&) = delete;
+
+private:
+    AsterVecDB& db_;
+    bool owner_;
+};
 
 AsterVecDB::~AsterVecDB()
 {
@@ -96,6 +147,8 @@ Status AsterVecDB::Open(const std::string& path,
     // on every open. Opening with the wrong value would silently mis-decode
     // every adjacency list.
     bool fresh_meta = false;
+    bool write_create_marker = false;
+    const std::string creating_marker = path + "/" + kCreatingMarkerName;
     {
         std::string metadata_path = path + "/" + kMetadataFileName;
         std::string metadata_bak = metadata_path + ".reinit_bak";
@@ -123,28 +176,68 @@ Status AsterVecDB::Open(const std::string& path,
                     "failed to restore metadata backup from a failed reinit");
             }
         }
+        const std::string metadata_prev = metadata_path + ".prev";
+        // A leftover temp file is an unfinished checkpoint; the previous
+        // complete one is still in place.
+        std::remove((metadata_path + ".tmp").c_str());
+        if (normalized_opts.reinit) {
+            std::remove(metadata_prev.c_str());
+        }
         uint32_t enc = 0;
         Status pst = AsterVec::PeekGraphEncoding(metadata_path, &enc);
+        if (!pst.ok() && !normalized_opts.reinit &&
+            durable::file_exists(metadata_prev)) {
+            Status prev_st = AsterVec::PeekGraphEncoding(metadata_prev, &enc);
+            if (prev_st.ok()) pst = prev_st;
+        }
         if (pst.ok()) {
             normalized_opts.graph_encoding_internal = enc;
         } else if (pst.IsNotFound()) {
-            if (!normalized_opts.reinit &&
+            // A crash inside the Open that created this store: the graph
+            // files exist but hold no user data (Open had not returned), and
+            // the marker records the encoding they were created with.
+            uint32_t marker_enc = 0;
+            bool interrupted_create = false;
+            if (!normalized_opts.reinit) {
+                std::ifstream m(creating_marker);
+                interrupted_create = static_cast<bool>(m >> marker_enc);
+            }
+            if (!normalized_opts.reinit && !interrupted_create &&
                 std::ifstream(path + "/CURRENT").good()) {
                 return Status::Corruption(
                     "graph data exists but lsm_vec_db.meta is missing; the "
                     "adjacency encoding cannot be determined — refusing to "
                     "guess. Rebuild the store (reinit) to recover.");
             }
-            // True new DB: varint by default. ASTERVEC_GRAPH_VARINT=0 is a
-            // bake-in kill-switch, honored at CREATE time only — whatever is
-            // created gets recorded and replayed regardless of env later.
-            const char* kill = std::getenv("ASTERVEC_GRAPH_VARINT");
-            bool use_varint = !(kill && kill[0] == '0');
-            normalized_opts.graph_encoding_internal =
-                use_varint ? ENCODING_TYPE_VARINT : ENCODING_TYPE_NONE;
+            if (interrupted_create) {
+                normalized_opts.graph_encoding_internal = marker_enc;
+            } else {
+                // True new DB: varint by default. ASTERVEC_GRAPH_VARINT=0 is
+                // a bake-in kill-switch, honored at CREATE time only —
+                // whatever is created gets recorded and replayed regardless
+                // of env later.
+                const char* kill = std::getenv("ASTERVEC_GRAPH_VARINT");
+                bool use_varint = !(kill && kill[0] == '0');
+                normalized_opts.graph_encoding_internal =
+                    use_varint ? ENCODING_TYPE_VARINT : ENCODING_TYPE_NONE;
+                write_create_marker = !normalized_opts.reinit;
+            }
             fresh_meta = true;
         } else {
             return pst;  // corrupt metadata header
+        }
+    }
+
+    if (write_create_marker) {
+        std::error_code ec;
+        std::filesystem::create_directories(path, ec);
+        {
+            std::ofstream m(creating_marker, std::ios::trunc);
+            m << normalized_opts.graph_encoding_internal << "\n";
+            if (!m) return Status::IOError("failed to write " + creating_marker);
+        }
+        if (!durable::fsync_file(creating_marker) || !durable::fsync_dir(path)) {
+            return Status::IOError("failed to sync " + creating_marker);
         }
     }
 
@@ -153,38 +246,63 @@ Status AsterVecDB::Open(const std::string& path,
     *db = std::unique_ptr<AsterVecDB>(
         new AsterVecDB(path, normalized_opts, std::move(index), std::move(log_stream)));
 
-    if (!normalized_opts.reinit) {
-        std::string metadata_path = path + "/" + kMetadataFileName;
-        std::ifstream metadata_stream(metadata_path, std::ios::binary);
-        if (metadata_stream.is_open()) {
-            Status metadata_status = (*db)->index_->DeserializeMetadata(metadata_stream);
-            if (!metadata_status.ok()) {
-                return metadata_status;
-            }
-            // C5b: tombstoned set now lives inside AsterVec; no separate copy needed.
+    if (normalized_opts.reinit || fresh_meta) {
+        // The graph and vector files were just recreated; payloads (reinit)
+        // and logged operations of the old store must go with them.
+        std::error_code ec;
+        if (normalized_opts.reinit) {
+            std::filesystem::remove_all(path + "/metadata", ec);
         }
+        std::filesystem::remove_all(path + "/" + kOpLogDirName, ec);
+    }
+    if (!normalized_opts.reinit) {
+        // Load the latest checkpoint; if it is damaged, fall back to the
+        // previous one. The graph may be ahead of either (WAL-recovered
+        // edges); traversal skips nodes the checkpoint does not know.
+        const std::string metadata_path = path + "/" + kMetadataFileName;
+        const std::string metadata_prev = metadata_path + ".prev";
+        const bool have_main = durable::file_exists(metadata_path);
+        Status ms = Status::OK();
+        if (have_main) {
+            std::ifstream in(metadata_path, std::ios::binary);
+            ms = (*db)->index_->DeserializeMetadata(in);
+        }
+        if ((!have_main || !ms.ok()) && durable::file_exists(metadata_prev)) {
+            std::ifstream in(metadata_prev, std::ios::binary);
+            Status ps = (*db)->index_->DeserializeMetadata(in);
+            if (!ps.ok()) {
+                return have_main
+                    ? Status::Corruption("both " + metadata_path + " (" +
+                                         ms.ToString() + ") and " +
+                                         metadata_prev + " (" + ps.ToString() +
+                                         ") are unusable")
+                    : ps;
+            }
+            if (have_main) {
+                LOG(WARN) << metadata_path << " is unusable (" << ms.ToString()
+                          << "); opened from " << metadata_prev;
+                // Drop the damaged file so the next checkpoint does not
+                // rotate it over the good previous copy.
+                std::remove(metadata_path.c_str());
+            }
+        } else if (!ms.ok()) {
+            return ms;
+        }
+        (*db)->main_checkpoint_lsn_ = (*db)->index_->checkpointLsn();
     }
 
     if (fresh_meta) {
         // Persist the encoding BEFORE any user write reaches the graph: a
-        // crash before the first Close() must not leave it ambiguous. A full
-        // (empty-index) serialize is used so the file is a valid v3 meta.
-        std::string metadata_path = path + "/" + kMetadataFileName;
-        std::ofstream meta_out(metadata_path,
-                               std::ios::binary | std::ios::trunc);
-        Status wst = meta_out.is_open()
-            ? (*db)->index_->SerializeMetadata(meta_out)
-            : Status::IOError("failed to create metadata file");
-        if (wst.ok()) {
-            meta_out.flush();
-            if (!meta_out) wst = Status::IOError("failed to flush metadata file");
-        }
+        // crash before the first checkpoint must not leave it ambiguous. A
+        // full (empty-index) serialize is used so the file is a valid meta.
+        Status wst = (*db)->writeMetadataFile();
         if (!wst.ok()) {
             return wst;
         }
         // Reinit completed and the fresh meta is on disk: the staged backup
-        // (if any) is now obsolete.
+        // (if any) is now obsolete, and so is a create marker.
         std::remove((path + "/" + kMetadataFileName + ".reinit_bak").c_str());
+        std::remove(creating_marker.c_str());
     }
 
     // Open the sibling metadata KV store (owned end-to-end by MetadataStore;
@@ -200,7 +318,205 @@ Status AsterVecDB::Open(const std::string& path,
 
     // Restore the live vector count persisted by a prior flush/Close (0 on a
     // fresh or wiped index, or after an unclean crash with no persisted file).
+    // The count recorded in the checkpoint matches it exactly (also after a
+    // fallback to .prev); the vector_count file serves pre-v4 stores.
     (*db)->loadCount();
+    if ((*db)->index_->checkpointLiveCount() >= 0) {
+        (*db)->live_count_.store((*db)->index_->checkpointLiveCount(),
+                                 std::memory_order_relaxed);
+    }
+
+    // Re-apply operations logged after the checkpoint, then start the log.
+    if (Status rs = (*db)->recoverFromOpLog(); !rs.ok()) {
+        db->reset();
+        return rs;
+    }
+    return Status::OK();
+}
+
+Status AsterVecDB::logOp(OpType op, node_id_t real_id,
+                         node_id_t internal_id, node_id_t old_internal_id,
+                         Span<float> vec, std::string_view payload,
+                         std::uint64_t* lsn, const char** encoded)
+{
+    *lsn = 0;
+    *encoded = nullptr;
+    if (options_.checkpoint_interval_ops > 0 &&
+        ops_since_checkpoint_.fetch_add(1, std::memory_order_relaxed) + 1 >=
+            options_.checkpoint_interval_ops) {
+        checkpoint_due_.store(true, std::memory_order_relaxed);
+    }
+    if (!oplog_) return Status::OK();
+
+    OpRecord rec;
+    rec.op = op;
+    rec.real_id = real_id;
+    rec.internal_id = internal_id;
+    rec.aux = old_internal_id;
+    rec.payload = payload;
+    if (!vec.empty()) {
+        // Encode once: the log and the store get the same bytes.
+        IVectorStorage* vs = index_->vector_storage_.get();
+        thread_local std::vector<char> record;
+        record.resize(vs->recordSize());
+        vs->encodeRecord(vec.data(), record.data());
+        rec.encoding = vs->encodingTag();
+        rec.record = std::string_view(record.data(), record.size());
+        *encoded = record.data();
+    }
+    return oplog_->Append(rec, lsn);
+}
+
+void AsterVecDB::logAbort(std::uint64_t lsn)
+{
+    if (!oplog_ || lsn == 0) return;
+    OpRecord rec;
+    rec.op = OpType::kAbort;
+    rec.aux = lsn;
+    std::uint64_t abort_lsn = 0;
+    Status s = oplog_->Append(rec, &abort_lsn);
+    if (!s.ok()) {
+        LOG(ERR) << "cannot log abort of lsn " << lsn << ": " << s.ToString();
+    }
+}
+
+Status AsterVecDB::recoverFromOpLog()
+{
+    const std::string dir = db_path_ + "/" + kOpLogDirName;
+    const std::uint64_t from = index_->checkpointLsn() + 1;
+    std::uint64_t next_lsn = from;
+    recovery_stats_ = RecoveryStats{};
+    recovery_stats_.checkpoint_lsn = from - 1;
+
+    if (durable::file_exists(dir)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        // Pass 1: operations that failed after they were logged.
+        std::unordered_set<std::uint64_t> aborted;
+        OpLog::ScanStats st;
+        Status s = OpLog::Scan(dir, from, [&](const OpRecord& r) {
+            if (r.op == OpType::kAbort) aborted.insert(r.aux);
+            return Status::OK();
+        }, &st);
+        if (!s.ok()) return s;
+        // Pass 2: apply in lsn order.
+        std::vector<float> scratch(static_cast<size_t>(options_.dim));
+        s = OpLog::Scan(dir, from, [&](const OpRecord& r) {
+            return replayRecord(r, aborted.count(r.lsn) > 0, scratch);
+        }, &st);
+        if (!s.ok()) return s;
+        if (st.records > 0) next_lsn = st.last_lsn + 1;
+
+        recovery_stats_.replayed_ops = st.records;
+        recovery_stats_.dropped_bytes = st.dropped_bytes;
+        recovery_stats_.lsn_gap = st.gap;
+        recovery_stats_.seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (st.records > 0 || st.dropped_bytes > 0 || st.gap) {
+            LOG(INFO) << "operation log: replayed " << st.records
+                      << " ops after checkpoint lsn " << (from - 1) << " in "
+                      << recovery_stats_.seconds << " s; dropped "
+                      << st.dropped_bytes << " torn bytes"
+                      << (st.gap ? "; stopped at a missing lsn" : "");
+        }
+    }
+
+    if (options_.enable_oplog) {
+        Status s = OpLog::Open(dir, next_lsn, options_.oplog_segment_bytes, &oplog_);
+        if (!s.ok()) return s;
+    }
+    if (next_lsn != from) {
+        // Make the replayed state the restart point so the next crash does
+        // not replay it again.
+        index_->setCheckpointLsn(next_lsn - 1);
+        writes_since_checkpoint_.fetch_add(1, std::memory_order_relaxed);
+        std::unique_lock<std::shared_mutex> gate(write_gate_);
+        if (Status s = checkpointLocked(); !s.ok()) return s;
+    }
+    if (!options_.enable_oplog) {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    return Status::OK();
+}
+
+Status AsterVecDB::replayRecord(const OpRecord& r, bool aborted,
+                                std::vector<float>& scratch)
+{
+    const real_id_t real = static_cast<real_id_t>(r.real_id);
+    const internal_id_t internal = static_cast<internal_id_t>(r.internal_id);
+    switch (r.op) {
+    case OpType::kAbort:
+        return Status::OK();
+
+    case OpType::kInsert:
+    case OpType::kUpdate: {
+        // A failed operation still consumed its update id.
+        if (is_update_id(internal)) index_->observe_update_id(internal);
+        if (aborted) return Status::OK();
+        IVectorStorage* vs = index_->vector_storage_.get();
+        if (r.encoding != vs->encodingTag() || r.record.size() != vs->recordSize()) {
+            return Status::Corruption(
+                "operation log record does not match the vector store encoding");
+        }
+        vs->decodeRecord(r.record.data(), scratch.data());
+        const bool was_alive = index_->is_alive(real);
+        if (r.op == OpType::kInsert && is_update_id(internal)) {
+            index_->record_update_mapping(real, internal);
+        }
+        try {
+            Status ist = index_->insertNode(internal, scratch, r.record.data());
+            if (!ist.ok()) return ist;
+        } catch (const std::exception& ex) {
+            return Status::IOError(std::string("replay: ") + ex.what());
+        }
+        const internal_id_t old_internal = static_cast<internal_id_t>(r.aux);
+        if (r.op == OpType::kUpdate) {
+            index_->record_update_mapping(real, internal);
+            index_->tombstone(old_internal);
+        }
+        if (!was_alive) live_count_.fetch_add(1, std::memory_order_relaxed);
+
+        // Payloads have their own WAL and may already hold this write or a
+        // later (unlogged) payload change: only fill a missing row.
+        if (metadata_store_) {
+            std::string existing;
+            const bool have_new = metadata_store_->Get(internal, &existing).ok();
+            if (!have_new && !r.payload.empty()) {
+                Status ps = metadata_store_->Put(internal, r.payload);
+                if (!ps.ok()) return ps;
+            } else if (!have_new && r.op == OpType::kUpdate) {
+                std::string old_meta;
+                if (metadata_store_->Get(old_internal, &old_meta).ok()) {
+                    Status ps = metadata_store_->Put(internal, std::string_view{old_meta});
+                    if (!ps.ok()) return ps;
+                }
+            }
+            if (r.op == OpType::kUpdate) {
+                Status ds = metadata_store_->Delete(old_internal);
+                if (!ds.ok() && !ds.IsNotFound()) return ds;
+            }
+        }
+        break;
+    }
+
+    case OpType::kDelete: {
+        if (aborted) return Status::OK();
+        const bool was_alive = index_->is_alive(real);
+        index_->tombstone(internal);
+        if (metadata_store_) {
+            Status ds = metadata_store_->Delete(internal);
+            if (!ds.ok() && !ds.IsNotFound()) return ds;
+        }
+        index_->forget_update_mapping(real);
+        if (was_alive) live_count_.fetch_sub(1, std::memory_order_relaxed);
+        break;
+    }
+
+    default:
+        return Status::Corruption("operation log: unknown op " +
+                                  std::to_string(static_cast<int>(r.op)));
+    }
+    writes_since_checkpoint_.fetch_add(1, std::memory_order_relaxed);
     return Status::OK();
 }
 
@@ -283,6 +599,7 @@ Status AsterVecDB::ValidateInsert(node_id_t id, Span<float> vec,
 
 Status AsterVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metadata_json)
 {
+    WriteScope ws(*this);
     // Validate everything up front (id range, metric, vector, metadata). Batch
     // callers run this for every item first, so a bad item writes nothing.
     if (auto s = ValidateInsert(id, vec, metadata_json); !s.ok()) return s;
@@ -307,22 +624,31 @@ Status AsterVecDB::Insert(node_id_t id, Span<float> vec, std::string_view metada
 
     // Q2: Insert after Delete → allocate a fresh update_id (matches Update path).
     // First-time Insert → use direct mapping.
-    internal_id_t target_internal;
     const internal_id_t direct = static_cast<internal_id_t>(r);
-    if (index_->is_tombstoned(direct)) {
-        target_internal = index_->allocate_update_id();
-        index_->record_update_mapping(r, target_internal);
-    } else {
-        target_internal = direct;
+    const bool reinsert = index_->is_tombstoned(direct);
+    const internal_id_t target_internal =
+        reinsert ? index_->allocate_update_id() : direct;
+
+    std::uint64_t lsn = 0;
+    const char* encoded = nullptr;
+    if (auto s = logOp(OpType::kInsert, r,
+                       target_internal, 0, vec, metadata_json, &lsn, &encoded);
+        !s.ok()) {
+        return s;
     }
+    if (reinsert) index_->record_update_mapping(r, target_internal);
 
     try {
         std::vector<float> data(vec.begin(), vec.end());
         {
-            Status ist = index_->insertNode(target_internal, data);
-            if (!ist.ok()) return ist;
+            Status ist = index_->insertNode(target_internal, data, encoded);
+            if (!ist.ok()) {
+                logAbort(lsn);
+                return ist;
+            }
         }
     } catch (const std::exception& ex) {
+        logAbort(lsn);
         return Status::IOError(ex.what());
     }
     // A new live vector now exists (this branch is reached only when r was not
@@ -351,6 +677,7 @@ Status AsterVecDB::GetPayload(node_id_t id, std::string* out_json)
 
 Status AsterVecDB::SetPayload(node_id_t id, std::string_view metadata_json)
 {
+    WriteScope ws(*this);
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
     const real_id_t r = static_cast<real_id_t>(id);
     if (!index_->is_alive(r)) return Status::NotFound("vector not found for id");
@@ -366,6 +693,7 @@ Status AsterVecDB::SetPayload(node_id_t id, std::string_view metadata_json)
 Status AsterVecDB::SetPayloadBatch(
     const std::vector<std::pair<node_id_t, std::string>>& items)
 {
+    WriteScope ws(*this);
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
     // Validate EVERY item (alive + metadata object within size cap) before any
     // write, then commit all rows in one atomic WriteBatch.
@@ -388,6 +716,7 @@ Status AsterVecDB::SetPayloadBatch(
 
 Status AsterVecDB::UpdatePayload(node_id_t id, std::string_view partial_json)
 {
+    WriteScope ws(*this);
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
     const real_id_t r = static_cast<real_id_t>(id);
     if (!index_->is_alive(r)) return Status::NotFound("vector not found for id");
@@ -402,6 +731,7 @@ Status AsterVecDB::UpdatePayload(node_id_t id, std::string_view partial_json)
 
 Status AsterVecDB::DeletePayloadKeys(node_id_t id, Span<const std::string> keys)
 {
+    WriteScope ws(*this);
     if (!metadata_store_) return Status::NotFound("metadata store unavailable");
     const internal_id_t i = index_->resolve_internal(static_cast<real_id_t>(id));
     std::vector<std::string> key_vec(keys.data(), keys.data() + keys.size());
@@ -416,6 +746,7 @@ Status AsterVecDB::Update(node_id_t id, Span<float> vec)
 Status AsterVecDB::UpdateInternal(node_id_t id, Span<float> vec,
                                 std::string_view metadata_json)
 {
+    WriteScope ws(*this);
     const real_id_t r = static_cast<real_id_t>(id);
     if (r > kMaxRealId) {
         return Status::InvalidArgument("real_id must fit in 63 bits");
@@ -449,13 +780,26 @@ Status AsterVecDB::UpdateInternal(node_id_t id, Span<float> vec,
     const internal_id_t old_internal = index_->resolve_internal(r);
     const internal_id_t new_internal = index_->allocate_update_id();
 
+    std::uint64_t lsn = 0;
+    const char* encoded = nullptr;
+    if (auto s = logOp(OpType::kUpdate, r,
+                       new_internal, old_internal, vec, metadata_json, &lsn,
+                       &encoded);
+        !s.ok()) {
+        return s;
+    }
+
     try {
         std::vector<float> data(vec.begin(), vec.end());
         {
-            Status ist = index_->insertNode(new_internal, data);
-            if (!ist.ok()) return ist;
+            Status ist = index_->insertNode(new_internal, data, encoded);
+            if (!ist.ok()) {
+                logAbort(lsn);
+                return ist;
+            }
         }
     } catch (const std::exception& ex) {
+        logAbort(lsn);
         return Status::IOError(ex.what());
     }
 
@@ -488,6 +832,7 @@ Status AsterVecDB::UpdateInternal(node_id_t id, Span<float> vec,
 
 Status AsterVecDB::Delete(node_id_t id)
 {
+    WriteScope ws(*this);
     if (!index_) return Status::InvalidArgument("db not opened");
     const real_id_t r = static_cast<real_id_t>(id);
 
@@ -504,6 +849,16 @@ Status AsterVecDB::Delete(node_id_t id)
     // Idempotent: if r never had a live vector, nothing to do (per design §5.3).
     if (!index_->vector_storage_ || !index_->vector_storage_->exists(i)) {
         return Status::OK();
+    }
+
+    {
+        std::uint64_t lsn = 0;
+        const char* unused = nullptr;
+        if (auto s = logOp(OpType::kDelete, r, i, 0,
+                           Span<float>(), std::string_view{}, &lsn, &unused);
+            !s.ok()) {
+            return s;
+        }
     }
 
     // Tombstone the live internal (either direct real_id or current update_id).
@@ -695,6 +1050,7 @@ Status AsterVecDB::BulkBuild(Span<const float> vectors, int n,
 {
     if (!index_) return Status::InvalidArgument("db not opened");
     if (n <= 0) return Status::InvalidArgument("n must be > 0");
+    std::unique_lock<std::shared_mutex> gate(write_gate_);
     if (options_.dim <= 0) {
         return Status::InvalidArgument("dim not set on db options");
     }
@@ -727,9 +1083,10 @@ Status AsterVecDB::BulkBuild(Span<const float> vectors, int n,
     // Bulk build loads n vectors at dense ids 0..n-1 into a fresh, empty index.
     live_count_.store(static_cast<std::int64_t>(n), std::memory_order_relaxed);
 
-    // Match Insert's post-write side effects.
-    flushVectorWrites();
-    return Status::OK();
+    writes_since_checkpoint_.fetch_add(1, std::memory_order_relaxed);
+    Status cs = checkpointLocked();
+    trim_allocator_now();
+    return cs;
 }
 
 std::size_t AsterVecDB::VectorCount() const
@@ -740,8 +1097,15 @@ std::size_t AsterVecDB::VectorCount() const
 
 void AsterVecDB::persistCount() const
 {
-    std::ofstream f(db_path_ + "/vector_count", std::ios::trunc);
-    if (f.is_open()) f << live_count_.load(std::memory_order_relaxed) << "\n";
+    const std::string path = db_path_ + "/vector_count";
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f.is_open()) return;
+        f << live_count_.load(std::memory_order_relaxed) << "\n";
+        if (!f) return;
+    }
+    std::rename(tmp.c_str(), path.c_str());
 }
 
 void AsterVecDB::loadCount()
@@ -755,12 +1119,91 @@ void AsterVecDB::loadCount()
     }
 }
 
+Status AsterVecDB::writeMetadataFile()
+{
+    const std::string meta = db_path_ + "/" + kMetadataFileName;
+    const std::string tmp = meta + ".tmp";
+    const std::string prev = meta + ".prev";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            return Status::IOError("failed to open " + tmp);
+        }
+        Status s = index_->SerializeMetadata(out);
+        if (!s.ok()) return s;
+        out.flush();
+        if (!out) return Status::IOError("failed to write " + tmp);
+    }
+    if (!durable::fsync_file(tmp)) {
+        return Status::IOError("failed to fsync " + tmp);
+    }
+    // Keep the current checkpoint as .prev via a hard link, then replace the
+    // main file with one atomic rename: lsm_vec_db.meta always names a
+    // complete checkpoint, old or new.
+    if (durable::file_exists(meta)) {
+        std::remove(prev.c_str());
+        if (::link(meta.c_str(), prev.c_str()) != 0) {
+            return Status::IOError("failed to keep previous checkpoint " + prev);
+        }
+    }
+    if (std::rename(tmp.c_str(), meta.c_str()) != 0) {
+        return Status::IOError("failed to install " + meta);
+    }
+    if (!durable::fsync_dir(db_path_)) {
+        return Status::IOError("failed to fsync " + db_path_);
+    }
+    return Status::OK();
+}
+
+Status AsterVecDB::Checkpoint()
+{
+    if (!index_ || closed_) return Status::InvalidArgument("db not opened");
+    std::unique_lock<std::shared_mutex> gate(write_gate_);
+    return checkpointLocked();
+}
+
+Status AsterVecDB::checkpointLocked()
+{
+    if (writes_since_checkpoint_.load(std::memory_order_relaxed) == 0 &&
+        durable::file_exists(db_path_ + "/" + kMetadataFileName)) {
+        return Status::OK();
+    }
+    // The checkpoint references vector slots and graph edges, so both must
+    // be on disk before it is installed.
+    if (!index_->vector_storage_->syncData()) {
+        return Status::IOError("failed to sync vector data");
+    }
+    if (Status s = index_->syncGraph(); !s.ok()) return s;
+    if (metadata_store_) {
+        if (Status s = metadata_store_->SyncWAL(); !s.ok()) return s;
+    }
+    // Writes are excluded, so every logged operation up to here is applied.
+    if (oplog_) index_->setCheckpointLsn(oplog_->LastLsn());
+    index_->setCheckpointLiveCount(live_count_.load(std::memory_order_relaxed));
+    if (Status s = writeMetadataFile(); !s.ok()) return s;
+    persistCount();
+    writes_since_checkpoint_.store(0, std::memory_order_relaxed);
+    ops_since_checkpoint_.store(0, std::memory_order_relaxed);
+    // The log must still cover the previous checkpoint (Open falls back to
+    // it if the new one is damaged).
+    if (oplog_) {
+        Status ts = oplog_->TruncateBelow(main_checkpoint_lsn_ + 1);
+        if (!ts.ok()) {
+            LOG(WARN) << "operation log truncation: " << ts.ToString();
+        }
+    }
+    main_checkpoint_lsn_ = index_->checkpointLsn();
+    return Status::OK();
+}
+
 void AsterVecDB::flushVectorWrites()
 {
-    if (index_) {
-        index_->vector_storage_->flushWrites();
+    if (index_ && !closed_) {
+        Status s = Checkpoint();
+        if (!s.ok()) {
+            LOG(ERR) << "checkpoint failed: " << s.ToString();
+        }
     }
-    persistCount();
     // 20260516_malloc_trim: a bulk insert leaves the glibc heap fragmented
     // (RocksDB / Aster churn temporary buffers; our edge + page caches grow
     // and shrink). Trim now while we know we're at a write-batch boundary.
@@ -791,37 +1234,21 @@ Status AsterVecDB::Close()
     if (!index_) {
         return Status::InvalidArgument("database not initialized");
     }
+    if (closed_) {
+        return Status::OK();
+    }
 
-    // Persist the live count so a graceful restart restores it exactly.
-    persistCount();
-
-    // Tear down the metadata KV store FIRST, so file locks on
-    // <path>/metadata are released even if the index-metadata file write
-    // below fails (I3). MetadataStore owns its DB and CF handle (storage
-    // seam); the destructor performs the same reset idempotently.
+    // Vectors, graph WAL, payload WAL, then the metadata file (Checkpoint
+    // orders these). Tear down regardless, so file locks are released even
+    // if the checkpoint fails (I3); report the checkpoint error afterwards.
+    Status cs = Checkpoint();
+    oplog_.reset();
     metadata_store_.reset();
-
-    // Now persist the HNSW index metadata (may fail on disk-full etc.).
-    std::string metadata_path = db_path_ + "/" + kMetadataFileName;
-    std::ofstream metadata_stream(metadata_path, std::ios::binary | std::ios::trunc);
-    if (!metadata_stream.is_open()) {
-        return Status::IOError("failed to open metadata file for writing");
-    }
-
-    // C5b: AsterVec owns tombstoned_internal_ids_; no sync needed.
-    Status metadata_status = index_->SerializeMetadata(metadata_stream);
-    if (!metadata_status.ok()) {
-        return metadata_status;
-    }
-    metadata_stream.flush();
-    if (!metadata_stream.good()) {
-        return Status::IOError("failed to flush metadata file");
-    }
     if (log_stream_) {
         log_stream_->flush();
     }
-
     index_->close();
-    return Status::OK();
+    closed_ = true;
+    return cs;
 }
 } // namespace astervec

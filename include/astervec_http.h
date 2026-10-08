@@ -45,6 +45,11 @@ struct HttpServerConfig {
     std::size_t vec_file_capacity = 1000000;   // initial idToPage_ size; auto-expands
     std::size_t paged_max_cached_pages = 8192;
 
+    // ---- Crash recovery (see AsterVecDBOptions) ----
+    bool enable_oplog = false;
+    std::uint64_t checkpoint_interval_ops = 0;
+    std::uint64_t oplog_segment_bytes = 64ull << 20;
+
     // ---- Observability ----
     bool enable_stats = false;       // flip to true via env for live debugging
     std::string log_level = "info";  // "trace"|"debug"|"info"|"warn"|"error"

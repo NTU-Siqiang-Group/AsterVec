@@ -519,6 +519,16 @@ namespace astervec
 
         Status SerializeMetadata(std::ostream& out) const;
         Status DeserializeMetadata(std::istream& in);
+        // Operation-log position covered by the last checkpoint (0 = none).
+        // Persisted in the metadata file (v4+).
+        uint64_t checkpointLsn() const { return checkpoint_lsn_; }
+        void setCheckpointLsn(uint64_t lsn) { checkpoint_lsn_ = lsn; }
+        // Live vector count recorded with the checkpoint (-1 = not recorded,
+        // pre-v4 file).
+        int64_t checkpointLiveCount() const { return checkpoint_live_count_; }
+        void setCheckpointLiveCount(int64_t n) { checkpoint_live_count_ = n; }
+        // fsync the graph store's WAL.
+        Status syncGraph();
         // Streaming bodies without the v3 whole-payload CRC framing; the
         // public pair above adds/verifies it. Impl deserialize bounds every
         // count against total_size before allocating.
@@ -549,7 +559,10 @@ namespace astervec
 
         // Returns non-OK when a graph write fails (e.g. Corruption from the
         // storage backend); the node may be partially linked in that case.
-        Status insertNode(node_id_t nodeId, const std::vector<float> &vector);
+        // `encoded`, if given, is `vector` already in the store's record
+        // encoding (IVectorStorage::encodeRecord); it is stored as is.
+        Status insertNode(node_id_t nodeId, const std::vector<float> &vector,
+                          const char* encoded = nullptr);
         Status deleteNode(node_id_t id);
         Status getNodeVector(node_id_t id, std::vector<float>* out);
 
@@ -614,6 +627,14 @@ namespace astervec
         // Atomic counter (concurrent-writer-refactor-plan §5.2).
         internal_id_t allocate_update_id() {
             return next_update_internal_id_.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Replay: an update id the log shows was handed out must never be
+        // handed out again (its edges may already be in the graph).
+        void observe_update_id(internal_id_t i) {
+            internal_id_t cur = next_update_internal_id_.load(std::memory_order_relaxed);
+            while (cur <= i && !next_update_internal_id_.compare_exchange_weak(
+                                   cur, i + 1, std::memory_order_relaxed)) {
+            }
         }
         void          record_update_mapping(real_id_t r, internal_id_t i);
 
@@ -705,7 +726,8 @@ namespace astervec
                               Span<const float> vectorB) const;
         void storeVectorWithStats(node_id_t id,
                                   const std::vector<float>& vec,
-                                  node_id_t sectionKey);
+                                  node_id_t sectionKey,
+                                  const char* encoded = nullptr);
         void readVectorWithStats(node_id_t id,
                                  std::vector<float>& vec);
         std::vector<SearchResult> searchLayer(const std::vector<float> &queryVector,
@@ -727,6 +749,7 @@ namespace astervec
         void linkNeighbors(node_id_t nodeId, const std::vector<node_id_t> &neighborIds, int layer);
         Status linkNeighborsAsterDB(node_id_t nodeId, const std::vector<node_id_t> &neighborIds);
         std::vector<node_id_t> getEdgesCached(node_id_t id);
+        void dropUnlocatable(std::vector<node_id_t>& ids);
 
         std::vector<node_id_t> selectNeighbors(
             const std::vector<float>& vector,
@@ -786,6 +809,9 @@ namespace astervec
         }
         bool graphCorrupted() const {
             return graph_corrupt_.load(std::memory_order_acquire);
+        }
+        uint64_t danglingEdgesSkipped() const {
+            return dangling_edges_skipped_.load(std::memory_order_relaxed);
         }
         Status graphCorruptionStatus() const {
             return graphCorrupted()
@@ -896,6 +922,13 @@ namespace astervec
 
         // Edge LRU cache for L0 GetAllEdges
         std::unique_ptr<EdgeLRUCache> edge_cache_;
+
+        // Layer-0 neighbours skipped because their vector has no location
+        // (see dropUnlocatable). Non-zero only after an unclean shutdown.
+        std::atomic<uint64_t> dangling_edges_skipped_{0};
+
+        uint64_t checkpoint_lsn_ = 0;
+        int64_t checkpoint_live_count_ = -1;
 
         // ----------------------------------------------------------------
         // Adaptive Direct I/O (see docs/local/..._ADAPTIVE_DIRECT_IO_*).

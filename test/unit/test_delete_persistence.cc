@@ -2,6 +2,7 @@
 // P1: tombstones + sparse update maps + monotonic counter survive Close+reopen.
 // P2: Bloom filter is reconstructed from the persisted forward map.
 
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -247,4 +248,48 @@ TEST_CASE("Backward compat: v1 metadata file (no update map, no update_locations
         REQUIRE(db->Close().ok());
     }
     std::filesystem::remove_all(path);
+}
+
+TEST_CASE("P3: inserts after a reopen never reuse the slots of updated vectors") {
+    // The paged store rebuilt its free-slot lists on load from the dense id
+    // map only, so slots held by update ids were handed out again and new
+    // inserts overwrote updated vectors.
+    auto path = make_path();
+    const int dim = 8;
+    auto vec_for = [&](int seed) {
+        std::vector<float> v(dim);
+        for (int d = 0; d < dim; ++d) v[d] = static_cast<float>(seed * 10 + d);
+        return v;
+    };
+    {
+        auto db = open_db(path, dim, 1000);
+        for (int i = 0; i < 100; ++i) {
+            auto v = vec_for(i);
+            REQUIRE(db->Insert(static_cast<uint64_t>(i), Span<float>(v)).ok());
+        }
+        for (int i = 0; i < 30; ++i) {
+            auto v = vec_for(1000 + i);
+            REQUIRE(db->Update(static_cast<uint64_t>(i), Span<float>(v)).ok());
+        }
+        REQUIRE(db->Close().ok());
+    }
+    auto db = open_db(path, dim, 1000);
+    for (int i = 100; i < 200; ++i) {
+        auto v = vec_for(i);
+        REQUIRE(db->Insert(static_cast<uint64_t>(i), Span<float>(v)).ok());
+    }
+    int wrong = 0;
+    for (int i = 0; i < 200; ++i) {
+        std::vector<float> got;
+        REQUIRE(db->Get(static_cast<uint64_t>(i), &got).ok());
+        const auto want = vec_for(i < 30 ? 1000 + i : i);
+        for (int d = 0; d < dim; ++d) {
+            if (std::abs(got[d] - want[d]) > 0.5f) {
+                ++wrong;
+                break;
+            }
+        }
+    }
+    CHECK(wrong == 0);
+    REQUIRE(db->Close().ok());
 }

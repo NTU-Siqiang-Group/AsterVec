@@ -31,6 +31,11 @@ AsterGraphStore::AsterGraphStore(rocksdb::Options& options,
 {
 }
 
+IGraphStore::Status AsterGraphStore::SyncWAL()
+{
+    return graph_->get_raw_db()->SyncWAL();
+}
+
 IGraphStore::Status AsterGraphStore::AddVertex(uint64_t id)
 {
     return graph_->AddVertex(static_cast<rocksdb::node_id_t>(id));

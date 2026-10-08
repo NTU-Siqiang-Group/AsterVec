@@ -1,6 +1,7 @@
 #include <array>
 #include "astervec_index.h"
 #include "aster_graph_store.h"
+#include "crc32.h"
 #include "disk_vector.h"
 #include "distance.h"
 #include "metadata_store.h"
@@ -161,34 +162,69 @@ using namespace ROCKSDB_NAMESPACE;
     //     RocksGraph CONSTRUCTOR parameter that Aster does not persist, so the
     //     engine records it here at create time and replays it at every open;
     //     files with version < 3 are raw-encoded by definition)
-    constexpr uint32_t kMetadataVersion = 3;
+    // v4: + trailer: checkpoint_lsn (the operation-log position the
+    //     checkpoint covers; 0 when no log is in use) and the live vector
+    //     count at the checkpoint. Placed after the paged-storage block so
+    //     the v3 header and its CRC layout are unchanged.
+    constexpr uint32_t kMetadataVersion = 4;
 
-    // Reflected CRC-32 (poly 0xEDB88320) over the fixed header fields. Guards
-    // the routing-critical values (encoding above all: a silently flipped but
+    // CRC-32 (crc32.h) over the fixed header fields. Guards the
+    // routing-critical values (encoding above all: a silently flipped but
     // still-legal encoding value would select the wrong decoder) against
     // accidental corruption. A deliberate edit that recomputes the CRC is out
     // of the threat model.
+    // Raw-register update: start from 0xFFFFFFFF, xor with 0xFFFFFFFF at
+    // the end. Crc32() below is the one-shot form.
+    uint32_t Crc32Update(uint32_t crc, const void* data, size_t n)
+    {
+        return crc32::Update(crc, data, n);
+    }
+
     uint32_t Crc32(const void* data, size_t n)
     {
-        // Magic-static IIFE: thread-safe one-time init (a hand-rolled
-        // `static bool init` guard is a data race under concurrent first
-        // calls — caught by TSan in review R4).
-        static const std::array<uint32_t, 256> table = [] {
-            std::array<uint32_t, 256> t{};
-            for (uint32_t i = 0; i < 256; i++) {
-                uint32_t c = i;
-                for (int k = 0; k < 8; k++)
-                    c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : (c >> 1);
-                t[i] = c;
-            }
-            return t;
-        }();
-        uint32_t crc = 0xFFFFFFFFu;
-        const auto* p = static_cast<const unsigned char*>(data);
-        for (size_t i = 0; i < n; i++)
-            crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
-        return crc ^ 0xFFFFFFFFu;
+        return crc32::Value(data, n);
     }
+
+    // Forwards writes to `target` while computing the CRC32 of everything
+    // written, so the metadata can be streamed to disk instead of being
+    // assembled in memory first.
+    class CrcOStreamBuf : public std::streambuf {
+    public:
+        explicit CrcOStreamBuf(std::ostream& target) : target_(target)
+        {
+            setp(buf_, buf_ + sizeof(buf_));
+        }
+        uint32_t crc() const { return crc_ ^ 0xFFFFFFFFu; }
+        bool ok() const { return ok_; }
+
+    protected:
+        int_type overflow(int_type ch) override
+        {
+            if (!drain()) return traits_type::eof();
+            if (!traits_type::eq_int_type(ch, traits_type::eof())) {
+                *pptr() = traits_type::to_char_type(ch);
+                pbump(1);
+            }
+            return traits_type::not_eof(ch);
+        }
+        int sync() override { return drain() ? 0 : -1; }
+
+    private:
+        bool drain()
+        {
+            const std::ptrdiff_t n = pptr() - pbase();
+            if (n > 0) {
+                crc_ = Crc32Update(crc_, pbase(), static_cast<size_t>(n));
+                if (!target_.write(pbase(), n)) ok_ = false;
+                pbump(static_cast<int>(-n));
+            }
+            return ok_;
+        }
+        std::ostream& target_;
+        char buf_[1 << 16];
+        uint32_t crc_ = 0xFFFFFFFFu;
+        bool ok_ = true;
+    };
 
     struct MetaHeaderV3 {
         uint32_t version;
@@ -271,20 +307,18 @@ using namespace ROCKSDB_NAMESPACE;
 
     Status AsterVec::SerializeMetadata(std::ostream& out) const
     {
-        // v3 integrity: serialize into memory, append a CRC32 over the WHOLE
-        // payload (magic + version + header + body), then write. Guards the
-        // body (vectors, layers, update map) that the header CRC cannot
-        // (review R3). Transient buffer ~= meta size; acceptable at Close.
-        std::ostringstream oss(std::ios::binary);
-        Status s = SerializeMetadataImpl(oss);
+        // v3+ integrity: a CRC32 over the WHOLE payload (magic + version +
+        // header + body) follows the payload. Guards the body (vectors,
+        // layers, update map) that the header CRC cannot (review R3). The
+        // payload is streamed through the CRC, never held in memory whole.
+        CrcOStreamBuf crcbuf(out);
+        std::ostream tee(&crcbuf);
+        Status s = SerializeMetadataImpl(tee);
         if (!s.ok()) {
             return s;
         }
-        const std::string body = oss.str();
-        uint32_t full_crc = Crc32(body.data(), body.size());
-        if (!out.write(body.data(),
-                       static_cast<std::streamsize>(body.size())) ||
-            !WriteValue(out, full_crc)) {
+        tee.flush();
+        if (!tee || !crcbuf.ok() || !WriteValue(out, crcbuf.crc())) {
             return Status::IOError("failed to write metadata");
         }
         return Status::OK();
@@ -447,6 +481,10 @@ using namespace ROCKSDB_NAMESPACE;
             }
         }
 
+        if (!WriteValue(out, checkpoint_lsn_) ||
+            !WriteValue(out, checkpoint_live_count_)) {
+            return Status::IOError("failed to write checkpoint trailer");
+        }
         return Status::OK();
     }
 
@@ -650,6 +688,13 @@ using namespace ROCKSDB_NAMESPACE;
             }
         }
 
+        checkpoint_lsn_ = 0;
+        checkpoint_live_count_ = -1;
+        if (version >= 4 && (!ReadValue(in, &checkpoint_lsn_) ||
+                             !ReadValue(in, &checkpoint_live_count_))) {
+            return Status::IOError("failed to read checkpoint trailer");
+        }
+
         // Deserialize runs single-threaded under the engine's lifecycle
         // exclusive (Open/Close path); release-store is sufficient.
         entry_point_.store(static_cast<node_id_t>(entryPoint),
@@ -761,11 +806,16 @@ using namespace ROCKSDB_NAMESPACE;
 
     void AsterVec::storeVectorWithStats(node_id_t id,
                                       const std::vector<float>& vec,
-                                      node_id_t sectionKey)
+                                      node_id_t sectionKey,
+                                      const char* encoded)
     {
         auto timer = stats.startTimer();
         try {
-            vector_storage_->storeVectorToDisk(id, vec, sectionKey);
+            if (encoded) {
+                vector_storage_->storeEncoded(id, encoded, sectionKey);
+            } else {
+                vector_storage_->storeVectorToDisk(id, vec, sectionKey);
+            }
         } catch (...) {
             stats.accumulateTime(timer, stats.vec_write_time);
             stats.addCount(1, stats.vec_write_count);
@@ -790,7 +840,8 @@ using namespace ROCKSDB_NAMESPACE;
         stats.addCount(1, stats.vec_read_count);
     }
 
-    Status AsterVec::insertNode(node_id_t nodeId, const std::vector<float> &vector)
+    Status AsterVec::insertNode(node_id_t nodeId, const std::vector<float> &vector,
+                                const char* encoded)
     {
         // C5a: removed deleted_ids_.erase(nodeId). Re-insert of a tombstoned id
         // is now routed by AsterVecDB::Insert (C5b) to allocate a fresh
@@ -864,7 +915,7 @@ using namespace ROCKSDB_NAMESPACE;
                 Status link_st = linkNeighborsAsterDB(nodeId, {});
                 if (!link_st.ok()) return link_st;
             }
-            storeVectorWithStats(nodeId, vector, /*sectionKey=*/nodeId);
+            storeVectorWithStats(nodeId, vector, /*sectionKey=*/nodeId, encoded);
             vectorStored = true;
 
             node_id_t expected_invalid = k_invalid_node_id;
@@ -945,7 +996,7 @@ using namespace ROCKSDB_NAMESPACE;
         // ----- Step 3: store vector to disk (publish bytes) -----
         if (!vectorStored)
         {
-            storeVectorWithStats(nodeId, vector, sectionKey);
+            storeVectorWithStats(nodeId, vector, sectionKey, encoded);
             vectorStored = true;
         }
 
@@ -1287,10 +1338,35 @@ using namespace ROCKSDB_NAMESPACE;
         return Status::OK();
     }
 
+    // Drops neighbours whose vector location is unknown. After an unclean
+    // shutdown, layer-0 edges (WAL-recovered) can be ahead of the vector
+    // location map (checkpointed); skipping them keeps traversal from
+    // reading an unassigned slot. The cache keeps the unfiltered list so an
+    // edge becomes usable again once its location is restored.
+    void AsterVec::dropUnlocatable(std::vector<node_id_t>& ids) {
+        size_t before = ids.size();
+        ids.erase(std::remove_if(ids.begin(), ids.end(),
+                                 [this](node_id_t n) {
+                                     return !vector_storage_->has_location(n);
+                                 }),
+                  ids.end());
+        if (ids.size() != before) {
+            dangling_edges_skipped_.fetch_add(before - ids.size(),
+                                              std::memory_order_relaxed);
+        }
+    }
+
+    Status AsterVec::syncGraph() {
+        return db_->SyncWAL();
+    }
+
     std::vector<node_id_t> AsterVec::getEdgesCached(node_id_t id) {
         if (edge_cache_) {
             std::vector<node_id_t> cached;
-            if (edge_cache_->get(id, &cached)) return cached;
+            if (edge_cache_->get(id, &cached)) {
+                dropUnlocatable(cached);
+                return cached;
+            }
         }
 
         std::vector<node_id_t> result;
@@ -1307,6 +1383,7 @@ using namespace ROCKSDB_NAMESPACE;
         if (edge_cache_) {
             edge_cache_->put(id, result);
         }
+        dropUnlocatable(result);
         return result;
     }
 

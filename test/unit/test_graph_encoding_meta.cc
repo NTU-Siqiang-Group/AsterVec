@@ -98,8 +98,8 @@ TEST_CASE("encoding: varint survives close/reopen with identical results") {
     auto opts = BaseOpts(dir, dim);
     REQUIRE(astervec::AsterVecDB::Open(dir, opts, &db).ok());
 
-    // Create-time persistence: meta exists with v3 + VARINT before Close.
-    CHECK(ReadMetaField32(meta, kVersionOff) == 3);
+    // Create-time persistence: meta exists with v4 + VARINT before Close.
+    CHECK(ReadMetaField32(meta, kVersionOff) == 4);
     CHECK(ReadMetaField32(meta, kEncodingOff) == 2);  // ENCODING_TYPE_VARINT
 
     for (int i = 0; i < n; i++) {
@@ -177,6 +177,9 @@ TEST_CASE("encoding: legal enum flip is caught by the header CRC") {
     REQUIRE(db->Close().ok());
     db.reset();
 
+    // No previous checkpoint to fall back to (that path is covered in
+    // test_crash_recovery.cc), so the damaged header must be refused.
+    std::remove((meta + ".prev").c_str());
     // 2 (VARINT) -> 0 (NONE): both legal enum values; only the CRC can tell.
     {
         std::fstream f(meta, std::ios::binary | std::ios::in | std::ios::out);
@@ -209,6 +212,7 @@ TEST_CASE("encoding: graph present but meta missing is refused") {
     db.reset();
 
     REQUIRE(std::remove(meta.c_str()) == 0);
+    std::remove((meta + ".prev").c_str());
     auto st = astervec::AsterVecDB::Open(dir, opts, &db);
     CHECK(st.IsCorruption());
 
@@ -341,6 +345,8 @@ TEST_CASE("encoding: corrupted meta BODY is rejected by the payload CRC") {
         char b = 0x5A;
         f.write(&b, 1);
     }
+    // Without a previous checkpoint to fall back to, the damage is fatal.
+    std::remove((meta + ".prev").c_str());
     std::unique_ptr<astervec::AsterVecDB> db;
     CHECK(astervec::AsterVecDB::Open(dir, opts, &db).IsCorruption());
 }

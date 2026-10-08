@@ -85,6 +85,11 @@ PYBIND11_MODULE(astervec, m)
         .def_readwrite("edge_cache_size", &astervec::AsterVecDBOptions::edge_cache_size)
         .def_readwrite("block_cache_bytes", &astervec::AsterVecDBOptions::block_cache_bytes)
         .def_readwrite("write_buf_cap", &astervec::AsterVecDBOptions::write_buf_cap)
+        .def_readwrite("enable_oplog", &astervec::AsterVecDBOptions::enable_oplog)
+        .def_readwrite("checkpoint_interval_ops",
+                       &astervec::AsterVecDBOptions::checkpoint_interval_ops)
+        .def_readwrite("oplog_segment_bytes",
+                       &astervec::AsterVecDBOptions::oplog_segment_bytes)
         .def_readwrite("vector_storage_type", &astervec::AsterVecDBOptions::vector_storage_type)
         .def_readwrite("db_target_size", &astervec::AsterVecDBOptions::db_target_size)
         .def_readwrite("random_seed", &astervec::AsterVecDBOptions::random_seed)
@@ -329,7 +334,25 @@ PYBIND11_MODULE(astervec, m)
              "Return the metadata dict for id (empty dict if no metadata row).")
         .def("flush_vector_writes",
              [](astervec::AsterVecDB& db) { db.flushVectorWrites(); },
-             "Flush any pending vector writes to the on-disk vector storage.")
+             "Flush pending vector writes and checkpoint (same as checkpoint(), "
+             "but logs errors instead of raising).")
+        .def("checkpoint",
+             [](astervec::AsterVecDB& db) { RaiseStatus(db.Checkpoint()); },
+             "Make everything written so far durable and record it as the "
+             "restart point. Writes wait while it runs; a no-op if nothing "
+             "changed since the last checkpoint.")
+        .def("recovery_stats",
+             [](const astervec::AsterVecDB& db) {
+                 const auto s = db.GetRecoveryStats();
+                 py::dict d;
+                 d["checkpoint_lsn"] = s.checkpoint_lsn;
+                 d["replayed_ops"] = s.replayed_ops;
+                 d["dropped_bytes"] = s.dropped_bytes;
+                 d["lsn_gap"] = s.lsn_gap;
+                 d["seconds"] = s.seconds;
+                 return d;
+             },
+             "What the last open replayed from the operation log.")
         .def("bulk_build",
              [](astervec::AsterVecDB& db,
                 const py::array_t<float, py::array::c_style | py::array::forcecast>& array,

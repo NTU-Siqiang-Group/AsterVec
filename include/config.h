@@ -23,6 +23,8 @@ struct Config {
     int ef_search = 128;
     bool reinit = true;
     bool skip_insert = false;   // reuse a built index (implies reinit=0)
+    bool enable_oplog = false;  // crash-safe operation log
+    uint64_t checkpoint_interval_ops = 0;
 
     size_t edge_cache_size = 100000;
     int vector_storage_type = 1; // 0 for basic, 1 for paged
@@ -92,6 +94,7 @@ R"(Usage:
        [--k <int>] [--efs <int>] \
        [--stats <0|1>] \
        [--batch-read <0|1>] \
+       [--oplog <0|1>] [--checkpoint-interval <ops>] \
        [--edge-policy <eager|lazy|none>] \
        [-h|--help]
 
@@ -132,6 +135,9 @@ Short aliases:
                 kv[k] = "1";
             }
             if (k == "batch-read") {
+                kv[k] = "1";
+            }
+            if (k == "oplog") {
                 kv[k] = "1";
             }
         };
@@ -191,6 +197,8 @@ Short aliases:
         if (kv.count("skip-insert"))      { cfg_.skip_insert = (kv["skip-insert"] != "0");
                                             if (cfg_.skip_insert) cfg_.reinit = false; }
         if (kv.count("batch-read"))         cfg_.enable_batch_read = (kv["batch-read"] != "0");
+        if (kv.count("oplog"))              cfg_.enable_oplog = (kv["oplog"] != "0");
+        if (kv.count("checkpoint-interval")) cfg_.checkpoint_interval_ops = parseU64(kv["checkpoint-interval"]);
 
         if (kv.count("M"))                  cfg_.M = parseI(kv["M"]);
         if (kv.count("Mmax"))               cfg_.Mmax = parseI(kv["Mmax"]);

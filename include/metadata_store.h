@@ -61,6 +61,9 @@ public:
     // Returns NotFound if no metadata exists for id.
     Status DeleteKeys(node_id_t id, const std::vector<std::string>& keys);
 
+    // fsync the payload DB's WAL so every write accepted so far is durable.
+    Status SyncWAL();
+
     // Observability counters (incremented on each call).
     size_t point_gets() const { return point_gets_; }
     size_t parses()     const { return parses_; }

@@ -134,6 +134,7 @@ set(LIB_SOURCES
     src/utils.cc
     src/metadata.cc
     src/metadata_store.cc
+    src/oplog.cc
     src/bloom_filter.cc
     src/astervec_rnn_descent.cc
     src/astervec_bulk_build.cc

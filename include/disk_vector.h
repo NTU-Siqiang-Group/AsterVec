@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -21,6 +22,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "durable_io.h"
 #include "id_types.h"
 
 // Thread-safety contract for PagedVectorStorage
@@ -119,11 +121,37 @@ public:
     virtual void readVectorFromDisk(node_id_t id,
                                     std::vector<float>& vec) = 0;
 
+    // ---- Record encoding ----
+    // The store owns how a vector is laid out on disk. The operation log
+    // writes these exact bytes, so a replayed vector is bit-identical to the
+    // one the store would have written, and the write path encodes once.
+    // Tags are persisted in the log: never renumber, add new ones instead.
+    static constexpr uint8_t kEncodingSQ8 = 1;      // [min f32][max f32][u8 x dim]
+    static constexpr uint8_t kEncodingFloat32 = 2;  // [f32 x dim]
+
+    // Bytes per stored vector.
+    virtual size_t recordSize() const = 0;
+    // Which encoding records use (kEncoding*).
+    virtual uint8_t encodingTag() const = 0;
+    // Encode `vec` (getVectorDim() floats) into `out` (recordSize() bytes).
+    virtual void encodeRecord(const float* vec, char* out) const = 0;
+    // Decode a record into `out` (getVectorDim() floats).
+    virtual void decodeRecord(const char* record, float* out) const = 0;
+    // Store an already-encoded record; same semantics as storeVectorToDisk.
+    virtual void storeEncoded(node_id_t id, const char* record,
+                              node_id_t sectionKey) = 0;
+
     // Mark a vector as deleted for logical ID 'id'
     virtual void deleteVector(node_id_t id) = 0;
 
     // Check whether a vector exists (not deleted and assigned)
     virtual bool exists(node_id_t id) const = 0;
+
+    // True if the store knows where the vector for `id` lives, so a read
+    // will not throw. Deleted (tombstoned) vectors still have a location.
+    // After an unclean shutdown the graph can reference ids whose location
+    // was never checkpointed; traversal uses this to skip them.
+    virtual bool has_location(node_id_t id) const = 0;
 
     // Optional prefetch API. Default is no-op.
     virtual void prefetchByIds(const std::vector<node_id_t>& /*ids*/) {}
@@ -152,6 +180,10 @@ public:
 
     // Flush buffered writes to disk. Default is no-op.
     virtual void flushWrites() {}
+
+    // Flush buffered writes and fsync the backing files, so every vector
+    // stored so far survives a power loss. Returns false on an I/O error.
+    virtual bool syncData() = 0;
 
     // Optional page cache stats. Default returns zeros.
     virtual PageCacheStats getPageCacheStats() const { return {}; }
@@ -308,19 +340,36 @@ public:
     void storeVectorToDisk(node_id_t id,
                            const std::vector<float>& vector) override
     {
-        if (static_cast<size_t>(id) >= totalVectors_)
-        {
-            throw std::out_of_range("Vector ID out of range.");
-        }
         if (vector.size() != dim_)
         {
             throw std::runtime_error("Vector size mismatch.");
+        }
+        storeEncoded(id, reinterpret_cast<const char*>(vector.data()), id);
+    }
+
+    size_t recordSize() const override { return dim_ * sizeof(float); }
+    uint8_t encodingTag() const override { return kEncodingFloat32; }
+    void encodeRecord(const float* vec, char* out) const override
+    {
+        std::memcpy(out, vec, dim_ * sizeof(float));
+    }
+    void decodeRecord(const char* record, float* out) const override
+    {
+        std::memcpy(out, record, dim_ * sizeof(float));
+    }
+
+    void storeEncoded(node_id_t id, const char* record,
+                      node_id_t /*sectionKey*/) override
+    {
+        if (static_cast<size_t>(id) >= totalVectors_)
+        {
+            throw std::out_of_range("Vector ID out of range.");
         }
 
         size_t offset = static_cast<size_t>(id) * dim_ * sizeof(float);
         fileStream_.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
 
-        fileStream_.write(reinterpret_cast<const char*>(vector.data()),
+        fileStream_.write(record,
                           static_cast<std::streamsize>(dim_ * sizeof(float)));
         if (!fileStream_.good())
         {
@@ -331,6 +380,19 @@ public:
         if (deletedFlags_[static_cast<size_t>(id)] != 0) {
             writeDeleteFlag(id, false);
         }
+    }
+
+    bool has_location(node_id_t id) const override
+    {
+        return static_cast<size_t>(id) < totalVectors_;
+    }
+
+    bool syncData() override
+    {
+        fileStream_.flush();
+        deleteStream_.flush();
+        return durable::fsync_file(filePath_) &&
+               durable::fsync_file(deleteFilePath_);
     }
 
     void readVectorFromDisk(node_id_t id,
@@ -721,6 +783,7 @@ private:
     // shard mutex when no writer has buffered anything yet.
     std::atomic<size_t>                      sectionWriteBufsCount_{0};
     int writeFd_ = -1;  // file descriptor for pwrite-based writes
+    std::mutex streamWriteMu_;  // fstream fallback when the fds are not open
     // 20260722_write_buf_cap: bound live section write buffers (total across
     // shards; each shard enforces cap/kNumSectionShards). 0 = unlimited
     // (legacy). Unbounded buffers scale with live-section count and were
@@ -931,7 +994,7 @@ private:
     // the record directly. (Port of opt-branch writeSlotSafely, folded
     // inside the shard lock so the check-and-act is atomic.)
     bool writeToSectionBuffer(int sectionIdx, size_t pageId, uint16_t slot,
-                              const std::vector<float>& vec) {
+                              const char* record) {
         // Lock-order rule:
         //   shard.mu is acquired BELOW; page_mu_ (via
         //   updateCacheAfterWrite) is acquired AFTER releasing
@@ -999,9 +1062,9 @@ private:
                 std::fill(swb.data.begin(), swb.data.end(), 0);
             }
 
-            // Quantize vector into the buffer
+            // Copy the encoded record into the buffer
             size_t offsetInPage = static_cast<size_t>(slot) * recordSize_;
-            quantize(vec.data(), dim_, swb.data.data() + offsetInPage);
+            std::memcpy(swb.data.data() + offsetInPage, record, recordSize_);
 
             // If page is full, flush to disk and free the buffer
             if (slot + 1 >= vectorsPerPage_) {
@@ -1014,7 +1077,7 @@ private:
         // Page-cache update OUTSIDE shard.mu to avoid the lock-order
         // inversion noted above. updateCacheAfterWrite takes page_mu_
         // exclusive on its own.
-        updateCacheAfterWrite(pageId, slot, vec);
+        updateCacheAfterWrite(pageId, slot, record);
         return true;
     }
 
@@ -1216,18 +1279,29 @@ private:
         dequantize(tmp.data(), out, dim_);
     }
 
-    // Write a single record (one vector) at (pageId, slot) to disk. Quantizes to SQ8.
-    // Write-path; called under the external per-index exclusive lock.
-    void writeRecord(size_t pageId, uint16_t slot, const std::vector<float>& vec) {
-        if (vec.size() != dim_) {
-            throw std::runtime_error("Vector size mismatch in writeRecord.");
-        }
-        std::vector<char> tmp(recordSize_);
-        quantize(vec.data(), dim_, tmp.data());
+    // Write a single encoded (SQ8) record at (pageId, slot) to disk.
+    // Concurrent writers call this for different slots, so it must not use
+    // the shared fstream (seek + write is not atomic across threads): a
+    // positional pwrite touches only this record's bytes.
+    void writeRecord(size_t pageId, uint16_t slot, const char* record) {
         size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
+        if (writeFd_ >= 0) {
+            size_t done = 0;
+            while (done < recordSize_) {
+                ssize_t w = ::pwrite(writeFd_, record + done, recordSize_ - done,
+                                     static_cast<off_t>(offset + done));
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    throw std::runtime_error("Failed to write vector to file.");
+                }
+                done += static_cast<size_t>(w);
+            }
+            return;
+        }
+        std::lock_guard<std::mutex> g(streamWriteMu_);
         fileStream_.clear();
         fileStream_.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
-        fileStream_.write(tmp.data(), static_cast<std::streamsize>(recordSize_));
+        fileStream_.write(record, static_cast<std::streamsize>(recordSize_));
         if (!fileStream_.good()) {
             throw std::runtime_error("Failed to write vector to file.");
         }
@@ -1238,7 +1312,7 @@ private:
     // Write-path; called under the external per-index exclusive lock.
     // Takes unique_lock as defence-in-depth against future relaxation of
     // the contract.
-    void updateCacheAfterWrite(size_t pageId, uint16_t slot, const std::vector<float>& vec) {
+    void updateCacheAfterWrite(size_t pageId, uint16_t slot, const char* record) {
         if (maxCachedPages_ == 0) return;
         std::unique_lock<std::shared_mutex> lk(page_mu_);
         int32_t cs = cacheSlotOf(pageId);
@@ -1249,7 +1323,7 @@ private:
         if (offsetInPage + recordSize_ > buf.data.size()) {
             return;
         }
-        quantize(vec.data(), dim_, buf.data.data() + offsetInPage);
+        std::memcpy(buf.data.data() + offsetInPage, record, recordSize_);
     }
 
     // Allocate a free slot for a given sectionKey (creates section/pages on demand).
@@ -1430,18 +1504,40 @@ public:
                            const std::vector<float>& vec,
                            node_id_t sectionKey) override
     {
-        ensure_dense_capacity(id);   // grows direct-id arrays if needed; no-op for update ids
         if (vec.size() != dim_) {
             throw std::runtime_error("Vector size mismatch.");
         }
+        // Quantize once; every copy below (section buffer, file, cache)
+        // takes these bytes.
+        thread_local std::vector<char> record;
+        record.resize(recordSize_);
+        quantize(vec.data(), dim_, record.data());
+        storeEncoded(id, record.data(), sectionKey);
+    }
+
+    size_t recordSize() const override { return recordSize_; }
+    uint8_t encodingTag() const override { return kEncodingSQ8; }
+    void encodeRecord(const float* vec, char* out) const override
+    {
+        quantize(vec, dim_, out);
+    }
+    void decodeRecord(const char* record, float* out) const override
+    {
+        dequantize(record, out, dim_);
+    }
+
+    void storeEncoded(node_id_t id, const char* record,
+                      node_id_t sectionKey) override
+    {
+        ensure_dense_capacity(id);   // grows direct-id arrays if needed; no-op for update ids
 
         int64_t curPage = page_of(id);
 
         if (curPage >= 0) {
             // Overwrite existing slot
             uint16_t curSlot = slot_of(id);
-            writeRecord(static_cast<size_t>(curPage), curSlot, vec);
-            updateCacheAfterWrite(static_cast<size_t>(curPage), curSlot, vec);
+            writeRecord(static_cast<size_t>(curPage), curSlot, record);
+            updateCacheAfterWrite(static_cast<size_t>(curPage), curSlot, record);
             mark_deleted_at(id, false);
             return;
         }
@@ -1458,16 +1554,16 @@ public:
         // observe page_of(id) >= 0 are guaranteed to find durable bytes
         // (either in the section write buffer or on disk).
         if (sectionIdx >= 0 && writeFd_ >= 0) {
-            if (!writeToSectionBuffer(sectionIdx, pageId, slot, vec)) {
+            if (!writeToSectionBuffer(sectionIdx, pageId, slot, record)) {
                 // Mid-page first-touch after a cap eviction/reopen: the
                 // section buffer path would clobber earlier slots; write
                 // the record directly instead.
-                writeRecord(pageId, slot, vec);
-                updateCacheAfterWrite(pageId, slot, vec);
+                writeRecord(pageId, slot, record);
+                updateCacheAfterWrite(pageId, slot, record);
             }
         } else {
-            writeRecord(pageId, slot, vec);
-            updateCacheAfterWrite(pageId, slot, vec);
+            writeRecord(pageId, slot, record);
+            updateCacheAfterWrite(pageId, slot, record);
         }
         mark_deleted_at(id, false);
 
@@ -1479,6 +1575,24 @@ public:
     // use ID as the "sectionKey".
     void storeVectorToDisk(node_id_t id, const std::vector<float>& vec) override {
         storeVectorToDisk(id, vec, id);
+    }
+
+    bool has_location(node_id_t id) const override
+    {
+        return page_of(id) >= 0;
+    }
+
+    bool syncData() override
+    {
+        // Write and drop the section buffers. Keeping them would make every
+        // later page read check the buffers under the shard locks (search
+        // ~15% slower); inserts into a partly-filled page then take the
+        // per-record pwrite path, which costs about the same.
+        flushWrites();
+        fileStream_.flush();
+        deleteStream_.flush();
+        return ::fsync(writeFd_) == 0 &&
+               durable::fsync_file(deleteFilePath_);
     }
 
     // Read a vector by its logical ID.
@@ -1519,11 +1633,20 @@ public:
         if (vec.size() != dim_) vec.resize(dim_);
         std::vector<char> tmp(recordSize_);
         size_t offset = pageId * kPageSize + static_cast<size_t>(slot) * recordSize_;
-        fileStream_.clear();
-        fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-        fileStream_.read(tmp.data(), static_cast<std::streamsize>(recordSize_));
-        if (!fileStream_.good()) {
-            throw std::runtime_error("Failed to read vector from file.");
+        if (readFd_ >= 0) {
+            // Positional read: safe alongside concurrent readers and writers.
+            ssize_t n = ::pread(readFd_, tmp.data(), recordSize_, static_cast<off_t>(offset));
+            if (n != static_cast<ssize_t>(recordSize_)) {
+                throw std::runtime_error("Failed to read vector from file.");
+            }
+        } else {
+            std::lock_guard<std::mutex> g(streamWriteMu_);
+            fileStream_.clear();
+            fileStream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+            fileStream_.read(tmp.data(), static_cast<std::streamsize>(recordSize_));
+            if (!fileStream_.good()) {
+                throw std::runtime_error("Failed to read vector from file.");
+            }
         }
         dequantize(tmp.data(), vec.data(), dim_);
     }
@@ -1909,6 +2032,23 @@ public:
             s.bufPool.clear();
         }
 
+        // v2: read update_locations_ sparse map. v1 files have no such block.
+        update_locations_.clear();
+        if (version >= 2) {
+            uint64_t updateLocCount = 0;
+            if (!read(&updateLocCount)) return false;
+            update_locations_.reserve(static_cast<size_t>(updateLocCount));
+            for (uint64_t i = 0; i < updateLocCount; ++i) {
+                uint64_t id = 0;
+                int64_t  page = 0;
+                uint16_t slot = 0;
+                if (!read(&id) || !read(&page) || !read(&slot)) return false;
+                UpdateLoc& loc = update_locations_[static_cast<node_id_t>(id)];
+                loc.page = page;
+                loc.slot = slot;
+            }
+        }
+
         std::vector<std::vector<uint8_t>> usedSlots;
         usedSlots.resize(pages_.size());
         for (size_t pageId = 0; pageId < pages_.size(); ++pageId) {
@@ -1932,6 +2072,21 @@ public:
                 usedSlots[pageId][slot] = 1;
             }
         }
+        // Slots held by update ids are in use too; without this they were
+        // put on the free list and the next inserts overwrote updated
+        // vectors after a reopen.
+        for (const auto& kv : update_locations_) {
+            const int64_t page = kv.second.page;
+            if (page < 0) continue;
+            const size_t pageId = static_cast<size_t>(page);
+            // Earlier versions never checked these; skip rather than refuse
+            // to open.
+            if (pageId >= pages_.size() ||
+                kv.second.slot >= usedSlots[pageId].size()) {
+                continue;
+            }
+            usedSlots[pageId][kv.second.slot] = 1;
+        }
 
         for (size_t pageId = 0; pageId < pages_.size(); ++pageId) {
             const PageMeta& meta = pages_[pageId];
@@ -1948,23 +2103,6 @@ public:
                 if (slot < usedSlots[pageId].size() && usedSlots[pageId][slot] == 0) {
                     freeList.emplace_back(pageId, static_cast<uint16_t>(slot));
                 }
-            }
-        }
-
-        // v2: read update_locations_ sparse map. v1 files have no such block.
-        update_locations_.clear();
-        if (version >= 2) {
-            uint64_t updateLocCount = 0;
-            if (!read(&updateLocCount)) return false;
-            update_locations_.reserve(static_cast<size_t>(updateLocCount));
-            for (uint64_t i = 0; i < updateLocCount; ++i) {
-                uint64_t id = 0;
-                int64_t  page = 0;
-                uint16_t slot = 0;
-                if (!read(&id) || !read(&page) || !read(&slot)) return false;
-                UpdateLoc& loc = update_locations_[static_cast<node_id_t>(id)];
-                loc.page = page;
-                loc.slot = slot;
             }
         }
 
