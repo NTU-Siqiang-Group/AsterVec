@@ -25,6 +25,7 @@ add_executable(astervec_unit_tests
     test_crash_recovery.cc
     test_oplog.cc
     test_oplog_replay.cc
+    test_search_empty.cc
     test_delete_stress.cc
     test_edge_cache_arena.cc
     test_concurrent_search.cc

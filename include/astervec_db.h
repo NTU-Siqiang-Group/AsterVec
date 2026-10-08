@@ -155,6 +155,10 @@ public:
     Status Update(node_id_t id, Span<float> vec);
     Status Delete(node_id_t id);
     Status Get(node_id_t id, std::vector<float>* vec);
+    // An empty result is not an error: an empty index, a search whose hits
+    // are all deleted, or a filter that matches nothing returns OK with an
+    // empty `out`. Errors are reserved for bad arguments, an invalid filter
+    // and storage failures.
     Status SearchKnn(Span<float> query,
                      const SearchOptions& options,
                      std::vector<SearchResult>* out);

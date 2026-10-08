@@ -128,11 +128,8 @@ def verify(astervec, db, series_seed, acked_ops, ckpts, in_flight_ckpt, oplog):
     else:
         return f"state matches none of {candidates} (have {len(got)} live ids)", None
 
-    # Search must work and find live vectors (an empty index has nothing to
-    # search: the engine reports NotFound).
+    # Search must work and find live vectors.
     live = list(got)
-    if not live:
-        return None, matched
     rng = random.Random(series_seed)
     sample = rng.sample(live, min(100, len(live)))
     hits = 0

@@ -279,8 +279,8 @@ TEST_CASE("encoding: crash before first Close still replays the encoding") {
     CHECK(ReadMetaField32(meta, kEncodingOff) == 2);  // stub survived
     std::unique_ptr<astervec::AsterVecDB> db;
     REQUIRE(astervec::AsterVecDB::Open(dir, opts, &db).ok());
-    // Index state is empty (no-WAL semantics: upper layers lived only in
-    // memory); the pre-existing contract returns NotFound on empty indexes.
+    // Index state is empty (nothing was checkpointed before the crash); an
+    // empty index searches to an empty result, not an error.
     auto q = MakeVectors(1, dim, 0x12);
     astervec::SearchOptions so;
     so.k = 5;
@@ -288,7 +288,8 @@ TEST_CASE("encoding: crash before first Close still replays the encoding") {
     std::vector<astervec::SearchResult> res;
     auto sst = db->SearchKnn(
         astervec::Span<float>(q[0].data(), q[0].size()), so, &res);
-    CHECK(sst.IsNotFound());
+    CHECK(sst.ok());
+    CHECK(res.empty());
     REQUIRE(db->Close().ok());
 }
 

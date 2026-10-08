@@ -932,10 +932,9 @@ Status AsterVecDB::SearchKnn(Span<float> query,
     if (index_->graphCorrupted()) {
         return index_->graphCorruptionStatus();
     }
-    if (results.empty()) {
-        return Status::NotFound("index is empty");
-    }
 
+    // Nothing to return (empty index, every hit deleted) is an empty result,
+    // not an error.
     out->clear();
     out->reserve(results.size());
     for (const auto& result : results) {
@@ -948,11 +947,6 @@ Status AsterVecDB::SearchKnn(Span<float> query,
         out->push_back(translated);
         if (static_cast<int>(out->size()) >= options.k) break;
     }
-
-    if (out->empty()) {
-        return Status::NotFound("no available neighbors");
-    }
-
     return Status::OK();
 }
 
@@ -1019,10 +1013,7 @@ Status AsterVecDB::SearchKnn(Span<float> query,
         translated.distance = result.distance;
         out->push_back(translated);
     }
-
-    if (out->empty()) {
-        return Status::NotFound("no available neighbors");
-    }
+    // No point matching the filter is an empty result, not an error.
     return Status::OK();
 }
 

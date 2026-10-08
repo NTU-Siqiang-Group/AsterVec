@@ -889,7 +889,7 @@ private:
         } else {
             s = db_->SearchKnn(Span<float>(q), opts, &results);
         }
-        if (!s.ok() && !s.IsNotFound()) {
+        if (!s.ok()) {
             sendError(res, statusFromDb(s), "db_error", s.ToString());
             return statusFromDb(s);
         }
