@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <mutex>
 #include <shared_mutex>
 #include <ostream>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "disk_vector.h"
+#include "point_id.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -34,6 +36,14 @@ using Status = ROCKSDB_NAMESPACE::Status;
 enum class DistanceMetric {
     kL2,
     kCosine,
+};
+
+// How callers identify points. Fixed when a store is created and recorded in
+// its metadata; opening a store uses the recorded mode.
+enum class IdMode {
+    kAuto,   // open: the store's recorded mode; create: kDense
+    kDense,  // integer ids up to 2^63-1, used directly as internal ids
+    kKeyed,  // any 64-bit integer or string (UUID) id; the engine maps it
 };
 
 // Tuning knobs for the in-memory bulk-build path. Defaults match the
@@ -114,6 +124,10 @@ struct AsterVecDBOptions {
     // Operation log segment size; older segments are removed once two
     // checkpoints cover them.
     uint64_t oplog_segment_bytes = 64ull << 20;
+
+    // Point-id mode (see IdMode). Only takes effect when a store is created;
+    // asking for a mode other than the recorded one is an error.
+    IdMode id_mode = IdMode::kAuto;
 };
 
 struct SearchOptions {
@@ -127,6 +141,12 @@ struct SearchResult {
     float distance;
 };
 
+// A search hit carrying the caller's point id (SearchPoints).
+struct PointHit {
+    PointId id;
+    float distance;
+};
+
 class AsterVecDB {
 public:
     ~AsterVecDB();
@@ -135,6 +155,32 @@ public:
                        const AsterVecDBOptions& opts,
                        std::unique_ptr<AsterVecDB>* db);
     Status Close();
+
+    // ---- Point operations ----
+    // Every call takes either a PointId (any int or string in keyed stores)
+    // or a plain integer id (PointId::Int). Insert is an upsert.
+    Status Insert(const PointId& id, Span<float> vec,
+                  std::string_view metadata_json = {});
+    Status Update(const PointId& id, Span<float> vec);
+    Status Delete(const PointId& id);
+    Status Get(const PointId& id, std::vector<float>* vec);
+    Status ValidateInsert(const PointId& id, Span<float> vec,
+                          std::string_view metadata_json) const;
+    Status GetPayload(const PointId& id, std::string* out_json);
+    Status SetPayload(const PointId& id, std::string_view metadata_json);
+    Status SetPayloadBatch(
+        const std::vector<std::pair<PointId, std::string>>& items);
+    Status UpdatePayload(const PointId& id, std::string_view partial_json);
+    Status DeletePayloadKeys(const PointId& id, Span<const std::string> keys);
+    // Search returning the callers' point ids (int or string). Use this in
+    // keyed stores with string ids; SearchKnn only reports integer ids.
+    Status SearchPoints(Span<float> query, const SearchOptions& options,
+                        std::string_view filter_json,
+                        std::vector<PointHit>* out);
+    // Bulk build with caller ids (keyed stores): ids[i] names vector i.
+    Status BulkBuild(Span<const float> vectors, const std::vector<PointId>& ids,
+                     const BulkBuildOptions& opts);
+    IdMode GetIdMode() const { return options_.id_mode; }
 
     Status Insert(node_id_t id, Span<float> vec);
     Status Insert(node_id_t id, Span<float> vec, std::string_view metadata_json);
@@ -278,6 +324,49 @@ private:
     Status checkpointLocked();
     Status writeMetadataFile();
 
+    // ---- Point ids ----
+    // Maps a caller id to the dense internal id. Dense stores check the
+    // range; keyed stores look the key up and, with `create`, allocate the
+    // next dense id. NotFound when the key is unknown and !create. *key gets
+    // the encoded key (keyed stores) for the operation log.
+    Status resolveId(const PointId& id, bool create, node_id_t* dense,
+                     std::string* key);
+    // Search results: dense ids -> integer keys (SearchKnn) / point ids.
+    Status toIntIds(std::vector<SearchResult>* out) const;
+    Status toPointHits(const std::vector<SearchResult>& in,
+                       std::vector<PointHit>* out) const;
+    void observeDenseId(node_id_t dense);
+    bool keyed_ = false;
+    // Next dense id for a new key (keyed stores).
+    std::atomic<node_id_t> next_dense_id_{0};
+    static constexpr size_t kKeyLockShards = 256;
+    mutable std::array<std::mutex, kKeyLockShards> key_locks_;
+    std::mutex& key_lock(std::string_view key) const {
+        return key_locks_[std::hash<std::string_view>{}(key) % kKeyLockShards];
+    }
+
+    // Operations on dense internal ids (the public calls resolve ids first).
+    Status validateInsertArgs(Span<float> vec,
+                              std::string_view metadata_json) const;
+    Status insertDense(node_id_t id, Span<float> vec,
+                       std::string_view metadata_json, std::string_view key);
+    Status updateDense(node_id_t id, Span<float> vec,
+                       std::string_view metadata_json, std::string_view key);
+    Status deleteDense(node_id_t id);
+    Status getDense(node_id_t id, std::vector<float>* vec);
+    Status getPayloadDense(node_id_t id, std::string* out_json);
+    Status setPayloadDense(node_id_t id, std::string_view metadata_json);
+    Status updatePayloadDense(node_id_t id, std::string_view partial_json);
+    Status deletePayloadKeysDense(node_id_t id, Span<const std::string> keys);
+    Status searchUnfilteredDense(Span<float> query, const SearchOptions& options,
+                                 std::vector<SearchResult>* out);
+    Status searchDense(Span<float> query, const SearchOptions& options,
+                       std::string_view filter_json,
+                       std::vector<SearchResult>* out);
+    Status bulkBuildImpl(Span<const float> vectors, int n,
+                         const BulkBuildOptions& opts,
+                         const std::vector<PointId>* ids);
+
     // Operation log (null when enable_oplog is off).
     std::unique_ptr<OpLog> oplog_;
     // checkpoint_lsn of lsn_vec_db.meta; segments up to it are kept so the
@@ -293,17 +382,14 @@ private:
     // stay null/0.
     Status logOp(OpType op, node_id_t real_id, node_id_t internal_id,
                  node_id_t old_internal_id, Span<float> vec,
-                 std::string_view payload, std::uint64_t* lsn,
-                 const char** encoded);
+                 std::string_view payload, std::string_view key,
+                 std::uint64_t* lsn, const char** encoded);
     // Marks a logged operation as failed so replay skips it.
     void logAbort(std::uint64_t lsn);
     Status recoverFromOpLog();
     Status replayRecord(const OpRecord& rec, bool aborted,
                         std::vector<float>& scratch);
 
-    // C5b internal helpers (declared private; callers use public Update/Insert).
-    Status UpdateInternal(node_id_t id, Span<float> vec,
-                          std::string_view metadata_json);
 
     std::string db_path_;
     AsterVecDBOptions options_;

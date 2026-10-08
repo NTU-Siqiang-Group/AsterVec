@@ -1,6 +1,7 @@
 #include "metadata_store.h"
 
 #include <cstring>
+#include <memory>
 
 #include "rocksdb/cache.h"
 #include "rocksdb/db.h"
@@ -15,6 +16,11 @@ using ROCKSDB_NAMESPACE::PinnableSlice;
 using ROCKSDB_NAMESPACE::ReadOptions;
 using ROCKSDB_NAMESPACE::Slice;
 using ROCKSDB_NAMESPACE::WriteOptions;
+
+namespace {
+constexpr char kForwardPrefix = 'k';   // 'k' + key       -> dense id (BE 8 bytes)
+constexpr char kReversePrefix = 'r';   // 'r' + dense(BE)  -> key
+}  // namespace
 
 std::string MetadataStore::EncodeKey(node_id_t id) {
     // Big-endian 8-byte encoding: lexicographic order == numeric order.
@@ -31,13 +37,15 @@ MetadataStore::MetadataStore(DB* db, ColumnFamilyHandle* cf)
 
 MetadataStore::~MetadataStore() {
     if (owns_) {
+        if (ids_cf_ && db_) db_->DestroyColumnFamilyHandle(ids_cf_);
         if (cf_ && db_) db_->DestroyColumnFamilyHandle(cf_);
         delete db_;
     }
 }
 
 MetadataStore::Status MetadataStore::Open(const std::string& dir,
-                                          std::unique_ptr<MetadataStore>* out) {
+                                          std::unique_ptr<MetadataStore>* out,
+                                          bool with_id_map) {
     ROCKSDB_NAMESPACE::Options meta_opts;
     meta_opts.create_if_missing = true;
     meta_opts.create_missing_column_families = true;
@@ -75,6 +83,11 @@ MetadataStore::Status MetadataStore::Open(const std::string& dir,
     cfopts.table_factory.reset(
         ROCKSDB_NAMESPACE::NewBlockBasedTableFactory(table_opts));
     cfds.emplace_back("metadata", cfopts);
+    if (with_id_map) {
+        // Point lookups only (by key, by dense id) plus one reverse seek on
+        // open; same cache and compression as the payloads.
+        cfds.emplace_back("ids", cfopts);
+    }
 
     std::vector<ColumnFamilyHandle*> handles;
     DB* raw = nullptr;
@@ -92,6 +105,7 @@ MetadataStore::Status MetadataStore::Open(const std::string& dir,
     raw->DestroyColumnFamilyHandle(handles[0]);
     auto store = std::unique_ptr<MetadataStore>(
         new MetadataStore(raw, handles[1]));
+    if (with_id_map) store->ids_cf_ = handles[2];
     store->owns_ = true;
     *out = std::move(store);
     return Status::OK();
@@ -142,6 +156,77 @@ MetadataStore::Status MetadataStore::Get(node_id_t id, Json* out_doc) const {
 
 MetadataStore::Status MetadataStore::SyncWAL() {
     return db_->SyncWAL();
+}
+
+MetadataStore::Status MetadataStore::LookupKey(std::string_view key,
+                                               node_id_t* dense) const {
+    if (!ids_cf_) return Status::NotSupported("store has no id map");
+    std::string k;
+    k.reserve(1 + key.size());
+    k.push_back(kForwardPrefix);
+    k.append(key.data(), key.size());
+    PinnableSlice v;
+    Status s = db_->Get(ReadOptions(), ids_cf_, k, &v);
+    if (!s.ok()) return s;
+    if (v.size() != 8) return Status::Corruption("bad id map entry");
+    node_id_t id = 0;
+    for (size_t i = 0; i < 8; ++i) {
+        id = (id << 8) | static_cast<unsigned char>(v.data()[i]);
+    }
+    *dense = id;
+    return Status::OK();
+}
+
+MetadataStore::Status MetadataStore::ReverseLookup(node_id_t dense,
+                                                   std::string* key) const {
+    if (!ids_cf_) return Status::NotSupported("store has no id map");
+    std::string k(1, kReversePrefix);
+    k += EncodeKey(dense);
+    return db_->Get(ReadOptions(), ids_cf_, k, key);
+}
+
+MetadataStore::Status MetadataStore::PutKey(std::string_view key, node_id_t dense) {
+    return PutKeys({{std::string(key), dense}});
+}
+
+MetadataStore::Status MetadataStore::PutKeys(
+        const std::vector<std::pair<std::string, node_id_t>>& items) {
+    if (!ids_cf_) return Status::NotSupported("store has no id map");
+    ROCKSDB_NAMESPACE::WriteBatch batch;
+    for (const auto& kv : items) {
+        const std::string dense = EncodeKey(kv.second);
+        std::string fwd(1, kForwardPrefix);
+        fwd += kv.first;
+        std::string rev(1, kReversePrefix);
+        rev += dense;
+        auto s = batch.Put(ids_cf_, fwd, dense);
+        if (!s.ok()) return s;
+        s = batch.Put(ids_cf_, rev, kv.first);
+        if (!s.ok()) return s;
+    }
+    return db_->Write(WriteOptions(), &batch);
+}
+
+MetadataStore::Status MetadataStore::MaxMappedId(node_id_t* max_id, bool* any) const {
+    if (!ids_cf_) return Status::NotSupported("store has no id map");
+    *any = false;
+    *max_id = 0;
+    std::unique_ptr<ROCKSDB_NAMESPACE::Iterator> it(
+        db_->NewIterator(ReadOptions(), ids_cf_));
+    // The reverse range ('r' + 8-byte big-endian id) sorts by id: its last
+    // entry holds the largest id.
+    std::string upper(1, static_cast<char>(kReversePrefix + 1));
+    it->SeekForPrev(upper);
+    if (it->Valid() && !it->key().empty() && it->key()[0] == kReversePrefix) {
+        if (it->key().size() != 9) return Status::Corruption("bad id map entry");
+        node_id_t id = 0;
+        for (size_t i = 1; i < 9; ++i) {
+            id = (id << 8) | static_cast<unsigned char>(it->key()[i]);
+        }
+        *max_id = id;
+        *any = true;
+    }
+    return it->status();
 }
 
 MetadataStore::Status MetadataStore::Delete(node_id_t id) {

@@ -1,4 +1,5 @@
 #include <chrono>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,6 +38,37 @@ std::vector<float> ToVector(const py::sequence& seq)
     return data;
 }
 
+// Python id -> PointId: int (0 .. 2**64-1), str, or uuid.UUID (as its str).
+astervec::PointId ToPointId(const py::handle& obj)
+{
+    if (py::isinstance<py::bool_>(obj)) {
+        throw py::type_error("id must be an int, str or uuid.UUID, not bool");
+    }
+    if (py::isinstance<py::int_>(obj)) {
+        py::int_ v = py::reinterpret_borrow<py::int_>(obj);
+        if (v < py::int_(0)) throw py::value_error("integer ids must be >= 0");
+        try {
+            return astervec::PointId::Int(v.cast<std::uint64_t>());
+        } catch (const py::cast_error&) {
+            throw py::value_error("integer ids must be < 2**64");
+        }
+    }
+    if (py::isinstance<py::str>(obj)) {
+        return astervec::PointId::Str(obj.cast<std::string>());
+    }
+    py::object uuid_cls = py::module_::import("uuid").attr("UUID");
+    if (py::isinstance(obj, uuid_cls)) {
+        return astervec::PointId::Str(py::str(obj).cast<std::string>());
+    }
+    throw py::type_error("id must be an int, str or uuid.UUID");
+}
+
+py::object FromPointId(const astervec::PointId& id)
+{
+    if (id.is_int()) return py::int_(id.as_int());
+    return py::str(id.as_str());
+}
+
 void RaiseStatus(const astervec::Status& status)
 {
     if (status.ok()) {
@@ -72,8 +104,17 @@ PYBIND11_MODULE(astervec, m)
         .value("Cosine", astervec::DistanceMetric::kCosine)
         .export_values();
 
+    py::enum_<astervec::IdMode>(m, "IdMode")
+        .value("Auto", astervec::IdMode::kAuto)
+        .value("Dense", astervec::IdMode::kDense)
+        .value("Keyed", astervec::IdMode::kKeyed);
+
     py::class_<astervec::AsterVecDBOptions>(m, "AsterVecDBOptions")
         .def(py::init<>())
+        .def_readwrite("id_mode", &astervec::AsterVecDBOptions::id_mode,
+                       "IdMode.Auto (default): a new store is created Keyed (int, "
+                       "str or UUID ids), an existing store keeps its mode. "
+                       "IdMode.Dense: integer ids used directly as slots.")
         .def_readwrite("dim", &astervec::AsterVecDBOptions::dim)
         .def_readwrite("metric", &astervec::AsterVecDBOptions::metric)
         .def_readwrite("m", &astervec::AsterVecDBOptions::m)
@@ -113,62 +154,75 @@ PYBIND11_MODULE(astervec, m)
 
     py::class_<astervec::AsterVecDB, std::unique_ptr<astervec::AsterVecDB>>(m, "AsterVecDB")
         .def_static("open", [](const std::string& path, const astervec::AsterVecDBOptions& options) {
+            // Python creates new stores keyed (any int, str or UUID id) unless
+            // the caller asks for dense; an existing store keeps its mode.
+            astervec::AsterVecDBOptions opts = options;
+            if (opts.id_mode == astervec::IdMode::kAuto) {
+                namespace fs = std::filesystem;
+                const bool exists = fs::exists(path + "/lsm_vec_db.meta") ||
+                                    fs::exists(path + "/lsm_vec_db.meta.prev") ||
+                                    fs::exists(path + "/CURRENT");
+                if (opts.reinit || !exists) opts.id_mode = astervec::IdMode::kKeyed;
+            }
             std::unique_ptr<astervec::AsterVecDB> db;
-            astervec::Status status = astervec::AsterVecDB::Open(path, options, &db);
+            astervec::Status status = astervec::AsterVecDB::Open(path, opts, &db);
             RaiseStatus(status);
             return db;
+        })
+        .def_property_readonly("id_mode", [](const astervec::AsterVecDB& db) {
+            return db.GetIdMode() == astervec::IdMode::kKeyed ? "keyed" : "dense";
         })
         // The sequence (Python list) overload is registered BEFORE the numpy
         // array_t one so that passing a list never triggers numpy overload
         // resolution (which would import numpy and fail if it isn't installed).
         .def("insert",
              [](astervec::AsterVecDB& db,
-                astervec::node_id_t id,
+                py::object id,
                 const py::sequence& seq,
                 py::object metadata) {
                  std::vector<float> data = ToVector(seq);
                  if (metadata.is_none()) {
-                     RaiseStatus(db.Insert(id, MakeSpan(data)));
+                     RaiseStatus(db.Insert(ToPointId(id), MakeSpan(data)));
                      return;
                  }
                  py::object json_mod = py::module_::import("json");
                  std::string md_str = json_mod.attr("dumps")(metadata).cast<std::string>();
-                 RaiseStatus(db.Insert(id, MakeSpan(data), md_str));
+                 RaiseStatus(db.Insert(ToPointId(id), MakeSpan(data), md_str));
              },
              py::arg("id"), py::arg("vector"), py::arg("metadata") = py::none(),
              "Insert a vector with optional metadata (Python dict serialized to JSON).")
         .def("insert",
              [](astervec::AsterVecDB& db,
-                astervec::node_id_t id,
+                py::object id,
                 const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
                 py::object metadata) {
                  std::vector<float> data = ToVector(array);
                  if (metadata.is_none()) {
-                     RaiseStatus(db.Insert(id, MakeSpan(data)));
+                     RaiseStatus(db.Insert(ToPointId(id), MakeSpan(data)));
                      return;
                  }
                  py::object json_mod = py::module_::import("json");
                  std::string md_str = json_mod.attr("dumps")(metadata).cast<std::string>();
-                 RaiseStatus(db.Insert(id, MakeSpan(data), md_str));
+                 RaiseStatus(db.Insert(ToPointId(id), MakeSpan(data), md_str));
              },
              py::arg("id"), py::arg("vector"), py::arg("metadata") = py::none(),
              "Insert a vector with optional metadata (Python dict serialized to JSON).")
-        .def("update", [](astervec::AsterVecDB& db, int id, const py::sequence& seq) {
+        .def("update", [](astervec::AsterVecDB& db, py::object id, const py::sequence& seq) {
             auto data = ToVector(seq);
-            RaiseStatus(db.Update(id, MakeSpan(data)));
+            RaiseStatus(db.Update(ToPointId(id), MakeSpan(data)));
         })
         .def("update", [](astervec::AsterVecDB& db,
-                           int id,
+                           py::object id,
                            const py::array_t<float, py::array::c_style | py::array::forcecast>& array) {
             auto data = ToVector(array);
-            RaiseStatus(db.Update(id, MakeSpan(data)));
+            RaiseStatus(db.Update(ToPointId(id), MakeSpan(data)));
         })
-        .def("delete", [](astervec::AsterVecDB& db, int id) {
-            RaiseStatus(db.Delete(id));
+        .def("delete", [](astervec::AsterVecDB& db, py::object id) {
+            RaiseStatus(db.Delete(ToPointId(id)));
         })
-        .def("get", [](astervec::AsterVecDB& db, int id) {
+        .def("get", [](astervec::AsterVecDB& db, py::object id) {
             std::vector<float> out;
-            RaiseStatus(db.Get(id, &out));
+            RaiseStatus(db.Get(ToPointId(id), &out));
             py::array_t<float> result(out.size());
             auto buf = result.mutable_unchecked<1>();
             for (size_t i = 0; i < out.size(); ++i) {
@@ -242,18 +296,17 @@ PYBIND11_MODULE(astervec, m)
                  opts.k = k;
                  opts.ef_search = ef_search;
                  opts.max_scan_candidates = max_scan_candidates;
-                 std::vector<astervec::SearchResult> out;
-                 if (filter.is_none()) {
-                     RaiseStatus(db.SearchKnn(MakeSpan(qdata), opts, &out));
-                 } else {
+                 std::string filter_json;
+                 if (!filter.is_none()) {
                      py::object json_mod = py::module_::import("json");
-                     std::string filter_json = json_mod.attr("dumps")(filter).cast<std::string>();
-                     RaiseStatus(db.SearchKnn(MakeSpan(qdata), opts, filter_json, &out));
+                     filter_json = json_mod.attr("dumps")(filter).cast<std::string>();
                  }
+                 std::vector<astervec::PointHit> out;
+                 RaiseStatus(db.SearchPoints(MakeSpan(qdata), opts, filter_json, &out));
                  py::list result;
                  for (const auto& r : out) {
                      py::dict d;
-                     d["id"] = r.id;
+                     d["id"] = FromPointId(r.id);
                      d["distance"] = r.distance;
                      result.append(d);
                  }
@@ -276,18 +329,17 @@ PYBIND11_MODULE(astervec, m)
                  opts.k = k;
                  opts.ef_search = ef_search;
                  opts.max_scan_candidates = max_scan_candidates;
-                 std::vector<astervec::SearchResult> out;
-                 if (filter.is_none()) {
-                     RaiseStatus(db.SearchKnn(MakeSpan(qdata), opts, &out));
-                 } else {
+                 std::string filter_json;
+                 if (!filter.is_none()) {
                      py::object json_mod = py::module_::import("json");
-                     std::string filter_json = json_mod.attr("dumps")(filter).cast<std::string>();
-                     RaiseStatus(db.SearchKnn(MakeSpan(qdata), opts, filter_json, &out));
+                     filter_json = json_mod.attr("dumps")(filter).cast<std::string>();
                  }
+                 std::vector<astervec::PointHit> out;
+                 RaiseStatus(db.SearchPoints(MakeSpan(qdata), opts, filter_json, &out));
                  py::list result;
                  for (const auto& r : out) {
                      py::dict d;
-                     d["id"] = r.id;
+                     d["id"] = FromPointId(r.id);
                      d["distance"] = r.distance;
                      result.append(d);
                  }
@@ -300,33 +352,33 @@ PYBIND11_MODULE(astervec, m)
              py::arg("max_scan_candidates") = 0,
              "kNN search with optional metadata filter. Returns list of dicts {id, distance}.")
         .def("set_payload",
-             [](astervec::AsterVecDB& db, astervec::node_id_t id, py::object metadata) {
+             [](astervec::AsterVecDB& db, py::object id, py::object metadata) {
                  py::object json_mod = py::module_::import("json");
                  std::string s = json_mod.attr("dumps")(metadata).cast<std::string>();
-                 RaiseStatus(db.SetPayload(id, s));
+                 RaiseStatus(db.SetPayload(ToPointId(id), s));
              },
              py::arg("id"), py::arg("metadata"),
              "Replace the metadata associated with id.")
         .def("update_payload",
-             [](astervec::AsterVecDB& db, astervec::node_id_t id, py::object partial) {
+             [](astervec::AsterVecDB& db, py::object id, py::object partial) {
                  py::object json_mod = py::module_::import("json");
                  std::string s = json_mod.attr("dumps")(partial).cast<std::string>();
-                 RaiseStatus(db.UpdatePayload(id, s));
+                 RaiseStatus(db.UpdatePayload(ToPointId(id), s));
              },
              py::arg("id"), py::arg("metadata"),
              "Merge-patch (RFC 7396) metadata for id; None values delete fields.")
         .def("delete_payload_keys",
-             [](astervec::AsterVecDB& db, astervec::node_id_t id,
+             [](astervec::AsterVecDB& db, py::object id,
                 const std::vector<std::string>& keys) {
                  astervec::Span<const std::string> span(keys);
-                 RaiseStatus(db.DeletePayloadKeys(id, span));
+                 RaiseStatus(db.DeletePayloadKeys(ToPointId(id), span));
              },
              py::arg("id"), py::arg("keys"),
              "Remove the specified keys from the metadata object for id.")
         .def("get_payload",
-             [](astervec::AsterVecDB& db, astervec::node_id_t id) -> py::object {
+             [](astervec::AsterVecDB& db, py::object id) -> py::object {
                  std::string s;
-                 RaiseStatus(db.GetPayload(id, &s));
+                 RaiseStatus(db.GetPayload(ToPointId(id), &s));
                  py::object json_mod = py::module_::import("json");
                  return json_mod.attr("loads")(s);
              },
@@ -356,7 +408,8 @@ PYBIND11_MODULE(astervec, m)
         .def("bulk_build",
              [](astervec::AsterVecDB& db,
                 const py::array_t<float, py::array::c_style | py::array::forcecast>& array,
-                int threads) -> py::dict {
+                int threads,
+                py::object ids) -> py::dict {
                  if (array.ndim() != 2) {
                      throw py::value_error("vectors must be a 2D array (n, dim)");
                  }
@@ -370,11 +423,20 @@ PYBIND11_MODULE(astervec, m)
 
                  // c_style|forcecast guarantees a C-contiguous float32 buffer.
                  const float* ptr = array.data();
+                 const astervec::Span<const float> flat(
+                     ptr, static_cast<size_t>(n) * static_cast<size_t>(dim));
                  auto t0 = std::chrono::high_resolution_clock::now();
-                 RaiseStatus(db.BulkBuild(
-                     astervec::Span<const float>(
-                         ptr, static_cast<size_t>(n) * static_cast<size_t>(dim)),
-                     static_cast<int>(n), bopts));
+                 if (ids.is_none()) {
+                     RaiseStatus(db.BulkBuild(flat, static_cast<int>(n), bopts));
+                 } else {
+                     std::vector<astervec::PointId> pids;
+                     pids.reserve(static_cast<size_t>(n));
+                     for (auto item : ids) pids.push_back(ToPointId(item));
+                     if (pids.size() != static_cast<size_t>(n)) {
+                         throw py::value_error("ids must have one entry per vector");
+                     }
+                     RaiseStatus(db.BulkBuild(flat, pids, bopts));
+                 }
                  auto t1 = std::chrono::high_resolution_clock::now();
 
                  double elapsed_ms =
@@ -389,11 +451,11 @@ PYBIND11_MODULE(astervec, m)
                  report["threads"] = bopts.num_threads;
                  return report;
              },
-             py::arg("vectors"), py::arg("threads") = 0,
+             py::arg("vectors"), py::arg("threads") = 0, py::arg("ids") = py::none(),
              "Build the whole index in one pass from a 2D (n, dim) float32 array "
              "(or a list of equal-length rows). Initial-load only: the DB must be "
-             "empty; ids are assigned 0..n-1. Returns a report dict "
-             "{n, elapsed_ms, vectors_per_sec, threads}.")
+             "empty. ids: one int/str/UUID per row (keyed stores); default "
+             "0..n-1. Returns a report dict {n, elapsed_ms, vectors_per_sec, threads}.")
         .def("trim_memory",
              [](astervec::AsterVecDB& db) { db.trimMemory(); },
              "Ask the allocator to return idle heap memory to the OS "

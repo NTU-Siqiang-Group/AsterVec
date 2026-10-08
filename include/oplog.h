@@ -18,6 +18,7 @@
 //   u64 internal_id
 //   u64 aux               update: old internal id; abort: aborted lsn
 //   u32 record_len, bytes record      vector in the store's encoding
+//   u32 key_len, bytes key            caller's point id (keyed stores; else empty)
 //   u32 payload_len, bytes payload    JSON; empty = no payload given
 //
 // No fsync per append: records reach the OS on every append, which is what
@@ -52,6 +53,7 @@ struct OpRecord {
     uint64_t internal_id = 0;
     uint64_t aux = 0;
     std::string_view record;
+    std::string_view key;  // PointId::Encode() in keyed stores, else empty
     std::string_view payload;
 };
 

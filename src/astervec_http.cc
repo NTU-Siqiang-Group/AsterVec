@@ -352,6 +352,8 @@ AsterVecDBOptions buildOptions(const HttpServerConfig& cfg) {
     opts.enable_oplog         = cfg.enable_oplog;
     opts.checkpoint_interval_ops = cfg.checkpoint_interval_ops;
     opts.oplog_segment_bytes  = cfg.oplog_segment_bytes;
+    // The HTTP API takes integer ids only; a keyed store is refused on open.
+    opts.id_mode              = IdMode::kDense;
     opts.enable_stats         = cfg.enable_stats;
     opts.enable_batch_read    = true;
     opts.reinit               = false;

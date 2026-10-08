@@ -45,6 +45,7 @@ struct Seen {
     uint64_t aux;
     uint8_t encoding;
     std::string record;
+    std::string key;
     std::string payload;
 };
 
@@ -53,7 +54,8 @@ std::vector<Seen> scan_all(const std::string& dir, uint64_t from,
     std::vector<Seen> out;
     Status s = OpLog::Scan(dir, from, [&](const OpRecord& r) {
         out.push_back({r.lsn, r.op, r.real_id, r.internal_id, r.aux, r.encoding,
-                       std::string(r.record), std::string(r.payload)});
+                       std::string(r.record), std::string(r.key),
+                       std::string(r.payload)});
         return Status::OK();
     }, st);
     REQUIRE(s.ok());
@@ -90,6 +92,7 @@ TEST_CASE("oplog: append and scan round trip") {
     ins.internal_id = 7;
     ins.record = std::string_view("\x01\x02\x03\x00\x05", 5);
     ins.payload = R"({"a":1})";
+    ins.key = std::string_view("\x02doc-1", 6);
     uint64_t lsn1 = 0, lsn2 = 0, lsn3 = 0;
     REQUIRE(log->Append(ins, &lsn1).ok());
 
@@ -119,6 +122,8 @@ TEST_CASE("oplog: append and scan round trip") {
     CHECK(seen[0].op == OpType::kInsert);
     CHECK(seen[0].record == std::string("\x01\x02\x03\x00\x05", 5));
     CHECK(seen[0].payload == R"({"a":1})");
+    CHECK(seen[0].key == std::string("\x02doc-1", 6));
+    CHECK(seen[1].key.empty());
     CHECK(seen[1].op == OpType::kUpdate);
     CHECK(seen[1].internal_id == (1ULL << 63) + 3);
     CHECK(seen[1].aux == 7);

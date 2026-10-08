@@ -22,7 +22,7 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr size_t kPrefixBytes = 8;   // body_len + crc
-constexpr size_t kFixedBody = 8 + 1 + 1 + 8 + 8 + 8 + 4 + 4;
+constexpr size_t kFixedBody = 8 + 1 + 1 + 8 + 8 + 8 + 4 + 4 + 4;
 // Records larger than this are treated as corrupt (a garbage length must
 // not make the scan allocate gigabytes).
 constexpr uint32_t kMaxBodyBytes = 64u << 20;
@@ -148,7 +148,8 @@ Status OpLog::openSegmentLocked()
 
 Status OpLog::Append(const OpRecord& rec, uint64_t* lsn_out)
 {
-    const size_t body = kFixedBody + rec.record.size() + rec.payload.size();
+    const size_t body =
+        kFixedBody + rec.record.size() + rec.key.size() + rec.payload.size();
     if (body > kMaxBodyBytes) return Status::InvalidArgument("log record too large");
     thread_local std::vector<char> buf;
     buf.resize(kPrefixBytes + body);
@@ -167,6 +168,11 @@ Status OpLog::Append(const OpRecord& rec, uint64_t* lsn_out)
     if (!rec.record.empty()) {
         std::memcpy(p, rec.record.data(), rec.record.size());
         p += rec.record.size();
+    }
+    put<uint32_t>(p, static_cast<uint32_t>(rec.key.size()));
+    if (!rec.key.empty()) {
+        std::memcpy(p, rec.key.data(), rec.key.size());
+        p += rec.key.size();
     }
     put<uint32_t>(p, static_cast<uint32_t>(rec.payload.size()));
     if (!rec.payload.empty()) {
@@ -275,9 +281,13 @@ Status OpLog::Scan(const std::string& dir, uint64_t from_lsn,
             rec.aux = get<uint64_t>(p);
             const char* const end = body.data() + body_len;
             const uint32_t rec_len = get<uint32_t>(p);
-            if (rec_len > static_cast<size_t>(end - p) - 4) break;
+            if (rec_len > static_cast<size_t>(end - p) - 8) break;
             rec.record = std::string_view(p, rec_len);
             p += rec_len;
+            const uint32_t key_len = get<uint32_t>(p);
+            if (key_len > static_cast<size_t>(end - p) - 4) break;
+            rec.key = std::string_view(p, key_len);
+            p += key_len;
             const uint32_t pay_len = get<uint32_t>(p);
             if (pay_len != static_cast<size_t>(end - p)) break;
             rec.payload = std::string_view(p, pay_len);

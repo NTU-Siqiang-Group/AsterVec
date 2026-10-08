@@ -25,12 +25,19 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 import numpy as np
 
 DIM = 32
 ID_SPACE = 3000
 TOL = 0.05  # SQ8 round-trip error is far below this
+ID_MODE = "dense"  # set from --id-mode; "keyed" stores every point under a UUID
+
+
+def key(vid):
+    """The id the store sees for model id `vid`."""
+    return str(uuid.UUID(int=vid + 1)) if ID_MODE == "keyed" else vid
 
 
 def vector(seed):
@@ -52,6 +59,7 @@ def options(astervec, path, oplog, interval):
     o.log_file_path = path + "/engine.log"
     o.enable_oplog = oplog
     o.checkpoint_interval_ops = interval
+    o.id_mode = astervec.IdMode.Keyed if ID_MODE == "keyed" else astervec.IdMode.Dense
     return o
 
 
@@ -64,9 +72,9 @@ def child(args):
     while True:
         kind, vid, vseed = op_at(args.series_seed, i)
         if kind == "put":
-            db.insert(vid, vector(vseed).tolist(), metadata={"s": vseed})
+            db.insert(key(vid), vector(vseed).tolist(), metadata={"s": vseed})
         else:
-            db.delete(vid)
+            db.delete(key(vid))
         out.write(f"op {i}\n")
         out.flush()
         i += 1
@@ -95,7 +103,7 @@ def read_store(astervec, db):
     got = {}
     for vid in range(ID_SPACE):
         try:
-            got[vid] = db.get(vid)
+            got[vid] = db.get(key(vid))
         except KeyError:
             pass
     return got
@@ -107,7 +115,7 @@ def matches(got, state, oplog, db):
     for vid, v in got.items():
         if np.max(np.abs(v - vector(state[vid]))) > TOL:
             return False
-        if oplog and db.get_payload(vid) != {"s": state[vid]}:
+        if oplog and db.get_payload(key(vid)) != {"s": state[vid]}:
             return False
     return True
 
@@ -135,7 +143,7 @@ def verify(astervec, db, series_seed, acked_ops, ckpts, in_flight_ckpt, oplog):
     hits = 0
     for vid in sample:
         res = db.search(got[vid].tolist(), k=1)
-        hits += bool(res) and res[0]["id"] == vid
+        hits += bool(res) and res[0]["id"] == key(vid)
     for _ in range(20):
         db.search(np.random.default_rng(rng.randrange(1 << 30)).normal(size=DIM).tolist(), k=10)
     if sample and hits < 0.95 * len(sample):
@@ -152,7 +160,8 @@ def run_series(args, series_seed, n_runs, report):
         for _ in range(n_runs):
             cmd = [sys.executable, __file__, "--child", "--path", path,
                    "--oplog", str(int(args.oplog)), "--series-seed", str(series_seed),
-                   "--start", str(done_ops), "--ckpt-every", str(args.ckpt_every)]
+                   "--start", str(done_ops), "--ckpt-every", str(args.ckpt_every),
+                   "--id-mode", ID_MODE]
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                  env=dict(os.environ))
             time.sleep(random.uniform(args.min_s, args.max_s))
@@ -196,6 +205,7 @@ def main():
     ap.add_argument("--child", action="store_true")
     ap.add_argument("--path")
     ap.add_argument("--oplog", type=int, default=1)
+    ap.add_argument("--id-mode", choices=["dense", "keyed"], default="dense")
     ap.add_argument("--series-seed", type=int, default=1)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--ckpt-every", type=int, default=400)
@@ -205,6 +215,8 @@ def main():
     ap.add_argument("--max-s", type=float, default=2.5)
     args = ap.parse_args()
     args.oplog = bool(args.oplog)
+    global ID_MODE
+    ID_MODE = args.id_mode
     if args.child:
         child(args)
         return
@@ -231,7 +243,8 @@ def main():
         n = min(args.runs_per_series, args.runs - total)
         if not run_series(args, series, n, report):
             break
-    print(f"\n{'oplog on' if args.oplog else 'oplog off'}: {total - failures}/{total} runs passed; "
+    print(f"\n{'oplog on' if args.oplog else 'oplog off'} ({ID_MODE}): "
+          f"{total - failures}/{total} runs passed; "
           f"{sum(ops)} acked ops; max replay {max(r for r, _ in replayed) if replayed else 0} ops")
     sys.exit(1 if failures else 0)
 

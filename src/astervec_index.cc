@@ -163,9 +163,10 @@ using namespace ROCKSDB_NAMESPACE;
     //     engine records it here at create time and replays it at every open;
     //     files with version < 3 are raw-encoded by definition)
     // v4: + trailer: checkpoint_lsn (the operation-log position the
-    //     checkpoint covers; 0 when no log is in use) and the live vector
-    //     count at the checkpoint. Placed after the paged-storage block so
-    //     the v3 header and its CRC layout are unchanged.
+    //     checkpoint covers; 0 when no log is in use), the live vector
+    //     count at the checkpoint, and the point-id mode (0 dense, 1 keyed;
+    //     optional on read, absent = dense). Placed after the paged-storage
+    //     block so the v3 header and its CRC layout are unchanged.
     constexpr uint32_t kMetadataVersion = 4;
 
     // CRC-32 (crc32.h) over the fixed header fields. Guards the
@@ -482,7 +483,8 @@ using namespace ROCKSDB_NAMESPACE;
         }
 
         if (!WriteValue(out, checkpoint_lsn_) ||
-            !WriteValue(out, checkpoint_live_count_)) {
+            !WriteValue(out, checkpoint_live_count_) ||
+            !WriteValue(out, id_mode_)) {
             return Status::IOError("failed to write checkpoint trailer");
         }
         return Status::OK();
@@ -693,6 +695,12 @@ using namespace ROCKSDB_NAMESPACE;
         if (version >= 4 && (!ReadValue(in, &checkpoint_lsn_) ||
                              !ReadValue(in, &checkpoint_live_count_))) {
             return Status::IOError("failed to read checkpoint trailer");
+        }
+        id_mode_ = 0;
+        if (version >= 4 && in.peek() != std::char_traits<char>::eof()) {
+            if (!ReadValue(in, &id_mode_) || id_mode_ > 1) {
+                return Status::Corruption("bad point-id mode in metadata");
+            }
         }
 
         // Deserialize runs single-threaded under the engine's lifecycle

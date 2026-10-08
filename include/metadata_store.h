@@ -27,8 +27,12 @@ public:
     // Opens (creating if missing) the sibling RocksDB at <dir> with the
     // metadata column family and returns a store that OWNS the DB and the CF
     // handle — the storage-seam form: callers hold no RocksDB types.
+    //
+    // with_id_map: also open the `ids` column family that maps caller point
+    // ids to dense internal ids (stores created with IdMode::kKeyed).
     static Status Open(const std::string& dir,
-                       std::unique_ptr<MetadataStore>* out);
+                       std::unique_ptr<MetadataStore>* out,
+                       bool with_id_map = false);
 
     // Destroys the owned CF handle and DB (no-op for the borrowing ctor).
     ~MetadataStore();
@@ -64,6 +68,21 @@ public:
     // fsync the payload DB's WAL so every write accepted so far is durable.
     Status SyncWAL();
 
+    // ---- Point id map (keyed stores) ----
+    // Keys are PointId::Encode() bytes. Both directions are kept so search
+    // results can be translated back. Entries are never removed: a key keeps
+    // its dense id for the life of the store.
+    bool has_id_map() const { return ids_cf_ != nullptr; }
+    // NotFound if the key has no dense id yet.
+    Status LookupKey(std::string_view key, node_id_t* dense) const;
+    // NotFound if no key maps to `dense`.
+    Status ReverseLookup(node_id_t dense, std::string* key) const;
+    // Records key <-> dense in one atomic batch (idempotent).
+    Status PutKey(std::string_view key, node_id_t dense);
+    Status PutKeys(const std::vector<std::pair<std::string, node_id_t>>& items);
+    // The largest dense id with a key; *any = false when the map is empty.
+    Status MaxMappedId(node_id_t* max_id, bool* any) const;
+
     // Observability counters (incremented on each call).
     size_t point_gets() const { return point_gets_; }
     size_t parses()     const { return parses_; }
@@ -71,6 +90,7 @@ public:
 private:
     DB*                 db_;
     ColumnFamilyHandle* cf_;
+    ColumnFamilyHandle* ids_cf_ = nullptr;  // only with an id map
     bool                owns_ = false;  // true iff created via Open()
     mutable size_t      point_gets_ = 0;
     mutable size_t      parses_     = 0;

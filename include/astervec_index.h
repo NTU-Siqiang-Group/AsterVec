@@ -527,6 +527,9 @@ namespace astervec
         // pre-v4 file).
         int64_t checkpointLiveCount() const { return checkpoint_live_count_; }
         void setCheckpointLiveCount(int64_t n) { checkpoint_live_count_ = n; }
+        // Point-id mode fixed at create time (0 dense, 1 keyed).
+        uint32_t idMode() const { return id_mode_; }
+        void setIdMode(uint32_t m) { id_mode_ = m; }
         // fsync the graph store's WAL.
         Status syncGraph();
         // Streaming bodies without the v3 whole-payload CRC framing; the
@@ -929,6 +932,7 @@ namespace astervec
 
         uint64_t checkpoint_lsn_ = 0;
         int64_t checkpoint_live_count_ = -1;
+        uint32_t id_mode_ = 0;
 
         // ----------------------------------------------------------------
         // Adaptive Direct I/O (see docs/local/..._ADAPTIVE_DIRECT_IO_*).
