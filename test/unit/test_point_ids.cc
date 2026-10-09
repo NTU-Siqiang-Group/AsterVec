@@ -375,3 +375,54 @@ TEST_CASE("point ids: a crash keeps keyed ids consistent, with and without the l
         REQUIRE(db->Close().ok());
     }
 }
+
+TEST_CASE("point ids: canonical UUID strings are stored in 16 bytes, unchanged to callers") {
+    const std::vector<std::string> uuids = {
+        "123e4567-e89b-42d3-a456-426614174000",
+        "00000000-0000-0000-0000-000000000000",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    };
+    for (const auto& u : uuids) {
+        const std::string enc = PointId::Str(u).Encode();
+        CHECK(enc.size() == 17);
+        PointId back;
+        REQUIRE(PointId::Decode(enc, &back));
+        CHECK(back == PointId::Str(u));
+    }
+    // Not canonical: stored as plain strings, exactly as before.
+    const std::vector<std::string> others = {
+        "123E4567-E89B-42D3-A456-426614174000",   // uppercase
+        "123e4567e89b42d3a456426614174000",       // no hyphens
+        "123e4567-e89b-42d3-a456-42661417400",    // 35 chars
+        "123e4567-e89b-42d3-a456-42661417400g",   // non-hex
+        "123e4567-e89b-42d3a-456-426614174000",   // hyphen moved
+        "{123e4567-e89b-42d3-a456-426614174000}", // braces
+    };
+    for (const auto& s : others) {
+        CAPTURE(s);
+        const std::string enc = PointId::Str(s).Encode();
+        CHECK(enc.size() == 1 + s.size());
+        PointId back;
+        REQUIRE(PointId::Decode(enc, &back));
+        CHECK(back == PointId::Str(s));
+    }
+
+    // End to end: the canonical string comes back identical; the uppercase
+    // spelling is still a different point, as before.
+    const auto path = make_path();
+    auto db = open_db(path, opts_for(path, IdMode::kKeyed));
+    auto a = vec(1), b = vec(2);
+    REQUIRE(db->Insert(PointId::Str(uuids[0]), Span<float>(a), R"({"v":"lower"})").ok());
+    REQUIRE(db->Insert(PointId::Str(others[0]), Span<float>(b), R"({"v":"upper"})").ok());
+    CHECK(db->VectorCount() == 2);
+    REQUIRE(db->Close().ok());
+    db = open_db(path, opts_for(path, IdMode::kAuto));
+    std::string p;
+    REQUIRE(db->GetPayload(PointId::Str(uuids[0]), &p).ok());
+    CHECK(p == R"({"v":"lower"})");
+    REQUIRE(db->GetPayload(PointId::Str(others[0]), &p).ok());
+    CHECK(p == R"({"v":"upper"})");
+    CHECK(top1(db.get(), a) == PointId::Str(uuids[0]));
+    CHECK(top1(db.get(), b) == PointId::Str(others[0]));
+    REQUIRE(db->Close().ok());
+}
