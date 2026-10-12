@@ -94,7 +94,7 @@ is expected.
 ```python
 db = astervec.AsterVecDB.open(path, opts)        # open or create
 
-db.insert(id, vector, metadata=None)          # insert (+ optional dict metadata)
+db.insert(id, vector, metadata=None)          # insert or replace (+ optional dict metadata)
 db.update(id, vector)                          # replace a vector
 db.delete(id)                                  # soft delete
 vec = db.get(id)                               # -> np.ndarray (float32)
@@ -109,10 +109,21 @@ db.update_payload(id, partial)                 # RFC 7396 merge (None deletes a 
 db.delete_payload_keys(id, ["k1", "k2"])       # remove specific keys
 md = db.get_payload(id)                         # -> dict ({} if none)
 
-db.bulk_build(vectors_2d, threads=0)           # initial load (empty DB); -> report dict
-db.flush_vector_writes()                        # flush to disk
-db.close()                                      # flush + close
+db.bulk_build(vectors_2d, threads=0, ids=None) # initial load (empty DB); -> report dict
+db.checkpoint()                                 # make all writes so far durable
+db.flush_vector_writes()                        # same, logging errors instead of raising
+db.close()                                      # checkpoint + close
 ```
+
+**Ids.** A store created from Python takes `int` (`0 .. 2**64-1`), `str` or
+`uuid.UUID` ids; `search` returns them as inserted (a UUID as its string form).
+The integer `7` and the string `"7"` are different points. Set
+`opts.id_mode = astervec.IdMode.Dense` for integer-only ids used directly as
+storage slots; an existing store keeps the mode it was created with.
+
+**Durability.** After an unclean shutdown the store reopens to its last
+checkpoint. With `opts.enable_oplog = True`, every acknowledged write also
+survives a process crash (it is replayed on open; see `db.recovery_stats()`).
 
 > **Quantization (SQ8).** Vectors are stored with 8-bit scalar quantization;
 > `get` returns a dequantized vector that differs from the input by up to
@@ -121,7 +132,8 @@ db.close()                                      # flush + close
 ### Bulk build (initial load)
 
 The fastest way to populate an **empty** database — builds the whole index in
-memory (RNN-Descent) and writes it in one pass; ids are assigned `0..n-1`.
+memory (RNN-Descent) and writes it in one pass; ids are assigned `0..n-1`, or
+taken from `ids=[...]` (one distinct id per row).
 
 ```python
 import numpy as np
@@ -149,6 +161,9 @@ concurrent calls from a thread pool — the engine is thread-safe).
 | `enable_batch_read` | `bool` | `True` | Batch vector reads by page during search. |
 | `reinit` | `bool` | `False` | Wipe existing data on open. |
 | `vector_file_path` | `str` | `""` | Vector storage file path. |
+| `id_mode` | `IdMode` | `Auto` | New stores accept int/str/UUID ids; `Dense` = integer slots. |
+| `enable_oplog` | `bool` | `False` | Keep every acknowledged write across a process crash. |
+| `checkpoint_interval_ops` | `int` | `0` | Checkpoint every N writes (`0` = on flush/close only). |
 
 `SearchOptions`: `k` (default `1`), `ef_search` (default `128`),
 `max_scan_candidates` (default `0` = auto, `k * 50` when a filter is set).

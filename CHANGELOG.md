@@ -4,6 +4,41 @@ All notable changes to AsterVec are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Any point id.** Stores can be created in keyed mode, where ids are any
+  64-bit unsigned integer or any string (UUIDs included); the engine maps them
+  to compact internal slots. C++: `PointId`, `IdMode`, `SearchPoints`,
+  `BulkBuild(vectors, ids, opts)`. Python: ids may be `int`, `str` or
+  `uuid.UUID`, `search()` returns them as inserted, `bulk_build(..., ids=...)`,
+  `db.id_mode`.
+- **Checkpoints.** `Checkpoint()` / `db.checkpoint()` makes everything written
+  so far durable in one atomic step and keeps the previous checkpoint as a
+  fallback. After an unclean shutdown a store reopens to its last checkpoint.
+  `checkpoint_interval_ops` checkpoints automatically every N writes.
+- **Operation log** (`enable_oplog`, off by default): every acknowledged
+  insert, update and delete survives a process crash and is replayed on open;
+  `recovery_stats()` reports the replay. HTTP: `ASTERVEC_OPLOG`,
+  `ASTERVEC_CHECKPOINT_INTERVAL_OPS`, `ASTERVEC_OPLOG_SEGMENT_BYTES`.
+
+### Changed
+- A search with nothing to return (empty index, no point matching the filter)
+  returns an empty result instead of `NotFound` / `KeyError`.
+- New stores created from Python use keyed ids by default; integer ids work
+  exactly as before, and existing stores keep their mode.
+- `flush_vector_writes()` and `close()` now checkpoint.
+- Python `update`, `delete` and `get` take 64-bit ids (previously 32-bit).
+
+### Fixed
+- Vectors written by `update` could be overwritten by later inserts after the
+  store was reopened.
+- Concurrent writers could crash the process or corrupt vector records.
+
+### Compatibility
+- Index metadata is now format v4. Stores written by this version cannot be
+  opened by 0.2.2 or earlier; older stores open unchanged.
+
 ## [0.2.2] - 2026-08-31
 
 Wheels-only release: Python 3.14 and 3.15 support. No engine changes.

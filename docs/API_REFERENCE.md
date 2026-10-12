@@ -108,7 +108,48 @@ holds the handle.
 Status Close();
 ```
 
-Flushes pending writes and releases resources. The handle is unusable afterward.
+Checkpoints (see below) and releases resources. The handle is unusable afterward.
+
+### Point ids
+
+`opts.id_mode` decides how callers identify points. It takes effect when a store is
+created and is recorded in it; opening uses the recorded mode, and asking for a
+different one returns `InvalidArgument`.
+
+| `IdMode` | Ids | Notes |
+|---|---|---|
+| `kAuto` (default) | — | Open: the store's mode. Create: `kDense`. |
+| `kDense` | integers `0 .. 2^63-1` | The id is the internal slot; keep ids compact. |
+| `kKeyed` | any `uint64_t` or string (e.g. a UUID) | The engine maps ids to internal slots itself. |
+
+Every point call takes either a plain integer or a `PointId`:
+
+```cpp
+db->Insert(PointId::Str("3f2b9c1e-8d4a-4e7b-9c1d-2a6f5e8b7c90"), vec, R"({"src":"a"})");
+db->Insert(PointId::Int(18446744073709551615ULL), vec);   // keyed stores only
+db->Delete(PointId::Str("doc-17#chunk-3"));
+```
+
+The integer `7` and the string `"7"` are different points.
+
+### Checkpoints and crash recovery
+
+```cpp
+Status Checkpoint();                  // make everything written so far durable
+RecoveryStats GetRecoveryStats() const;
+```
+
+A checkpoint syncs the vector data and both write-ahead logs, then atomically
+installs the index metadata; the previous checkpoint is kept and used
+automatically if the latest one is damaged. Writes wait while it runs (searches
+do not). `flushVectorWrites()`, `BulkBuild()` and `Close()` checkpoint, and
+`opts.checkpoint_interval_ops` checkpoints every N writes.
+
+After an unclean shutdown the store reopens to its last checkpoint. With
+`opts.enable_oplog = true`, every acknowledged insert, update and delete is also
+appended to an operation log and replayed on open, so no acknowledged write is
+lost to a process crash. `GetRecoveryStats()` reports what the last open
+replayed.
 
 ---
 
@@ -123,9 +164,11 @@ db->Insert(43, vec, R"({"category":"docs"})");         // with JSON metadata
 ```cpp
 Status Insert(node_id_t id, Span<float> vec);
 Status Insert(node_id_t id, Span<float> vec, std::string_view metadata_json);
+Status Insert(const PointId& id, Span<float> vec, std::string_view metadata_json = {});
 ```
 
-Inserts a vector and builds its HNSW connections. `vec` length must equal
+Inserts a vector and builds its HNSW connections; inserting an existing id
+replaces it. `vec` length must equal
 `opts.dim`. The optional `metadata_json` is a JSON object stored as the vector's
 payload. Returns `InvalidArgument` on a dimension mismatch or malformed metadata.
 A `std::vector<float>` converts implicitly to `Span<float>`.
@@ -154,7 +197,18 @@ Status SearchKnn(Span<float> query, std::vector<SearchResult>* out);  // uses op
 
 Results are sorted by ascending distance, up to `k` entries. `filter_json` is a
 Mongo-style predicate (see [§17](#17-metadata-filter-operators)). The last overload
-uses the `k` and `ef_search` set on `AsterVecDBOptions` at open time.
+uses the `k` and `ef_search` set on `AsterVecDBOptions` at open time. A search with
+nothing to return (empty index, no point matching the filter) returns `OK` with
+an empty `out`.
+
+```cpp
+Status SearchPoints(Span<float> query, const SearchOptions& options,
+                    std::string_view filter_json,     // "" = no filter
+                    std::vector<PointHit>* out);
+```
+
+`SearchPoints` returns each hit's `PointId`. Use it in keyed stores with string
+ids; `SearchKnn` reports integer ids only.
 
 ---
 
@@ -162,14 +216,14 @@ uses the `k` and `ef_search` set on `AsterVecDBOptions` at open time.
 
 ```cpp
 Status Get(node_id_t id, std::vector<float>* vec);   // resizes to dim; NotFound if absent
-Status Update(node_id_t id, Span<float> vec);        // replace vector; rebuilds edges
+Status Update(node_id_t id, Span<float> vec);        // replace vector (inserts if absent)
 Status Delete(node_id_t id);                          // soft delete (tombstone)
 std::size_t VectorCount() const;                      // live vector count
 ```
 
-`Delete` tombstones the id (excluded from future searches; survives reopen).
-`VectorCount` is exact in steady state and across graceful restarts (approximate
-only after an unclean crash).
+Each call also takes a `PointId`. `Delete` tombstones the id (excluded from future
+searches; survives reopen); deleting an id that was never written is a no-op.
+`VectorCount` is exact, including after a restart from a checkpoint.
 
 ---
 
@@ -182,18 +236,22 @@ Status UpdatePayload(node_id_t id, std::string_view partial_json);   // RFC 7396
 Status DeletePayloadKeys(node_id_t id, Span<const std::string> keys);
 ```
 
-`UpdatePayload` merge-patches: keys in `partial_json` overwrite, and a key set to
-`null` deletes it. `Delete(id)` removes the vector and its payload together.
+Each call also takes a `PointId`. `UpdatePayload` merge-patches: keys in
+`partial_json` overwrite, and a key set to `null` deletes it. `Delete(id)` removes
+the vector and its payload together.
 
 ---
 
 ## 6. Bulk Build
 
 The fastest way to populate an **empty** database: build the whole index in memory
-(RNN-Descent), then write it in one pass. IDs are assigned `0..n-1`.
+(RNN-Descent), then write it in one pass. IDs are assigned `0..n-1`, or taken
+from `ids` (keyed stores; one distinct id per vector).
 
 ```cpp
 Status BulkBuild(Span<const float> vectors, int n, const BulkBuildOptions& opts);
+Status BulkBuild(Span<const float> vectors, const std::vector<PointId>& ids,
+                 const BulkBuildOptions& opts);
 ```
 
 ```cpp
@@ -237,6 +295,10 @@ thread-safe).
 | `reinit` | `bool` | `false` | `true` = wipe existing data; `false` = reopen. |
 | `vector_file_path` | `string` | `""` | Path to the vector data file. |
 | `log_file_path` | `string` | `""` | Path to the log file (empty = no file logging). |
+| `id_mode` | `IdMode` | `kAuto` | Point-id mode, fixed at create time (see [§1](#point-ids)). |
+| `enable_oplog` | `bool` | `false` | Log every write so acknowledged writes survive a process crash. |
+| `checkpoint_interval_ops` | `uint64_t` | `0` | Checkpoint every N inserts/updates/deletes (`0` = only on flush/close). |
+| `oplog_segment_bytes` | `uint64_t` | `64 MiB` | Operation-log segment size. |
 
 **Tuning:** higher `m` / `ef_construction` → better recall, slower build; higher
 `ef_search` → better recall, slower queries; higher `paged_max_cached_pages` → more
@@ -257,6 +319,15 @@ struct SearchOptions {
 };
 
 struct SearchResult { node_id_t id; float distance; };
+
+enum class IdMode { kAuto, kDense, kKeyed };
+class PointId {                               // an integer or a string id
+  public:
+    static PointId Int(uint64_t v);
+    static PointId Str(std::string s);
+    bool is_int() const;  uint64_t as_int() const;  const std::string& as_str() const;
+};
+struct PointHit { PointId id; float distance; };   // SearchPoints result
 ```
 
 `Span<T>` is a lightweight non-owning view over contiguous memory; a
@@ -300,6 +371,10 @@ db.close()
 `AsterVecDB.open(path: str, opts: AsterVecDBOptions) -> AsterVecDB` — raises `ValueError`
 on invalid arguments, `RuntimeError` on I/O errors.
 
+A store created from Python accepts `int`, `str` and `uuid.UUID` ids (keyed mode)
+unless `opts.id_mode = astervec.IdMode.Dense`; an existing store keeps the mode it
+was created with (`db.id_mode` is `"keyed"` or `"dense"`).
+
 ---
 
 ## 11. Inserting Vectors
@@ -311,10 +386,13 @@ db.insert(2, [0.1] * 128, metadata={"category": "docs"})   # with metadata
 ```
 
 ```python
-db.insert(id: int, vector: list[float] | np.ndarray, metadata: dict | None = None) -> None
+db.insert(id: int | str | uuid.UUID, vector: list[float] | np.ndarray,
+          metadata: dict | None = None) -> None
 ```
 
-`vector` length must equal `opts.dim`. `metadata` is any JSON-serializable object
+Integer ids range over `0 .. 2**64-1`; inserting an existing id replaces it; the
+integer `7` and the string `"7"` are different points. `vector` length must equal
+`opts.dim`. `metadata` is any JSON-serializable object
 (serialized internally). Raises `ValueError` on a dimension mismatch.
 
 ---
@@ -343,14 +421,18 @@ objects; `search` accepts a Mongo-style `filter` dict (see
 [§17](#17-metadata-filter-operators)) and returns plain dicts (convenient for
 pandas). `max_scan_candidates` bounds the filtered scan (`0` = auto, `k * 50`).
 
+`search` returns each id as it was inserted (`int` or `str`; a `uuid.UUID` comes
+back as its string form). `search_knn` reports integer ids only, so use `search`
+with string ids. A search with nothing to return gives `[]`.
+
 ---
 
 ## 13. Retrieving, Updating, Deleting
 
 ```python
 vec = db.get(id)            # -> np.ndarray (float32); raises KeyError if absent
-db.update(id, vector)       # replace vector; raises KeyError if absent
-db.delete(id)               # soft delete
+db.update(id, vector)       # replace vector (inserts if absent)
+db.delete(id)               # soft delete; no-op for an unknown id
 ```
 
 ---
@@ -376,11 +458,12 @@ report = db.bulk_build(np.random.rand(100_000, 128).astype(np.float32), threads=
 ```
 
 ```python
-db.bulk_build(vectors: np.ndarray, threads: int = 0) -> dict
+db.bulk_build(vectors: np.ndarray, threads: int = 0, ids: list | None = None) -> dict
 ```
 
 `vectors` is a 2-D `(n, dim)` float32 array (or a list of equal-length rows).
-**Initial-load only**: the DB must be empty; ids are assigned `0..n-1`. For
+**Initial-load only**: the DB must be empty; ids are assigned `0..n-1` unless
+`ids` gives one distinct `int`/`str`/`uuid.UUID` per row (keyed stores). For
 incremental updates afterward use `insert`.
 
 ---
@@ -410,6 +493,10 @@ All properties are read-write.
 | `reinit` | `bool` | `False` | Wipe existing data on open. |
 | `vector_file_path` | `str` | `""` | Vector storage file path. |
 | `log_file_path` | `str` | `""` | Log file path. |
+| `id_mode` | `IdMode` | `Auto` | `Auto`: new stores keyed, existing keep theirs; `Dense`; `Keyed`. |
+| `enable_oplog` | `bool` | `False` | Log every write so acknowledged writes survive a process crash. |
+| `checkpoint_interval_ops` | `int` | `0` | Checkpoint every N inserts/updates/deletes (`0` = only on flush/close). |
+| `oplog_segment_bytes` | `int` | `67108864` | Operation-log segment size. |
 
 ### SearchOptions
 
@@ -426,11 +513,21 @@ astervec.DistanceMetric.L2      # Euclidean (L2) distance
 astervec.DistanceMetric.Cosine  # 1 - cosine similarity
 ```
 
+### IdMode
+
+```python
+astervec.IdMode.Auto    # default: new stores keyed, existing stores keep their mode
+astervec.IdMode.Dense   # integer ids used directly as slots
+astervec.IdMode.Keyed   # int, str or uuid.UUID ids
+```
+
 ### Other methods
 
 | Method | Description |
 |--------|-------------|
-| `db.flush_vector_writes()` | Flush pending vector writes to disk. |
+| `db.checkpoint()` | Make everything written so far durable (raises on failure). |
+| `db.flush_vector_writes()` | Same as `checkpoint()`, but logs errors instead of raising. |
+| `db.recovery_stats() -> dict` | What the last open replayed from the operation log. |
 | `db.trim_memory()` | Ask the allocator to return idle heap to the OS (glibc `malloc_trim`; no-op elsewhere). |
 | `db.delete_stats() -> dict` | Tombstone/Bloom observability counters. |
 
@@ -469,7 +566,7 @@ db.search(query, k=10, filter={
 | C++ `Status` | Python exception | When |
 |--------------|------------------|------|
 | `InvalidArgument` / `NotSupported` | `ValueError` | dimension mismatch, bad params, unsupported metric |
-| `NotFound` | `KeyError` | vector id not found |
+| `NotFound` | `KeyError` | id not found (`get`, `set_payload`, `update_payload`); searches return `[]` instead |
 | other | `RuntimeError` | I/O / storage errors |
 
 ---

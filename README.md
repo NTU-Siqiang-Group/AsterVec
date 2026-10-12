@@ -69,7 +69,7 @@ rebuild step:
 
 ```python
 db.update(7, new_vector)          # replace a vector in place
-db.delete(3)                      # frees the space for reuse
+db.delete(3)                      # removed from results immediately
 db.bulk_build(embeddings)         # fast initial load, NumPy accepted
 ```
 
